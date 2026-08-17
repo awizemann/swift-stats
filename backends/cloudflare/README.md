@@ -1,27 +1,54 @@
-# Cloudflare backend — reserved
+# Cloudflare backend — reserved (store decided: D1)
 
 Nothing is implemented here yet. This folder is the reserved home for the
-Cloudflare backend: a small ingest Worker that validates and stores batches, and
-a read layer serving `GET /v1/summary` and `GET /v1/events/top`.
+Cloudflare backend: a small ingest Worker on `POST /v1/events`, and a read layer
+serving `GET /v1/summary` and `GET /v1/events/top`. The contract is
+[`../../docs/schema.md`](../../docs/schema.md).
 
-Planned shape (decided in the plan, not yet built):
+## Decided
 
-- **Ingest**: a Worker on `POST /v1/events`, validating against
-  [`../../docs/schema.md`](../../docs/schema.md).
-- **Store**: Workers Analytics Engine — write blobs/doubles/indexes, query over
-  the SQL API, `index1 = projectId`. No schema migrations, cheap at small scale.
-  Relational alternative if ad-hoc querying wins: D1 (we then own schema and
-  retention).
-- **Read**: the SQL API behind a read key, distinct from the write key.
+**Store: D1**, chosen over Workers Analytics Engine for two reasons that outweigh
+AE's lower write cost here:
 
-Open, to settle when this is built:
+- **Exact counts.** `activeInstalls`, `sessions` and `installs` become
+  `COUNT(DISTINCT …)`, not HyperLogLog estimates. The conformance checklist makes
+  a backend declare which it is, and a reader UI that has to hedge every number
+  is a worse product. This backend will declare **exact**.
+- **History.** Relational rows plus daily rollup tables let aggregates live
+  indefinitely, which AE's fixed retention window does not allow.
 
-- Analytics Engine distinct counts are **approximate**; `activeInstalls`,
-  `sessions` and `installs` will have to be declared as estimates per the
-  conformance checklist. If that is unacceptable for the reader UI, D1 wins.
-- Where the `batchId` dedupe window lives (KV with a 24 h+ TTL is the obvious
-  choice) and what it costs per batch.
-- Whether the Worker accepts `Content-Encoding: gzip`.
+The cost — we own the schema, the migrations and the retention job — is accepted.
 
-When implemented, this README must cover the ten required items and carry the
-filled-in conformance checklist from [`../README.md`](../README.md).
+**Retention.**
+
+- Raw events: **90 days, MUST**, enforced by a scheduled deletion rather than by
+  convention. This is the hard promise schema §13 asks a backend to make.
+- **Daily rollups: kept indefinitely.** A rollup job aggregates raw events into
+  per-day rows (per `projectId`, per `date`, per event name, per broken-down prop
+  value) *before* the raw rows age out, so `/v1/summary` keeps answering ranges
+  older than 90 days while nothing person-scale survives.
+- Consequence to write down at implementation time: once a day's raw events are
+  gone, no *new* dimension can be back-computed for it. The rollup shape is
+  therefore part of the schema design, not an afterthought, and
+  `/v1/events/top` over a range older than 90 days is answered from rollups only.
+
+**Keys.** `projectId` is derived from the write key's scope (schema §2.4) — one
+project per key, minted server-side, never trusted from the client. Read keys are
+separately minted and separately project-scoped. Keys live in Worker secrets;
+none of them belong in this repo.
+
+## Still open, to settle when this is built
+
+- The D1 table layout: the raw `events` table's indexes (`(projectId, ts)` at
+  minimum) and whether `props` is a JSON column or a narrow key/value side table.
+  The §8.2 breakdown query is the thing to design against.
+- Where the `batchId` dedupe window lives: a D1 table with a scheduled purge, or
+  KV with a 24 h+ TTL. KV is cheaper per batch; D1 keeps dedupe transactional
+  with the insert, which is what makes "202 only when durable" easy to honor.
+- Whether the Worker accepts `Content-Encoding: gzip` (schema §7 makes it
+  optional and non-negotiated, so the answer only has to be written down here).
+- The rollup job's trigger (a Cron Trigger) and how it handles a late-arriving
+  offline batch for a day that was already rolled up.
+
+When implemented, this README must cover the ten required items in
+[`../README.md`](../README.md) and carry the filled-in conformance checklist.

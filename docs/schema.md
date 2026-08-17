@@ -23,9 +23,9 @@ names the version an SDK build speaks; `Stats.sdkVersion` names the build.
   rules are the whole story.
 - **Field format enforcement.** Any field whose value violates the format stated
   for it in §1, §2 or §3 (a `sessionId` not matching §10's pattern, an
-  `installId` that is not 64 hex chars, an over-long `appId`, a `projectId` with
-  a disallowed character, a `bundleId` that differs from an event's `appId`, a
-  malformed `ts`) MUST be rejected by the backend with **400** for the whole
+  `installId` that is not 64 hex chars, an over-long `appId` or `userId`, a
+  `projectId` with a disallowed character, a `bundleId` that differs from an
+  event's `appId`, a malformed `ts`) MUST be rejected by the backend with **400** for the whole
   batch. The only fields exempt are the ones §3 explicitly says to store
   verbatim when unknown (`osName`, `arch`) and `props`, which follows §2.3.
 - When two strings must be compared or ordered by this document, the comparison
@@ -67,10 +67,10 @@ Every ingest request body is exactly one envelope object.
 | `context` | object | yes | Exactly one per batch, see §3. |
 | `events` | array | yes | 1–100 event objects, see §2 and §5. An empty array MUST be rejected with **400**. |
 
-A batch MUST NOT contain events for more than one `(appId, projectId,
-installId)` triple — the emitter partitions batches so that the single `context`
-and the key scope check (§7) are unambiguous. A backend MUST reject a mixed
-batch with **400**.
+A batch MUST NOT contain events for more than one `(appId, installId)` pair, nor
+more than one `projectId` where that optional field is present — the emitter
+partitions batches so that the single `context` and the key scope check (§7) are
+unambiguous. A backend MUST reject a mixed batch with **400**.
 
 `sessionId` **may** vary within a batch: a batch commonly spans a session
 boundary, and `session_end` (§12) deliberately carries the *previous* session's
@@ -104,8 +104,9 @@ tracked before an app update keep reporting the version that produced them. Only
 | `sessionId` | string | yes | See §10. |
 | `installId` | string | yes | 64 lowercase hex chars — SHA-256, see §9. |
 | `appId` | string | yes | The emitting app's bundle identifier, e.g. `com.wizemann.Overwatch`. ≤ 128 scalars. |
-| `projectId` | string | yes | The tenant/rollup key a reader queries by. ≤ 64 scalars, `[A-Za-z0-9._-]` only. Chosen by the app; for a single-app project it MAY equal `appId`. |
+| `projectId` | string | no | The tenant/rollup key a reader queries by. ≤ 64 scalars, `[A-Za-z0-9._-]` only. **The backend derives it from the write key's scope** — see §2.4. An emitter MAY send it; a mismatch with the key's scope is **400**. |
 | `seq` | integer | yes | See §2.2. |
+| `userId` | string | no | An opaque, app-supplied, already-hashed account identifier. Omit when unset — see §2.5. |
 | `props` | object | no | See §2.3. Omit when empty. |
 
 ### 2.1 Event names
@@ -166,6 +167,60 @@ A **flat** map of app-authored properties.
   This is a contract, not a suggestion: it is what makes the privacy manifest
   in §13 truthful.
 
+### 2.4 `projectId` — derived, not asserted
+
+`projectId` is **authoritative from the write key**, not from the client. A write
+key is provisioned scoped to exactly one `projectId`; the backend looks that up
+and stamps every event in the batch with it.
+
+- A backend MUST derive `projectId` from the presented `X-Stats-Key` and MUST
+  store the derived value, never a client-supplied one.
+- An emitter MAY include `projectId` on its events (it is useful in local logs
+  and for a self-hosted backend that wants the redundancy). If present and it
+  does **not** equal the key's scope, the backend MUST reject the batch with
+  **400** — which is a permanent drop, so a misconfigured app fails loudly
+  rather than quietly writing into the wrong project.
+- If absent, the batch is perfectly valid; the derived value applies.
+- A key scoped to more than one project is out of scope for `v1`. If that is ever
+  needed, the client-supplied `projectId` becomes the selector *within* the
+  key's scope — which is why the field exists in `v1` rather than being removed.
+- The same rule holds for reads: a read key is project-scoped, and `projectId`
+  on a read request is validated against that scope (§8), not trusted.
+
+Consequence for the SDK: the app configures a `projectId` for its own clarity,
+but it cannot mislabel traffic, and a leaked write key can only ever append to
+the one project it was minted for.
+
+### 2.5 `userId`
+
+Optional. Present only when the app called `identify(userID:)`, and then on every
+subsequent event of that install until `reset()` or a new `identify` call.
+
+- ≤ 128 scalars. Opaque to the schema; no format is imposed.
+- The value MUST already be hashed or otherwise opaque **before it reaches the
+  SDK**. The SDK MUST NOT transmit a raw identifier: an emitter given something
+  that looks like a raw identifier (an email address, in particular) SHOULD log
+  at `warning`, and MUST hash the supplied value with the install salt (§9)
+  before it goes on the wire, so that a careless consumer cannot leak a plaintext
+  address to a backend.
+- It MUST NOT be an email address, phone number, username, or any other value a
+  person could be contacted or identified by outside the app's own database.
+- Lives under the **`identity`** consent group (§11). When `identity` is denied
+  the field MUST be omitted entirely — an `identify()` call is remembered in
+  memory but never emitted — and `identify()` MUST NOT re-enable linkage that
+  consent withheld.
+- `reset()` (§9) clears it.
+- A backend MUST treat it as an opaque string: it MAY index it for a per-account
+  rollup, and MUST NOT expose it in the `v1` read contract (§8 has no `userId`
+  dimension) or use it to join across projects.
+- Sending a `userId` makes events for that account linkable, which is a real
+  privacy cost. Apps that do not need per-account analysis SHOULD never call
+  `identify()`.
+- **Disclosure**: an app that uses `identify()` collects an account identifier
+  and MUST declare **User ID** in its own privacy manifest and App Store
+  nutrition label. The SDK's bundled manifest does not declare it, because the
+  SDK does not collect one unless asked — see §14.
+
 ## 3. The context object
 
 Sent **once per batch**, not per event. It describes the emitter as of the
@@ -199,10 +254,10 @@ attributes every event in the batch to this context.
 | `appVersion` | string | yes | `CFBundleShortVersionString`. ≤ 32 scalars. |
 | `appBuild` | string | yes | `CFBundleVersion`. String, not a number — build numbers are not always numeric. ≤ 32 scalars. |
 | `bundleId` | string | yes | MUST equal each event's `appId`. |
-| `osName` | string | yes | One of `macOS`, `iOS`, `iPadOS`, `visionOS`, `tvOS`, `watchOS`, `web`. Closed set in `v1`; a backend MUST accept an unknown value (store it verbatim) rather than reject, so a new Apple platform does not require a schema bump. |
+| `osName` | string | yes | One of `macOS`, `iOS`, `iPadOS`, `visionOS`, `tvOS`, `watchOS`, `web`. Closed set in `v1`; a backend MUST accept an unknown value (store it verbatim) rather than reject, so a new Apple platform does not require a schema bump. `web` is **reserved for a future JS emitter** — out of scope for `v1`, but a backend MUST accept it rather than have to change later. |
 | `osVersion` | string | yes | Dotted, e.g. `15.4.1` or `18.2`. Marketing version, not the Darwin kernel version. |
 | `deviceModel` | string | yes | Raw model identifier: `Mac15,3`, `iPhone16,2`. **Not** a marketing name — mapping to "iPhone 15 Pro" is a reader-side concern. On the web, `web`. ≤ 64 scalars. |
-| `arch` | string | yes | `arm64`, `arm64e`, `x86_64`, or `wasm32`. Unknown values stored verbatim. |
+| `arch` | string | yes | `arm64`, `arm64e`, `x86_64`, or `wasm32`. Unknown values stored verbatim. `wasm32` is **reserved for a future JS emitter**, as `web` is above. |
 | `locale` | string | yes | POSIX-ish BCP 47 with underscore: `en_US`, `pt_BR`, or bare `de`. ≤ 32 scalars. |
 | `region` | string | yes | ISO 3166-1 alpha-2, uppercase, e.g. `US`. `ZZ` when unknown. Derived from the device region setting — a backend MUST NOT derive it from client IP (see §13). |
 | `screenWidth` | integer | yes | Points (not pixels) of the main screen / window scene. `0` when headless. |
@@ -311,7 +366,7 @@ Body: one envelope (§1).
 
 | Header | Req. | Notes |
 |---|---|---|
-| `X-Stats-Key` | yes | The **write** key. Public-by-necessity (it ships inside the app binary), so it MUST be write-only: it grants nothing but "append events for the projects this key is scoped to". A backend MUST scope the key to a project set and MUST reject a batch whose `projectId` is outside that set with **401**. |
+| `X-Stats-Key` | yes | The **write** key. Public-by-necessity (it ships inside the app binary), so it MUST be write-only: it grants nothing but "append events to the one project this key is scoped to". The key **determines** `projectId` (§2.4). A backend MUST reject a batch whose client-supplied `projectId` disagrees with the key's scope with **400**, and a missing, unknown or revoked key with **401**. |
 | `Content-Type` | yes | MUST be `application/json`, optionally with `; charset=utf-8`. Anything else → **400**. |
 | `Content-Encoding` | no | `gzip` only. Support is **optional for a backend but not discoverable at runtime** — there is no negotiation handshake in `v1`. An emitter MUST default to **uncompressed** and MUST compress only when the consumer explicitly configured it (having read the backend's README, which MUST state whether gzip is supported per `backends/README.md`). A backend that does not support gzip MUST reject a gzipped body with **400** rather than silently mis-parse; because a 400 is a permanent drop (§7 responses), a misconfigured emitter loses data, which is exactly why the default is off. |
 | `X-Stats-Read-Key` | — | An emitter MUST NOT send it to this endpoint. A backend MUST **ignore** it here — never 400 or 401 on its presence, since a permanent drop is the emitter's response to those. |
@@ -322,8 +377,8 @@ retry policy:
 | Status | Meaning | Emitter MUST |
 |---|---|---|
 | **202** Accepted | Durably queued or written. Body ignored (empty or small JSON). | Delete the batch from the local queue. |
-| **400** Bad Request | Malformed JSON, bad `schema` value, bad event name, a `stats_`-prefixed name, empty or over-100 `events`, an object/array props value, a batch mixing `appId`/`projectId`/`installId`, or any field violating its documented format (§0). An out-of-scope `projectId` is **401**, not 400. | **Drop** the batch permanently. Log at `error`. Never retry — the batch will never become valid. |
-| **401** Unauthorized | Missing/invalid/out-of-scope write key. | **Drop** the batch. Log at `error`. Never retry; retrying a bad key is a self-inflicted DoS. |
+| **400** Bad Request | Malformed JSON, bad `schema` value, bad event name, a `stats_`-prefixed name, empty or over-100 `events`, an object/array props value, a batch mixing `appId`/`projectId`/`installId`, a `projectId` disagreeing with the write key's scope (§2.4), or any field violating its documented format (§0). | **Drop** the batch permanently. Log at `error`. Never retry — the batch will never become valid. |
+| **401** Unauthorized | Missing, unknown or revoked write key. | **Drop** the batch. Log at `error`. Never retry; retrying a bad key is a self-inflicted DoS. |
 | **413** Payload Too Large | Body over the byte limit. | Re-split into smaller batches with **new** `batchId`s and retry those. If a single event cannot be split, drop it and log at `error`. |
 | **429** Too Many Requests | Rate limited. `Retry-After` (seconds, integer) SHOULD be present. | **Retain** the batch. Wait `Retry-After` if present, else the backoff schedule below. Do not increase concurrency. |
 | **5xx** | Backend fault. | **Retain** the batch. Retry with the backoff schedule. |
@@ -352,8 +407,13 @@ Other requirements:
 
 Reads use a **separate** key, `X-Stats-Read-Key`, which MUST NOT be embeddable
 in a shipped client app. A write key MUST NOT grant reads, and a backend MUST
-return **401** if the read endpoints are called with only a write key. Read
-keys are scoped to a project set the same way write keys are.
+return **401** if the read endpoints are called with only a write key.
+
+Read keys are **project-scoped** the same way write keys are (§2.4). The
+`projectId` query parameter is validated against the key's scope, never trusted:
+a request for a project the key does not cover MUST return **401**, and MUST NOT
+distinguish "not authorized" from "no such project" — that distinction leaks the
+existence of other projects.
 
 Both read endpoints are `GET`, return `application/json`, and MUST be safe and
 idempotent.
@@ -500,12 +560,14 @@ Error bodies are `{"error": "<machine_code>", "message": "<human text>"}`;
   different apps or backends. It is not a secret and provides no security on its
   own; it MUST NOT be treated as one.
 - `reset()` MUST: flush or discard pending events for the old identity,
-  generate a fresh UUID, reset `seq` to 0, and start a new session. Events
-  emitted before and after a reset MUST NOT be linkable by the backend.
-- `identify(userID:)`, if a consumer uses it, MUST hash the supplied id with the
-  same salt before it goes on the wire and lives under the `identity` consent
-  group (§11). `v1` carries no `userId` field on the event; an app that needs it
-  puts a hashed value in `props`, accepting the cardinality cost.
+  generate a fresh UUID, reset `seq` to 0, clear any `userId`, and start a new
+  session. Events emitted before and after a reset MUST NOT be linkable by the
+  backend.
+- `identify(userID:)` sets the optional `userId` field (§2.5) on every subsequent
+  event of that install. The SDK hashes the supplied value with the same salt
+  before it goes on the wire, so a raw identifier never leaves the device, and
+  the whole feature lives under the `identity` consent group (§11) — denied means
+  the field is omitted. It is opt-in and most apps should not use it.
 - A backend MUST NOT create its own identifier — no IP-derived id, no cookie,
   no fingerprint — and MUST NOT store the client IP alongside events (§13).
 
@@ -553,7 +615,7 @@ Error bodies are `{"error": "<machine_code>", "message": "<human text>"}`;
   |---|---|
   | `usage` | Event names, `props`, sessions, auto-events (§12). |
   | `diagnostics` | The context object's diagnostic fields: os/device/arch/screen/locale/region, `isDebug`, `isTestFlight`, `colorScheme`. |
-  | `identity` | A stable `installId` across launches, and `identify(userID:)`. Denied → the emitter MUST use a **per-session ephemeral** install id (fresh random UUID per session, hashed the same way) so nothing is linkable across sessions. |
+  | `identity` | A stable `installId` across launches, and the `userId` field (§2.5). Denied → the emitter MUST use a **per-session ephemeral** install id (fresh random UUID per session, hashed the same way) so nothing is linkable across sessions, and MUST omit `userId` entirely even if the app called `identify()`. |
 - `usage` denied means nothing is emitted at all, whatever the other groups say.
 - `diagnostics` denied → the emitter still MUST send a well-formed `context`
   (the field is required), filling diagnostic fields with the documented
@@ -632,6 +694,12 @@ stay consistent with this document:
   **Other Diagnostic Data** (the context object) — both *not linked to
   identity*, *not used for tracking*, purposes App Functionality + Analytics.
 - Accessed API: `NSPrivacyAccessedAPICategoryUserDefaults`, reason **CA92.1**.
+
+The package manifest deliberately does **not** declare `NSPrivacyCollectedDataTypeUserID`, because the SDK collects no
+account identifier on its own. An app that calls `identify(userID:)` (§2.5) is
+sending one, and **that app** must add User ID to its own manifest and nutrition
+label. This is called out here because it is the one place where using an
+optional SDK feature changes the consumer's disclosure obligations.
 
 A consuming app must declare the same collected types in its own manifest and
 answer the App Store nutrition label accordingly. `StatsTests` asserts these

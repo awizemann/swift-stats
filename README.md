@@ -29,7 +29,9 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
   [schema §13](docs/schema.md#13-deliberately-never-collected).
 - **Opt-out by default, per app.** With no configuration the SDK collects
   nothing at all — no queue, no id, no context. Consent is three independent
-  groups (`usage` / `diagnostics` / `identity`) and it persists.
+  groups (`usage` / `diagnostics` / `identity`) and it persists. A leaked write
+  key can only append to the one project it was minted for — the backend derives
+  the project from the key, never from the client.
 - **Not tracking.** `NSPrivacyTracking` is `false` and there are no tracking
   domains, because first-party data with a non-correlatable id is not tracking.
   No ATT prompt. The bundled `PrivacyInfo.xcprivacy` says exactly that, and a
@@ -82,7 +84,7 @@ import StatsCloudflare
 let stats = StatsClient(
     configuration: .init(
         appId: "com.example.MyApp",
-        projectId: "myapp",
+        projectId: "myapp",                           // the write key is authoritative — schema §2.4
         installIdSalt: "a-constant-per-app-string",   // see schema §9
         autoEvents: [.appOpen, .appBackground],       // opt-in, default none
         sessionInactivityGap: .minutes(5)             // default: 5 on iOS, 30 on macOS
@@ -128,7 +130,7 @@ docs/
                              sessions, consent, reserved names, never-collected list
 backends/
   README.md                How backends plug in + the shared conformance checklist
-  cloudflare/              Reserved for the Cloudflare backend (Worker + Analytics Engine)
+  cloudflare/              Reserved for the Cloudflare backend (Worker + D1)
 Sources/
   Stats/                   Core emitter (scaffold today)
     Resources/
@@ -148,7 +150,7 @@ CHANGELOG.md               Keep-a-changelog, semver
 |---|---|---|
 | P12a | Package scaffold, wire schema `v1`, backend contract, CI | **done** |
 | P12b | `Stats` core: file-backed queue, dispatcher, identity, sessions, consent, tests | next |
-| P12c | `backends/cloudflare/`: ingest Worker + read helper | planned |
+| P12c | `backends/cloudflare/`: ingest Worker on D1 + read helper | planned |
 | P12d | First consumer emits events | planned |
 | P12e | Read side: per-project usage in a consumer app | planned |
 | P12f | Tag 0.1.0, semver policy | planned |

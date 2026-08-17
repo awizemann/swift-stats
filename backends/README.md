@@ -28,7 +28,8 @@ Each backend folder MUST contain its own `README.md` covering:
 6. Whether `activeInstalls` / `sessions` / `installs` are **exact or
    approximate**, and if approximate, the error characteristics. Readers surface
    this to users, so it cannot be left implicit.
-7. How write keys and read keys are provisioned, scoped to projects, and rotated.
+7. How write keys and read keys are provisioned, scoped to a project, and
+   rotated — including how `projectId` is derived from the write key (§2.4).
 8. Whether it supports `Content-Encoding: gzip`, and its compressed body cap.
 9. Whether it truncates/drops or rejects on a props-limit violation (§2.3).
 10. Its filled-in conformance checklist (below), with the commit it was verified
@@ -46,8 +47,14 @@ has not been verified, not a backend that is fine.
       small JSON body.
 - [ ] Returns 202 **only after** the batch is durable enough to survive the
       process dying; returns 5xx otherwise rather than accepting-and-losing.
-- [ ] Requires `X-Stats-Key`; returns **401** when it is missing, invalid, or
-      not scoped to the batch's `projectId`.
+- [ ] Requires `X-Stats-Key`; returns **401** when it is missing, unknown or
+      revoked.
+- [ ] **Derives `projectId` from the write key's scope** (§2.4) and stores the
+      derived value, never a client-supplied one. Accepts a batch with no
+      `projectId`; rejects a supplied `projectId` that disagrees with the key's
+      scope with **400**.
+- [ ] Treats `userId` (§2.5) as an opaque string — never exposed in the read
+      contract, never joined across projects.
 - [ ] Grants **no read access** to a write key — read endpoints return 401 with
       only a write key.
 - [ ] Requires `Content-Type: application/json` (`; charset=utf-8` tolerated);
@@ -55,8 +62,9 @@ has not been verified, not a backend that is fine.
 - [ ] Rejects an unknown `schema` value with **400** — never guesses.
 - [ ] Rejects `events: []`, > 100 events, a malformed event name, a
       `stats_`-prefixed name, and an object/array props value with **400**.
-- [ ] Rejects with **400** a batch that mixes `appId`, `projectId` or
-      `installId`, and any field violating its documented format (§0).
+- [ ] Rejects with **400** a batch that mixes `appId` or `installId` (or supplies
+      more than one `projectId`), and any field violating its documented
+      format (§0).
 - [ ] Rejects a body over 256 KiB (uncompressed) with **413**; caps the
       compressed body it will read.
 - [ ] **Ignores unknown envelope/event/context keys** rather than rejecting
@@ -80,7 +88,8 @@ has not been verified, not a backend that is fine.
 
 ### Read — `GET /v1/summary`, `GET /v1/events/top`
 
-- [ ] Requires `X-Stats-Read-Key`, scoped to a project set; **401** otherwise.
+- [ ] Requires `X-Stats-Read-Key`, project-scoped; **401** otherwise, with an
+      out-of-scope project indistinguishable from a nonexistent one.
 - [ ] `date` buckets use the event `ts` in **UTC**, never `sentAt`, never a
       local day.
 - [ ] `/v1/summary` **zero-fills every day** in the served range and sorts
@@ -126,11 +135,11 @@ PRs welcome. To add one:
 
 ## Choosing a backend
 
-| | `cloudflare` (P12c) |
+| | `cloudflare` |
 |---|---|
-| Status | Reserved — not yet implemented |
-| Store | Workers Analytics Engine (candidate), D1 as the relational alternative |
-| Distinct counts | Likely **approximate** on Analytics Engine |
-| Cost shape | Per-event write, cheap at small scale |
+| Status | Reserved — store decided, not yet implemented |
+| Store | **D1** (decided) — Worker ingest, relational rows + daily rollups |
+| Distinct counts | **Exact** (`COUNT(DISTINCT …)`) |
+| Retention | Raw events 90 days; daily rollups indefinite |
 
 More rows land here as backends do.

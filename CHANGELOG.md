@@ -24,9 +24,23 @@ package; schema changes are called out explicitly below.
   `GET /v1/summary` and `GET /v1/events/top` read contract behind a separate
   read key, identity (salted SHA-256 of a random UUID in the SDK's own
   UserDefaults suite), session policy, consent groups, reserved event names,
-  and the never-collected list.
+  and the never-collected list. Notable contract decisions:
+  - `projectId` is **derived by the backend from the write key's scope** and
+    never trusted from the client; a client-supplied value that disagrees is a
+    **400**. Read keys are project-scoped the same way.
+  - An optional, opaque `userId` on the event, set by `identify(userID:)`, hashed
+    by the SDK before it leaves the device, and omitted entirely when the
+    `identity` consent group is denied. An app that uses it must declare User ID
+    in its own privacy manifest — the SDK's manifest does not, because the SDK
+    collects no account identifier unless asked.
+  - `web` / `wasm32` are reserved for a future JS emitter, which is out of scope
+    for `v1`.
 - `backends/README.md`: how backends plug in, per-backend README requirements,
-  and the shared conformance checklist. `backends/cloudflare/` reserved.
+  and the shared conformance checklist. `backends/cloudflare/` is reserved with
+  its store **decided: D1** — exact distinct counts and indefinite history,
+  chosen over Analytics Engine's cheaper approximate writes. Raw events are
+  retained 90 days (a MUST for that backend); daily rollups are kept
+  indefinitely.
 - MIT `LICENSE`, `README.md`, this changelog, `.gitignore`, and a GitHub
   Actions workflow running `swift build` and `swift test` on `macos-15`.
 
