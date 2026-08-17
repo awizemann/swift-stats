@@ -1,11 +1,10 @@
 import Foundation
 import Stats
 
-/// Test seams for consumers of `Stats`.
+/// Test seams for consumers of `Stats`, and what this package's own tests use.
 ///
-/// Placeholder for P12b, which adds the in-memory sink plus the deterministic
-/// clock and id-generator doubles. Nothing here may be timing-dependent: tests
-/// drive the clock, they never sleep.
+/// Nothing here is timing-dependent: `ManualClock` advances only when a test
+/// says so, so backoff and interval flushes are driven, never awaited.
 public enum StatsTesting: Sendable {
     /// Version of the testing helpers. Tracks the package version.
     public static let helpersVersion = Stats.sdkVersion
