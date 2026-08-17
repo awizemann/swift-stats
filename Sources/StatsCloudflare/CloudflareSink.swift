@@ -1,43 +1,3 @@
-// ============================================================================
-//  NOT YET COMPILED — excluded from the `StatsCloudflare` target in Package.swift
-// ============================================================================
-//
-//  This file conforms to `StatsSink` from `Sources/Stats`, which at the time of
-//  writing contains only the P12a placeholder. The core protocol and its
-//  supporting types are being written concurrently, to exactly this contract:
-//
-//      public nonisolated protocol StatsSink: Sendable {
-//          func send(_ batch: StatsBatch) async -> SinkOutcome
-//      }
-//      public enum SinkOutcome: Sendable {
-//          case accepted
-//          case retry(after: Duration?)
-//          case drop(reason: String)
-//      }
-//      public struct StatsBatch: Sendable, Codable { ... }
-//
-//  Rather than duplicate those types here — which would produce a redeclaration
-//  conflict the moment the core lands, and would let this file compile against a
-//  shape the core does not actually have — the file is written against the real
-//  names and excluded from the build.
-//
-//  TO ENABLE, once `Sources/Stats` defines `StatsSink`, `SinkOutcome` and
-//  `StatsBatch`:
-//
-//    1. Delete the `exclude:` entry for this file on the `StatsCloudflare`
-//       target in Package.swift.
-//    2. Delete the `exclude:` entry for `CloudflareSinkTests.swift` on the
-//       `StatsCloudflareTests` target.
-//    3. `swift build --target StatsCloudflare && swift test`
-//
-//  Everything genuinely worth testing here is already built and tested:
-//  `IngestDisposition.from(statusCode:headers:)` is the whole of §7's retry
-//  policy as a pure function, and `IngestDispositionTests` covers it. What
-//  remains below is request construction plus a case-for-case translation of
-//  `IngestDisposition` into `SinkOutcome`.
-//
-// ============================================================================
-
 import Foundation
 import Stats
 import os
@@ -72,11 +32,11 @@ public struct CloudflareSink: StatsSink {
     public func send(_ batch: StatsBatch) async -> SinkOutcome {
         let body: Data
         do {
-            let encoder = JSONEncoder()
-            // Not `.sortedKeys` and not `.prettyPrinted`: §5's 256 KiB limit is on
-            // the serialized bytes, so the encoding must stay as compact as the
-            // emitter assumed when it split the batch.
-            body = try encoder.encode(batch)
+            // `batch.serialized()`, never a local `JSONEncoder`. The dispatcher
+            // enforced §5's 256 KiB limit against exactly these bytes when it
+            // decided how to split, so encoding differently here would put a
+            // different byte count on the wire than the one that was checked.
+            body = try batch.serialized()
         } catch {
             // A batch that cannot be encoded will not encode on a retry either.
             logger.error("Batch failed to encode; dropping.")
@@ -119,13 +79,11 @@ public struct CloudflareSink: StatsSink {
 
     /// Translates the tested §7 policy into the core SDK's vocabulary.
     ///
-    /// One lossy step, called out because it matters: `IngestDisposition` has a
-    /// distinct `.resplit` case for 413, but `SinkOutcome` does not, so a 413
-    /// becomes `.drop`. That follows the agreed core contract (413 drops), and it
-    /// is safe — dropping loses one oversized batch, whereas retrying the same
-    /// bytes would loop forever. It does forgo §7's preferred behavior of
-    /// re-splitting into smaller batches with new `batchId`s. If `SinkOutcome`
-    /// ever gains a re-split case, this is the one line to change.
+    /// A total, case-for-case mapping with nothing lost: `.resplit` becomes
+    /// `SinkOutcome.tooLarge`, which is what makes the dispatcher halve the batch
+    /// and retry the halves under new `batchId`s — §7's actual 413 requirement,
+    /// rather than the permanent drop a sink without that case would have to
+    /// settle for.
     static func outcome(for disposition: IngestDisposition) -> SinkOutcome {
         switch disposition {
         case .accepted:
@@ -135,9 +93,7 @@ public struct CloudflareSink: StatsSink {
         case .drop(let reason):
             return .drop(reason: reason)
         case .resplit:
-            return .drop(
-                reason: "413 Payload Too Large — the batch exceeds 256 KiB and cannot be re-split here."
-            )
+            return .tooLarge
         }
     }
 }

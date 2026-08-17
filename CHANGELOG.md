@@ -10,6 +10,61 @@ package; schema changes are called out explicitly below.
 ## [Unreleased]
 
 ### Added
+- **`Stats` core client** — the emitter the schema was written for:
+  - Value types encoding exactly per schema: `StatsEvent`, `StatsContext`,
+    `StatsBatch`, and `StatsValue` (string / int / double / bool / null, with
+    literal conformances so `["count": 3, "cached": true, "section": nil]` just
+    works). Timestamps are hand-rolled millisecond UTC (`…T14:03:11.482Z`);
+    absent optionals and empty `props` are omitted rather than nulled.
+  - `StatsClient`, an `actor`: `track(_:props:)`, `identify(userID:)`,
+    `setConsent(_:)`, `isEnabled` / `setEnabled(_:)`, `flush()`, `reset()`,
+    `applicationDidBecomeActive()` / `applicationDidEnterBackground()`.
+    `track()` returns once the event is on disk.
+  - `StatsSink` (`nonisolated protocol`, never throws) with `SinkOutcome` =
+    `.accepted` / `.retry(after:)` / `.tooLarge` / `.drop(reason:)`, and a
+    documented mapping from every §7 HTTP status onto the four.
+  - `EventStore`: JSON-lines queue in `Application Support/<appId>/swift-stats/`,
+    one append per group of captured events, loaded on start, capped with
+    drop-oldest, and carrying the context frozen at track time with each event.
+  - `Dispatcher`: flush at N events / T elapsed / on background; batches of
+    ≤ 100 events and ≤ 256 KiB (byte limit applied first) that never mix two
+    install ids, app ids or project ids (§1); one request in flight via task
+    chaining; exponential backoff from 1 s with full jitter, floored at the base
+    and capped at 5 minutes, during which no trigger may send; a `.tooLarge`
+    re-split into halves with fresh batch ids (§7's 413 row); a 24-hour ceiling
+    on *delivery attempts* for a batch, measured on the monotonic clock so a
+    long-offline device is not punished for having been offline; `batchId`
+    reused across retries of the same batch, and reissued whenever the queue
+    head moves under it; permanent drops deleted immediately.
+  - Identity per §9: random UUID → salted SHA-256 (CryptoKit) in the SDK's own
+    `UserDefaults` suite derived from the app id; `seq` persisted; `reset()`
+    regenerates. Sessions per §10 (launch + monotonic inactivity gap, default 30
+    min on macOS / 5 min elsewhere, id `<epochSeconds>-<8 digits>`), auto-events
+    per §12 in their fixed boundary order, all opt-in.
+  - Consent per §11: `usage` / `diagnostics` / `identity`, default `[]`, denial
+    of `diagnostics` sending the documented fallbacks, denial of `identity`
+    switching to a per-session ephemeral install id, and any revocation
+    discarding the queue and deleting the stored install UUID.
+  - Injected `StatsClock` / `StatsUUIDProvider` / `StatsRandomSource` seams; the
+    package never calls `Date.now` or `Task.sleep` directly.
+- **`StatsTesting`**: `InMemorySink` (recording, scriptable outcomes),
+  `ManualClock` (conforms to both `StatsClock` and the standard `Clock`; a test
+  advances it rather than sleeping), `FixedUUIDProvider`, `FixedRandomSource`.
+- **`StatsTests`**: 65 tests covering schema encoding round-trips, props
+  truncation and the byte-wise 32-key cap, identity hashing and `reset()`,
+  session-gap and boundary ordering, consent gating, opt-out, all three flush
+  triggers, batch splitting by count and bytes, retry/backoff/drop semantics,
+  queue persistence across a relaunch (asserting the frozen context is *not*
+  re-stamped by a newer app version), and drop-oldest — plus the pre-existing
+  privacy-manifest assertion. No test sleeps.
+- Two context fields are **supplied by the consumer** rather than sampled, so the
+  core keeps importing nothing but Foundation and `os`: `screenMetrics` /
+  `colorScheme` (which would need AppKit/UIKit and a main-actor hop) and
+  `isPreRelease` for the context's `isTestFlight` (whose classic
+  `Bundle.appStoreReceiptURL` check is deprecated in favor of StoreKit's
+  `AppTransaction`). All three default to values §3 and §11 explicitly permit —
+  `0` / `0` / `1.0`, omitted, and `false`. Also, `osName` reports `iOS` on
+  iPadOS, since distinguishing them requires UIKit.
 - Package scaffold: `Stats`, `StatsCloudflare` and `StatsTesting` products,
   `StatsTests` and `StatsCloudflareTests` test targets. Swift tools 6.2,
   language mode 6, `ExistentialAny`, macOS 15 / iOS 18, zero dependencies.
@@ -68,18 +123,20 @@ package; schema changes are called out explicitly below.
   loopback exempt per §7), `StatsTransport` (the injectable HTTP seam, which
   declines redirects so a 3xx cannot move the write key), and
   `IngestDisposition.from(statusCode:headers:)` — the whole of §7's retry policy
-  as a pure, tested function. `CloudflareSink` is written against the core sink
-  API and excluded from the build until P12b defines `StatsSink`, `SinkOutcome`
-  and `StatsBatch`.
+  as a pure, tested function. `CloudflareSink` is the `StatsSink` conformance:
+  it posts `batch.serialized()` (never its own encoding, so the bytes the
+  dispatcher size-checked are the bytes on the wire) and maps 413 to
+  `.tooLarge`, so the dispatcher re-splits rather than dropping.
 - MIT `LICENSE`, `README.md`, this changelog, `.gitignore`, and a GitHub
   Actions workflow running `swift build` and `swift test` on `macos-15`.
 
 ### Not yet implemented
-- The emitter itself — `StatsClient`, the file-backed event queue, the
-  dispatcher, identity, sessions and consent — lands next. The quick-start in
-  the README is the planned API and does not compile today.
-- `CloudflareSink` (the `StatsSink` conformance in `StatsCloudflare`) is written
-  but excluded from the build until the core sink API exists. The rest of
-  `StatsCloudflare` — including the entire read side — builds and is tested today.
+- Known and accepted: a crash between a `202` and the queue file being rewritten
+  re-sends those events under a **new** `batchId` on the next launch, so the
+  backend's dedupe cannot suppress them. Delivery is at-least-once by design;
+  persisting the in-flight batch id would close this and is a later change.
+- One `EventStore` per queue file is assumed. Two `StatsClient`s over the same
+  app id (an app plus an extension, say) would interleave `seq` and overwrite
+  each other's queue file — there is no file locking in v1.
 
 [Unreleased]: https://github.com/awizemann/swift-stats/commits/main

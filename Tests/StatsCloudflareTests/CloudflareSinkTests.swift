@@ -1,20 +1,3 @@
-// ============================================================================
-//  NOT YET COMPILED — excluded from `StatsCloudflareTests` in Package.swift
-// ============================================================================
-//
-//  Paired with Sources/StatsCloudflare/CloudflareSink.swift, which needs
-//  `StatsSink`, `SinkOutcome` and `StatsBatch` from `Sources/Stats`. Remove both
-//  `exclude:` entries in Package.swift once those exist, then `swift test`.
-//
-//  The §7 status table these tests lean on is ALREADY covered, and covered
-//  without needing the core types, by `IngestDispositionTests`. What is left here
-//  is the request construction and the `IngestDisposition -> SinkOutcome`
-//  translation.
-//
-//  The `makeBatch()` helper below is a placeholder: `StatsBatch`'s initializer is
-//  the other agent's to define, so fill it in from the real one at merge time.
-// ============================================================================
-
 import Foundation
 import Testing
 import Stats
@@ -30,9 +13,41 @@ struct CloudflareSinkTests {
         CloudflareSink(endpoint: endpoint, writeKey: writeKey, transport: transport)
     }
 
-    /// TODO(merge): build a real `StatsBatch` with the core's initializer.
+    /// A minimal but genuinely valid §1 envelope.
     static func makeBatch() -> StatsBatch {
-        fatalError("Fill in from the core StatsBatch initializer at merge time.")
+        StatsBatch(
+            batchId: "8B0B8AF0-3E9F-4F9F-9F1D-4E45B0A9C0D1",
+            sentAt: Date(timeIntervalSince1970: 1_786_928_400),
+            context: StatsContext(
+                sdkVersion: Stats.sdkVersion,
+                appVersion: "1.4.2",
+                appBuild: "318",
+                bundleId: "com.wizemann.Overwatch",
+                osName: "macOS",
+                osVersion: "15.4.1",
+                deviceModel: "Mac15,3",
+                arch: "arm64",
+                locale: "en_US",
+                region: "US",
+                screenWidth: 1512,
+                screenHeight: 982,
+                screenScale: 2.0,
+                isDebug: false,
+                isTestFlight: false,
+                colorScheme: "dark"
+            ),
+            events: [
+                StatsEvent(
+                    name: "project_opened",
+                    ts: Date(timeIntervalSince1970: 1_786_928_391),
+                    sessionId: "1786012978-40371852",
+                    installId: String(repeating: "a", count: 64),
+                    appId: "com.wizemann.Overwatch",
+                    seq: 41,
+                    props: ["section": "analytics", "cached": true]
+                )
+            ]
+        )
     }
 
     @Test("Posts to /v1/events with the write key and a JSON content type")
@@ -72,7 +87,10 @@ struct CloudflareSinkTests {
             (400, "drop"),
             (401, "drop"),
             (403, "drop"),
-            (413, "drop"),   // see CloudflareSink.outcome(for:) on the lossy step
+            // §7's actual 413 requirement: re-split with new batchIds, which is
+            // what `.tooLarge` asks the dispatcher to do. A `.drop` here would
+            // silently discard an oversized batch instead.
+            (413, "tooLarge"),
             (429, "retry"),
             (500, "retry"),
             (503, "retry"),
@@ -83,6 +101,7 @@ struct CloudflareSinkTests {
             switch outcome {
             case .accepted: actual = "accepted"
             case .retry: actual = "retry"
+            case .tooLarge: actual = "tooLarge"
             case .drop: actual = "drop"
             }
             #expect(actual == expected, "status \(status)")
