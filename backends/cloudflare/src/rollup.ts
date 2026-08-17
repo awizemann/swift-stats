@@ -237,7 +237,8 @@ export async function runScheduled(env: Env, now: Date): Promise<{
   //        §1 explicitly permits — it lands in a day the last pass already rolled
   //        and is never rolled again.
   //      * `bucketDay` clamps an implausibly old `ts` onto the *oldest surviving
-  //        day*, which is precisely the day the next sweep deletes.
+  //        day* — precisely the day the next sweep keeps, and so the last day
+  //        whose raw rows a pass must roll before a later sweep removes them.
   //
   //    So the set to roll is not "the last four days", it is "every day whose raw
   //    rows this pass is about to remove". In the steady state that is one day,

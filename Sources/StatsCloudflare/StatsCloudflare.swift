@@ -3,10 +3,11 @@ import Stats
 
 /// Namespace for the Cloudflare backend adapter.
 ///
-/// Placeholder for P12c, which adds the HTTP sink that posts batches to a
-/// `stats-worker` deployment (`POST /v1/events`) and the read helper for
-/// `GET /v1/summary`. Both must conform to `docs/schema.md` and pass the
-/// conformance checklist in `backends/README.md`.
+/// Holds the paths and version constants shared by `CloudflareSink` (which
+/// posts batches to a `stats-worker` deployment's `POST /v1/events`) and
+/// `StatsQuery` (which reads `GET /v1/summary` and `GET /v1/events/top`). Both
+/// conform to `docs/schema.md` and to the conformance checklist in
+/// `backends/README.md`.
 public enum StatsCloudflare: Sendable {
     /// Version of this adapter. Tracks the package version.
     public static let adapterVersion = Stats.sdkVersion

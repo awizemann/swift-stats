@@ -26,7 +26,7 @@ cron 10 2 * * *        roll up closed days, then delete raw events past 90 days
 |---|---|---|
 | `projects` | tenants | `id` (the wire `projectId`) |
 | `keys` | **SHA-256 hashes** of write and read keys | `key_hash`; `(project_id, kind)` |
-| `batches` | the `batchId` dedupe ledger (§6) | `batch_id` PK — the dedupe *is* the PK |
+| `batches` | the `batchId` dedupe ledger (§6) | `(project_id, batch_id)` PK — the dedupe *is* the PK |
 | `batch_context` | the §3 context, once per batch | `batch_id` |
 | `events` | one row per event | `(project_id, day)`, `(project_id, day, name)`, `(install_id)`, `(day)` |
 | `daily_rollups` | per-day `opens` / `sessions` / `activeInstalls` / `events` | `(project_id, day, include_debug)` |

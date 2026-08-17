@@ -143,7 +143,7 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
   const statements: D1PreparedStatement[] = [];
 
   // §6 idempotency. This INSERT is the FIRST statement of the batch and
-  // `batches.batch_id` is the PRIMARY KEY, so a duplicate aborts the entire D1
+  // `(project_id, batch_id)` is the PRIMARY KEY, so a duplicate aborts the D1
   // batch atomically — events cannot be written twice, and there is no
   // read-then-write race to lose. (A pre-flight SELECT would have exactly that
   // race: two concurrent retries of the same batch would both see "absent".)

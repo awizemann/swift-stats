@@ -340,8 +340,15 @@ describe('validation → 400 (§0, §2, §5)', () => {
   });
 
   it('never echoes the request body in an error response', async () => {
-    const marker = 'canary_value_that_must_not_come_back';
-    const response = await post(makeBatch({ events: [makeEvent({ name: marker.toUpperCase() })] }));
+    // The marker must be asserted in the EXACT form that was sent. Sending
+    // `marker.toUpperCase()` while asserting the lowercase form made this
+    // unfalsifiable: the response could echo the name verbatim and still pass.
+    const marker = 'CANARY_VALUE_THAT_MUST_NOT_COME_BACK';
+    const response = await post(
+      makeBatch({
+        events: [makeEvent({ name: marker, props: { section: marker }, userId: marker })]
+      })
+    );
     expect(response.status).toBe(400);
     expect(await response.text()).not.toContain(marker);
   });

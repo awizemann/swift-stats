@@ -9,6 +9,11 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-08-17
+
+First tagged release: wire schema `v1`, the `Stats` core emitter, the
+`StatsCloudflare` adapter, and the Cloudflare Worker + D1 backend.
+
 ### Added
 - **`Stats` core client** — the emitter the schema was written for:
   - Value types encoding exactly per schema: `StatsEvent`, `StatsContext`,
@@ -139,4 +144,5 @@ package; schema changes are called out explicitly below.
   app id (an app plus an extension, say) would interleave `seq` and overwrite
   each other's queue file — there is no file locking in v1.
 
-[Unreleased]: https://github.com/awizemann/swift-stats/commits/main
+[Unreleased]: https://github.com/awizemann/swift-stats/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/awizemann/swift-stats/releases/tag/0.1.0

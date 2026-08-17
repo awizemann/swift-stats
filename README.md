@@ -4,11 +4,11 @@ Privacy-first usage analytics for native Apple apps. A small Swift package, zero
 dependencies, Swift 6 language mode, and a documented wire schema so the backend
 is yours to choose.
 
-> **Status: core client + schema (v0.1.0, unreleased).**
+> **Status: core client + schema (v0.1.0).**
 > The wire contract in [`docs/schema.md`](docs/schema.md) is complete and stable
 > for `v1`, and the emitter (`StatsClient`, the file-backed queue, the
-> dispatcher, identity, sessions, consent) is implemented and tested. What is
-> A shipping backend is included: [`backends/cloudflare/`](backends/cloudflare/README.md)
+> dispatcher, identity, sessions, consent) is implemented and tested. A shipping
+> backend is included: [`backends/cloudflare/`](backends/cloudflare/README.md)
 > (Worker + D1) with the matching `StatsCloudflare` adapter. See [Roadmap](#roadmap).
 
 ## Why
@@ -137,8 +137,8 @@ nonisolated protocol UsageTracking: Sendable {          // an actor can conform
     func track(_ name: String, props: [String: StatsValue]) async
 }
 
-// In tests (from StatsTesting): a recording sink, a clock you drive by hand,
-// and deterministic ids. No test needs to sleep.
+// In tests, `import StatsTesting` for a recording sink, a clock you drive by
+// hand, and deterministic ids. No test needs to sleep.
 let sink = InMemorySink(outcomes: [.retry(after: nil), .accepted])
 let clock = ManualClock()
 let client = StatsClient(configuration: StatsConfiguration(
@@ -274,7 +274,8 @@ Tests/
   StatsTests/              Encoding, props, identity, sessions, consent, dispatch
                              — plus a test asserting the privacy manifest's contents
   StatsCloudflareTests/
-.github/workflows/ci.yml   swift build + swift test on macos-15
+.github/workflows/ci.yml   swift build + swift test on macos-15, plus the
+                             backend's vitest conformance suite
 CHANGELOG.md               Keep-a-changelog, semver
 ```
 
@@ -287,7 +288,7 @@ CHANGELOG.md               Keep-a-changelog, semver
 | P12c | `backends/cloudflare/`: ingest Worker on D1 + read helper | **done** |
 | P12d | First consumer emits events | planned |
 | P12e | Read side: per-project usage in a consumer app | planned |
-| P12f | Tag 0.1.0, semver policy | planned |
+| P12f | Tag 0.1.0, semver policy | **done** |
 
 Until 1.0, minor versions may make breaking API changes. The **wire schema** is
 versioned separately, and `v1` will not break — see

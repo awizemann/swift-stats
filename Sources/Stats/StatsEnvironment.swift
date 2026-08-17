@@ -2,6 +2,9 @@
 import Darwin
 #endif
 import Foundation
+import os
+
+private nonisolated let logger = Logger(subsystem: StatsLog.subsystem, category: "Environment")
 
 /// Samples the context object (schema §3) from the process.
 ///
@@ -20,10 +23,20 @@ nonisolated enum StatsEnvironment {
         isPreRelease: Bool?
     ) -> StatsContext {
         let info = Bundle.main.infoDictionary
+        let appVersion = info?["CFBundleShortVersionString"] as? String ?? "0"
+        let appBuild = info?["CFBundleVersion"] as? String ?? "0"
+        // §3 caps these at 32 scalars and `deviceModel` at 64. They come from the
+        // consumer's Info.plist and from `sysctl`, so the SDK cannot fix them —
+        // but §0 makes an over-long field a **400 for the whole batch**, which is
+        // a permanent drop. Without this line the only symptom would be every
+        // batch vanishing with no local signal at all.
+        warnIfOverLimit(appVersion, limit: 32, field: "appVersion (CFBundleShortVersionString)")
+        warnIfOverLimit(appBuild, limit: 32, field: "appBuild (CFBundleVersion)")
+
         return StatsContext(
             sdkVersion: Stats.sdkVersion,
-            appVersion: info?["CFBundleShortVersionString"] as? String ?? "0",
-            appBuild: info?["CFBundleVersion"] as? String ?? "0",
+            appVersion: appVersion,
+            appBuild: appBuild,
             bundleId: bundleId,
             osName: osName,
             osVersion: osVersion,
@@ -38,6 +51,18 @@ nonisolated enum StatsEnvironment {
             isTestFlight: isPreRelease ?? isTestFlightFallback,
             colorScheme: colorScheme
         )
+    }
+
+    /// Logs a §3 context field that exceeds its documented scalar limit. The
+    /// value itself is never logged — only the field name and the two counts.
+    private static func warnIfOverLimit(_ value: String, limit: Int, field: String) {
+        let count = value.unicodeScalars.count
+        guard count > limit else { return }
+        logger.warning("""
+            context field \(field, privacy: .public) is \(count, privacy: .public) scalars, over \
+            the schema §3 limit of \(limit, privacy: .public); a conforming backend will reject \
+            every batch with 400
+            """)
     }
 
     /// One of the schema's closed set. iPadOS is reported as `iOS`: telling them

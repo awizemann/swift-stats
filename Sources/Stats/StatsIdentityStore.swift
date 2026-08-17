@@ -150,9 +150,4 @@ struct StatsIdentityStore: @unchecked Sendable {
         }
         return Self.hash(raw, salt: salt)
     }
-
-    /// Wipes everything this suite holds. Used by `reset()`.
-    func removeAll() {
-        defaults.removePersistentDomain(forName: suiteName)
-    }
 }

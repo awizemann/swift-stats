@@ -3,10 +3,9 @@ import os
 
 /// Namespace for package-wide constants.
 ///
-/// P12a ships the schema contract and the package scaffold only; the emitter
-/// (`StatsClient`, `EventStore`, `Dispatcher`, identity, sessions, consent)
-/// lands in P12b. The wire contract those types must honor is
-/// `docs/schema.md`, which is versioned independently of this SDK.
+/// The wire contract every type in this package honors is `docs/schema.md`,
+/// which is versioned independently of this SDK: `sdkVersion` names this build,
+/// `schemaVersion` names the wire format that build speaks.
 public enum Stats: Sendable {
     /// Version of this Swift package. Semver; `0.x` means the API may still move.
     public static let sdkVersion = "0.1.0"

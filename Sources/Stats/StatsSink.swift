@@ -2,7 +2,7 @@ import Foundation
 
 /// What a sink says happened to a batch.
 ///
-/// The three cases are exactly the three behaviors schema §7's response table
+/// The four cases are exactly the four behaviors schema §7's response table
 /// prescribes for the emitter, collapsed to the only distinctions the
 /// dispatcher can act on. Mapping HTTP status codes onto them is the sink's
 /// job, and the mapping is normative:
@@ -11,7 +11,7 @@ import Foundation
 /// |---|---|
 /// | 202 | `.accepted` |
 /// | 400, 401, any other 4xx, 3xx | `.drop(reason:)` |
-/// | 413 | `.drop` after re-splitting, or `.retry` if it re-splits itself |
+/// | 413 | `.tooLarge` — the dispatcher halves the batch and reissues `batchId`s |
 /// | 429 | `.retry(after: Retry-After)` |
 /// | 5xx, transport error, timeout | `.retry(after: nil)` |
 public enum SinkOutcome: Sendable, Hashable {

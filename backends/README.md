@@ -15,7 +15,7 @@ One folder per backend:
 ```
 backends/
   README.md            ← this file: the rules for all backends
-  cloudflare/          ← reserved for P12c: Worker + Analytics Engine (or D1)
+  cloudflare/          ← Worker + D1: ingest, reads, migrations, admin CLI
 ```
 
 Each backend folder MUST contain its own `README.md` covering:
