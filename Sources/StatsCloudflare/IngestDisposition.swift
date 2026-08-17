@@ -101,14 +101,26 @@ public enum IngestDisposition: Sendable, Equatable {
     /// The HTTP-date form is deliberately not parsed. It is legal HTTP but not in
     /// the schema, and misreading a date as a duration could park a batch for
     /// years — returning `nil` falls back to the §7 backoff, which is bounded at
-    /// 5 minutes per attempt. A negative or absurd value is treated the same way.
+    /// 5 minutes per attempt.
+    ///
+    /// The hint is honored **up to 24 hours**, and only the floor is clamped
+    /// here (a zero or negative value is not a wait, it is a request loop, so it
+    /// falls back to the schedule). It used to be capped at 5 minutes, which read
+    /// §7's per-attempt backoff ceiling as a ceiling on `Retry-After` too — it is
+    /// not: §7 says "wait `Retry-After` if present, **else** the backoff schedule",
+    /// and the 5 minutes bounds the schedule. Capping it meant a backend shedding
+    /// load with `Retry-After: 1800` got hammered every 5 minutes by exactly the
+    /// clients it had asked to back off. 24 hours is the batch's §7 retention
+    /// ceiling, past which the emitter drops it anyway, so a longer hint could
+    /// only park a batch until it expired without ever being attempted.
     static func retryAfter(from headers: [String: String]) -> Duration? {
         guard let raw = headers["retry-after"]?.trimmingCharacters(in: .whitespaces),
               let seconds = Int(raw),
               seconds > 0
         else { return nil }
-        // Cap at the §7 per-attempt ceiling of 5 minutes: a cooperative client
-        // should not be talked into a longer sleep than the schedule allows.
-        return .seconds(min(seconds, 300))
+        return .seconds(min(seconds, maxRetryAfterSeconds))
     }
+
+    /// §7's 24-hour retention ceiling for a batch, in seconds.
+    static let maxRetryAfterSeconds = 24 * 60 * 60
 }

@@ -124,11 +124,32 @@ struct IngestDispositionTests {
             }
         }
 
-        @Test("Retry-After is capped at the §7 per-attempt ceiling of 5 minutes")
-        func capped() {
+        /// §7 says "wait `Retry-After` if present, **else** the backoff schedule",
+        /// so the 5-minute cap bounds the *schedule*, not the server's
+        /// instruction. Capping the hint at 5 minutes meant a backend shedding
+        /// load with `Retry-After: 1800` got hammered every 5 minutes by exactly
+        /// the clients it had asked to stay away.
+        @Test("A Retry-After longer than the backoff cap is honored, not truncated", arguments: [
+            (600, 600),       // 10 minutes — was silently cut to 300
+            (1_800, 1_800),   // 30 minutes, a realistic load-shedding value
+            (86_400, 86_400)  // exactly the ceiling
+        ])
+        func honorsLongHint(seconds: Int, expected: Int) {
             #expect(
-                IngestDisposition.from(statusCode: 429, headers: ["retry-after": "86400"])
-                    == .retry(after: .seconds(300))
+                IngestDisposition.from(statusCode: 429, headers: ["retry-after": String(seconds)])
+                    == .retry(after: .seconds(expected))
+            )
+        }
+
+        /// The only ceiling left is §7's 24-hour retention ceiling for a batch:
+        /// past it the emitter drops the batch anyway, so honoring a longer hint
+        /// could only park it until it expired without ever being attempted.
+        @Test("Beyond 24 hours the hint is clamped to the retention ceiling")
+        func cappedAtRetentionCeiling() {
+            #expect(IngestDisposition.maxRetryAfterSeconds == 86_400)
+            #expect(
+                IngestDisposition.from(statusCode: 429, headers: ["retry-after": "999999"])
+                    == .retry(after: .seconds(86_400))
             )
         }
 

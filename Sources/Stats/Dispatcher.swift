@@ -327,11 +327,19 @@ actor Dispatcher {
         let delay: Duration
         if let serverHint {
             // A 429's `Retry-After` is authoritative; jittering it would ignore a
-            // server that told us exactly when to come back. It is still clamped
-            // to the schedule's floor and ceiling — a hint of `0` (or a negative
-            // one) would otherwise turn the retry into an unthrottled request
-            // loop driven by a remote value.
-            delay = min(max(serverHint, configuration.backoffBase), configuration.backoffCap)
+            // server that told us exactly when to come back.
+            //
+            // Only the FLOOR is clamped: a hint of `0` (or a negative one) is not
+            // a wait, it is an unthrottled request loop driven by a remote value.
+            // The ceiling is the §7 retention ceiling, not `backoffCap` — §7 says
+            // "wait `Retry-After` if present, ELSE the backoff schedule", so the
+            // 5-minute cap bounds the schedule, not the server's instruction.
+            // Clamping to 5 minutes meant a backend shedding load with
+            // `Retry-After: 1800` was hammered every 5 minutes by exactly the
+            // clients it had asked to stay away. Past the retention ceiling the
+            // batch is dropped anyway, so honoring a longer hint could only park
+            // it until it expired unattempted.
+            delay = min(max(serverHint, configuration.backoffBase), configuration.retentionCeiling)
         } else {
             let exponent = min(max(consecutiveRetries - 1, 0), 16)
             let uncapped = configuration.backoffBase * Double(1 << exponent)

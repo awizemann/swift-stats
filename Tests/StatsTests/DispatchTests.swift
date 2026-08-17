@@ -152,6 +152,48 @@ struct DispatchTests {
         await harness.tearDown()
     }
 
+    /// Discriminating: 30 minutes is longer than `backoffCap` (5 minutes) and
+    /// shorter than `retentionCeiling` (24 hours). The old clamp to `backoffCap`
+    /// turned it into 300 s, so a backend shedding load got hammered every five
+    /// minutes by exactly the clients it had asked to stay away. §7 caps the
+    /// *schedule* at 5 minutes; a server's explicit instruction is honored up to
+    /// the batch's retention ceiling.
+    @Test("A server Retry-After past the backoff cap is honored up to the retention ceiling")
+    func retryAfterHonoredPastBackoffCap() async {
+        let harness = Harness(flushAt: 10_000, outcomes: [.retry(after: .seconds(1_800))])
+        await harness.client.track("a")
+        await harness.client.flush()
+        await harness.client.waitForFlushes()
+
+        #expect(harness.clock.requestedSleeps.contains(.seconds(1_800)))
+        #expect(
+            !harness.clock.requestedSleeps.contains(.seconds(300)),
+            "the hint must not be truncated to the backoff cap"
+        )
+        #expect(await harness.client.queuedEventCount == 1)
+        await harness.tearDown()
+    }
+
+    /// The floor and the ceiling that do remain. A hint of zero is a request
+    /// loop, not a wait, so it is floored at `backoffBase`; a hint past the
+    /// retention ceiling could only park the batch until it expired unattempted.
+    @Test("A Retry-After is floored at the backoff base and ceilinged at the retention ceiling", arguments: [
+        (Duration.seconds(0), Duration.seconds(1)),
+        (Duration.milliseconds(1), Duration.seconds(1)),
+        (Duration.seconds(48 * 60 * 60), Duration.seconds(24 * 60 * 60))
+    ])
+    func retryAfterClamps(hint: Duration, expected: Duration) async {
+        let harness = Harness(flushAt: 10_000, outcomes: [.retry(after: hint)])
+        await harness.client.track("a")
+        await harness.client.flush()
+        await harness.client.waitForFlushes()
+
+        // The interval timer also sleeps (30 s); the retry is the other one.
+        let backoffs = harness.clock.requestedSleeps.filter { $0 != .seconds(30) }
+        #expect(backoffs.contains(expected), "hint \(hint) should schedule \(expected)")
+        await harness.tearDown()
+    }
+
     @Test("Backoff is capped, so a long outage does not schedule an hour-long wait")
     func backoffCap() async {
         let harness = Harness(
