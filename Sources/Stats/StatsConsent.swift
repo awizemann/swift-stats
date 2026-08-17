@@ -2,9 +2,16 @@ import Foundation
 
 /// The three independently togglable consent groups of schema §11.
 ///
-/// The SDK's default is `[]` — **collect nothing**. An app may default it to on
-/// where its own privacy policy and jurisdiction allow, but it has to say so in
-/// code; there is no way to get collection by forgetting to configure consent.
+/// The SDK's default is `[.usage, .diagnostics]` — **opt-out by default for an
+/// app**. The app is the thing with a privacy policy and a jurisdiction, and the
+/// end-user opt-out it must ship is `setEnabled(false)`.
+///
+/// `.identity` is **not** in the default: it makes an install stable across
+/// launches and lets `identify()` emit a `userId`, which changes what the
+/// consumer has to disclose (§14). It has to be asked for in code.
+///
+/// Pass `.none` to collect nothing at all until a person says yes — with `.none`
+/// recorded there is no queue, no install id and no context.
 public struct StatsConsent: OptionSet, Sendable, Hashable, Codable {
     public let rawValue: Int
     public init(rawValue: Int) { self.rawValue = rawValue }
@@ -21,8 +28,12 @@ public struct StatsConsent: OptionSet, Sendable, Hashable, Codable {
 
     /// Everything. Note this includes `identity`, which most apps do not need.
     public static let all: StatsConsent = [.usage, .diagnostics, .identity]
-    /// The SDK default.
+    /// Collect nothing at all. **Not** the SDK default (see the type's docs);
+    /// pass it explicitly when the app wants a person to opt *in* first.
     public static let none: StatsConsent = []
+
+    /// The SDK default: usage and diagnostics, without `identity`.
+    public static let `default`: StatsConsent = [.usage, .diagnostics]
 }
 
 /// The auto-events of schema §12, all opt-in and default off.

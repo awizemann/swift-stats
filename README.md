@@ -28,11 +28,17 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
   storage, no location, no free text, no session replay. The list of things the
   schema forbids is written down and normative:
   [schema §13](docs/schema.md#13-deliberately-never-collected).
-- **Opt-out by default, per app.** With no configuration the SDK collects
-  nothing at all — no queue, no id, no context. Consent is three independent
-  groups (`usage` / `diagnostics` / `identity`) and it persists. A leaked write
-  key can only append to the one project it was minted for — the backend derives
-  the project from the key, never from the client.
+- **Opt-out by default, per app.** With no configuration the SDK collects usage
+  and diagnostics — `consent` defaults to `[.usage, .diagnostics]` — and the
+  opt-out you ship for a person is `setEnabled(false)`. `identity` is **not** in
+  the default and has to be asked for in code, because a stable install id and a
+  `userId` change what your app must disclose
+  ([schema §14](docs/schema.md#14-privacy-manifest)). If your policy or
+  jurisdiction wants collect-nothing-until-asked, pass `consent: .none`: with
+  `.none` recorded there is no queue, no id and no context. Consent is three
+  independent groups (`usage` / `diagnostics` / `identity`) and it persists. A
+  leaked write key can only append to the one project it was minted for — the
+  backend derives the project from the key, never from the client.
 - **Not tracking.** `NSPrivacyTracking` is `false` and there are no tracking
   domains, because first-party data with a non-correlatable id is not tracking.
   No ATT prompt. The bundled `PrivacyInfo.xcprivacy` says exactly that, and a
@@ -88,7 +94,9 @@ let stats = StatsClient(configuration: StatsConfiguration(
     // sessionGap defaults to 30 min on macOS, 5 min on iOS
 ))
 
-// 2. Nothing is collected until the person says yes: the SDK's default is `[]`.
+// 2. Consent already defaults to [.usage, .diagnostics], so this line is only
+//    needed to CHANGE it — to grant .identity (a stable install id + userId), or
+//    to pass .none if your policy wants collect-nothing-until-asked.
 await stats.setConsent([.usage, .diagnostics])   // .identity withheld → per-session id
 
 // 3. Track. Names are snake_case; props are flat and never carry user text.
@@ -236,9 +244,25 @@ Five things the SDK cannot do for you:
    silently re-identifies every install as new.
 
 4. **Ship an opt-out control.** `setEnabled(false)` for the master switch and
-   `setConsent(_:)` for the three groups; both persist. Remember that revoking a
-   group *discards* the queue and deletes the stored install id — that is the
-   point. Put the toggle somewhere a person can find it.
+   `setConsent(_:)` for the three groups; both persist. Put the toggle somewhere
+   a person can find it.
+
+   The two are **deliberately asymmetric about the install id**, and it is worth
+   knowing which you are calling:
+
+   | Call | Queue | Hashed `userId` | Persisted install UUID |
+   |---|---|---|---|
+   | `setEnabled(false)` | discarded | forgotten | **kept** |
+   | `setConsent(_:)` revoking a group | discarded | forgotten | **deleted** |
+   | `reset()` | flushed first | forgotten | regenerated (or deleted) |
+
+   The opt-out is a *switch*: a person who turns it off and back on expects the
+   same install, not a new one, and while it is off nothing is collected, so the
+   retained UUID sits unused and reaches no backend. A consent revocation is a
+   *withdrawal of permission to identify*, which
+   [schema §11](docs/schema.md#11-consent) requires be unresumable — keeping the
+   UUID would let a later grant continue a linkage the person had ended. If you
+   want "stop collecting **and** forget me", call `reset()` after the opt-out.
 
 5. **Pass in the two things the core cannot sample.** `screenMetrics` and
    `colorScheme` need AppKit/UIKit, and `isPreRelease` (the context's

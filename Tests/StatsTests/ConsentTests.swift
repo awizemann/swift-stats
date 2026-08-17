@@ -7,7 +7,42 @@ import Testing
 /// revocation must destroy.
 @Suite("Consent and opt-out")
 struct ConsentTests {
-    @Test("With no consent recorded, nothing is captured at all")
+    /// The product decision: the package is opt-**out** by default *for an app*,
+    /// and the end-user opt-out is `setEnabled(false)`. `.identity` stays out of
+    /// the default because granting it changes the consumer's §14 disclosure.
+    @Test("The configuration default is [.usage, .diagnostics] — identity withheld")
+    func configurationDefaultIsUsageAndDiagnostics() async {
+        #expect(StatsConsent.default == [.usage, .diagnostics])
+        #expect(!StatsConsent.default.contains(.identity))
+
+        // Discriminating on the *client*, not just the constant: a client whose
+        // configuration never mentions consent collects, and collects without a
+        // stable identity.
+        let harness = Harness(consent: .default, sessionGap: .seconds(300))
+        #expect(await harness.client.currentConsent == [.usage, .diagnostics])
+
+        await harness.client.identify(userID: "account-1")
+        await harness.client.track("a")
+        harness.clock.advance(by: .seconds(400))
+        await harness.client.track("b")
+        await harness.client.flush()
+        await harness.client.waitForFlushes()
+
+        let events = await harness.sink.sentEvents
+        #expect(events.map(\.name) == ["a", "b"])
+        // `diagnostics` granted, so the context is the real one …
+        #expect(await harness.sink.batches.first?.context.deviceModel != "unknown")
+        // … and `identity` is not, so no userId and a per-session install id.
+        #expect(events.allSatisfy { $0.userId == nil })
+        #expect(events[0].installId != events[1].installId)
+        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        #expect(suite?.string(forKey: "installUUID") == nil)
+        await harness.tearDown()
+    }
+
+    /// The default changing must not weaken the `.none` guarantee: an app that
+    /// asks for collect-nothing still gets collect-nothing.
+    @Test("With consent .none, nothing is captured at all")
     func defaultCollectsNothing() async {
         let harness = Harness(consent: .none)
         await harness.client.track("a")

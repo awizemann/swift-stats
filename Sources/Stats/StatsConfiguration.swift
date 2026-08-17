@@ -44,7 +44,17 @@ public struct StatsConfiguration: Sendable {
     public var enabled: Bool
 
     /// Initial consent, used only the first time this app runs (afterwards the
-    /// persisted choice wins). Default `[]` — collect nothing.
+    /// persisted choice wins).
+    ///
+    /// Default `[.usage, .diagnostics]`: the package is **opt-out by default for
+    /// an app**, because the app — not the package — is the thing with a privacy
+    /// policy and a jurisdiction, and the end-user opt-out it must ship is
+    /// `setEnabled(false)`. `.identity` is deliberately **not** in the default:
+    /// granting it means a stable install id and a `userId`, which changes what
+    /// the consumer has to disclose (§14), so it has to be asked for in code.
+    ///
+    /// Pass `.none` for collect-nothing-until-asked; with `.none` recorded,
+    /// nothing at all is collected — no queue, no install id, no context.
     public var consent: StatsConsent
 
     /// Which of the four reserved auto-events to emit. Default none (§12).
@@ -83,11 +93,15 @@ public struct StatsConfiguration: Sendable {
     public var uuidProvider: any StatsUUIDProvider
     public var randomSource: any StatsRandomSource
 
-    /// Overrides the app version/build/os/device sampling. Injected by tests so
-    /// the encoding assertions do not depend on the machine running them; `nil`
-    /// in production, where the values come from `Bundle` / `ProcessInfo` /
-    /// `uname`.
-    public var contextOverride: StatsContext?
+    /// Overrides the app version/build/os/device sampling. Injected by this
+    /// package's own tests so the encoding assertions do not depend on the
+    /// machine running them; in production the values come from `Bundle` /
+    /// `ProcessInfo` / `uname`.
+    ///
+    /// `package`, not `public`: it is a test seam, and a consumer that could set
+    /// it could make every event claim an app version, OS and device the install
+    /// is not running — which is a data-integrity hole, not a feature.
+    package var contextOverride: StatsContext?
 
     /// The platform default inactivity gap (§10).
     public static var defaultSessionGap: Duration {
@@ -108,7 +122,7 @@ public struct StatsConfiguration: Sendable {
         maxQueued: Int = 10_000,
         sessionGap: Duration = StatsConfiguration.defaultSessionGap,
         enabled: Bool = true,
-        consent: StatsConsent = .none,
+        consent: StatsConsent = .default,
         autoEvents: StatsAutoEvents = .none,
         storageDirectory: URL? = nil,
         screenMetrics: StatsScreenMetrics = .headless,
@@ -119,8 +133,7 @@ public struct StatsConfiguration: Sendable {
         backoffBase: Duration = .seconds(1),
         clock: any StatsClock = SystemStatsClock(),
         uuidProvider: any StatsUUIDProvider = SystemUUIDProvider(),
-        randomSource: any StatsRandomSource = SystemRandomSource(),
-        contextOverride: StatsContext? = nil
+        randomSource: any StatsRandomSource = SystemRandomSource()
     ) {
         self.appId = appId
         self.projectId = projectId
@@ -143,6 +156,6 @@ public struct StatsConfiguration: Sendable {
         self.clock = clock
         self.uuidProvider = uuidProvider
         self.randomSource = randomSource
-        self.contextOverride = contextOverride
+        self.contextOverride = nil
     }
 }

@@ -151,9 +151,14 @@ public final class ManualClock: StatsClock, Clock, @unchecked Sendable {
 }
 
 extension Duration {
-    /// Seconds as a `Double`. Public here because a test asserting a backoff
-    /// schedule needs to compare durations numerically.
-    public var statsSeconds: Double {
+    /// Seconds as a `Double`, for the backoff-schedule assertions in this
+    /// package's own tests.
+    ///
+    /// `package`, not `public`: a testing library has no business adding a
+    /// member to a standard-library type in every consumer's namespace, where it
+    /// would collide with theirs and could never be removed without a breaking
+    /// change. A consumer who wants it can write the one line themselves.
+    package var statsSeconds: Double {
         Double(components.seconds) + Double(components.attoseconds) * 1e-18
     }
 }

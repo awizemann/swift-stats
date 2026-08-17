@@ -114,6 +114,41 @@ struct EncodingTests {
         #expect(StatsTimestamp.date(from: text) == nil)
     }
 
+    /// Discriminating: every one of these passed the old `second < 61` /
+    /// `(1...31).contains(day)` checks and then *silently rolled over* through
+    /// `daysFromCivil`, so a queued line saying `2026-02-30` decoded to March 2nd
+    /// and re-encoded as a different string than the one on disk. §0 fixes the
+    /// format with no leap second, so `:60` is not a timestamp the schema carries.
+    @Test("A non-calendar day or a 60th second is rejected, not rolled over", arguments: [
+        "2026-08-17T14:03:60.000Z",  // leap-second-shaped: rolled to 14:04:00
+        "2026-02-30T00:00:00.000Z",  // February never has 30 days
+        "2026-02-29T00:00:00.000Z",  // 2026 is not a leap year
+        "2100-02-29T00:00:00.000Z",  // century, not divisible by 400
+        "2026-04-31T00:00:00.000Z",  // April has 30
+        "2026-06-31T00:00:00.000Z",
+        "2026-09-31T00:00:00.000Z",
+        "2026-11-31T00:00:00.000Z",
+        "2026-08-00T00:00:00.000Z"   // day zero
+    ])
+    func nonCalendarTimestampRejection(text: String) {
+        #expect(StatsTimestamp.date(from: text) == nil)
+    }
+
+    /// The other side of the boundary: the real leap days and 31sts must still
+    /// parse, so the days-per-month check cannot pass by rejecting everything.
+    @Test("Real calendar days on the boundary still parse", arguments: [
+        "2024-02-29T00:00:00.000Z",  // leap year
+        "2000-02-29T00:00:00.000Z",  // divisible by 400
+        "2026-02-28T23:59:59.999Z",
+        "2026-01-31T00:00:00.000Z",
+        "2026-04-30T00:00:00.000Z",
+        "2026-12-31T23:59:59.999Z"
+    ])
+    func calendarBoundaryAccepted(text: String) throws {
+        let date = try #require(StatsTimestamp.date(from: text))
+        #expect(StatsTimestamp.string(from: date) == text)
+    }
+
     @Test("An event with a malformed ts fails to decode rather than loading silently")
     func decodeRejectsBadTimestamp() throws {
         let line = """

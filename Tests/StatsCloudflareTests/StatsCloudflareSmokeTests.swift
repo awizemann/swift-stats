@@ -4,9 +4,16 @@ import Stats
 
 @Suite("StatsCloudflare scaffold")
 struct StatsCloudflareSmokeTests {
-    @Test("The adapter targets the same schema version as the core")
+    /// `StatsCloudflare.schemaVersion` is *defined* as `Stats.schemaVersion`, so
+    /// comparing the two asserted nothing: it was true by construction and would
+    /// have stayed true through a wire-breaking bump of both. The literal is the
+    /// actual contract — `docs/schema.md` is `v1`, and the Worker's
+    /// `SCHEMA_VERSION` in `validate.ts` serves `v1` only.
+    @Test("The adapter and the core both target wire schema v1")
     func schemaVersionsAgree() {
-        #expect(StatsCloudflare.schemaVersion == Stats.schemaVersion)
+        #expect(Stats.schemaVersion == "v1")
+        #expect(StatsCloudflare.schemaVersion == "v1")
+        #expect(Stats.sdkVersion == "0.1.0")
         #expect(StatsCloudflare.adapterVersion == Stats.sdkVersion)
     }
 

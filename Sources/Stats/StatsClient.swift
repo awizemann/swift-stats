@@ -185,6 +185,12 @@ public actor StatsClient {
     ///
     /// Under denied `identity` consent the call is remembered but never emitted,
     /// and `identify()` cannot re-enable linkage consent withheld.
+    ///
+    /// - Important: calling this puts the SDK's **User ID** data type in play, so
+    ///   the consuming app must declare `NSPrivacyCollectedDataTypeUserID` in its
+    ///   privacy manifest and nutrition label (schema §14) — the package's own
+    ///   `PrivacyInfo.xcprivacy` cannot declare it, because whether it is
+    ///   collected depends on whether *you* call this method.
     public func identify(userID: String) async {
         guard !userID.isEmpty else {
             logger.error("identify() was given an empty id; ignoring")
@@ -209,6 +215,12 @@ public actor StatsClient {
     /// queue is discarded (not flushed) and the stored install UUID is deleted,
     /// so revocation cannot be undone into a resumed identity. Re-granting
     /// starts a new identity with `seq` back at 0 (§11).
+    ///
+    /// ## Asymmetry with `setEnabled(false)` — deliberate, not an oversight
+    ///
+    /// A consent **revocation** deletes the persisted install UUID; the master
+    /// opt-out does not. See ``setEnabled(_:)`` for why, and ``reset()`` for the
+    /// call that forgets the UUID without touching either switch.
     public func setConsent(_ groups: StatsConsent) async {
         let revoked = consent.subtracting(groups)
         consent = groups
@@ -232,6 +244,26 @@ public actor StatsClient {
     /// whatever consent says.
     public var isEnabled: Bool { enabled }
 
+    /// The master opt-out. `false` clears the queue, ends the session and forgets
+    /// any hashed `userId`; the choice is persisted, so it survives relaunch.
+    ///
+    /// ## What an opt-out keeps, and why
+    ///
+    /// `setEnabled(false)` **keeps the persisted install UUID**, while revoking a
+    /// consent group through ``setConsent(_:)`` **deletes** it. That asymmetry is
+    /// intentional:
+    ///
+    /// - The opt-out is a *switch*, and a person who flips it off and back on
+    ///   expects the same install, not a new one. Nothing is collected while it
+    ///   is off, so the retained UUID sits unused on disk and reaches no
+    ///   backend — it is not an identifier "in use", it is a remembered one.
+    /// - A consent revocation is a *withdrawal of permission to identify*, which
+    ///   §11 requires be unresumable: keeping the UUID would let a later grant
+    ///   continue a linkage the person had ended.
+    ///
+    /// If you want the opt-out to forget the install too, call ``reset()`` after
+    /// it — that is the call that regenerates (or deletes) the UUID, and the only
+    /// one that does so without changing a switch.
     public func setEnabled(_ newValue: Bool) async {
         guard newValue != enabled else { return }
         enabled = newValue
@@ -261,6 +293,11 @@ public actor StatsClient {
     /// Forgets this install: flushes what the old identity produced, then a
     /// fresh UUID, `seq` back to 0, no `userId`, and a new session on the next
     /// event. Events from before and after a reset are not linkable (§9).
+    ///
+    /// This is the call that **forgets the install**, which neither switch does
+    /// on its own: ``setEnabled(_:)`` keeps the stored UUID and ``setConsent(_:)``
+    /// only deletes it on a revocation. Pair it with an opt-out when you want
+    /// "stop collecting *and* forget me".
     public func reset() async {
         await dispatcher.flushNow()
         if consent.contains(.identity) {

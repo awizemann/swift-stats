@@ -65,7 +65,7 @@ final class Harness: Sendable {
         self.sink = InMemorySink(outcomes: outcomes, defaultOutcome: defaultOutcome)
         var context = contextOverride
         context?.bundleId = appId
-        self.configuration = StatsConfiguration(
+        var configuration = StatsConfiguration(
             appId: appId,
             projectId: "overwatch",
             installIdSalt: Harness.salt,
@@ -80,9 +80,11 @@ final class Harness: Sendable {
             storageDirectory: self.directory,
             clock: clock,
             uuidProvider: self.uuids,
-            randomSource: random,
-            contextOverride: context
+            randomSource: random
         )
+        // `package`, not part of the public init: see StatsConfiguration.
+        configuration.contextOverride = context
+        self.configuration = configuration
         self.client = StatsClient(configuration: configuration)
     }
 
