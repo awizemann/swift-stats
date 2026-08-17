@@ -47,7 +47,12 @@ actor EventStore {
         var recordCount: Int
     }
 
-    private let fileURL: URL
+    /// Resolves the queue file's location. A closure rather than a `URL` so that
+    /// `FileManager.url(for:.applicationSupportDirectory, create: true)` — which
+    /// is synchronous disk I/O, and creates a directory — happens inside this
+    /// actor on first use rather than on whatever thread built the client.
+    private let resolveFileURL: @Sendable () -> URL
+    private var cachedFileURL: URL?
     private let maxQueued: Int
     private var entries: [Entry] = []
     private var nextID = 0
@@ -56,9 +61,17 @@ actor EventStore {
     /// from memory instead of leaving the two permanently divergent.
     private var needsRewrite = false
 
-    init(fileURL: URL, maxQueued: Int) {
-        self.fileURL = fileURL
+    init(fileURL: @escaping @Sendable () -> URL, maxQueued: Int) {
+        self.resolveFileURL = fileURL
         self.maxQueued = maxQueued
+    }
+
+    /// The queue file, resolved once, lazily, on the actor.
+    private var fileURL: URL {
+        if let cachedFileURL { return cachedFileURL }
+        let resolved = resolveFileURL()
+        cachedFileURL = resolved
+        return resolved
     }
 
     /// The default location. `Application Support` rather than `Caches`: the
@@ -281,6 +294,7 @@ actor EventStore {
                 try handle.write(contentsOf: lines)
             } else {
                 try lines.write(to: fileURL, options: .atomic)
+                restrictPermissions()
             }
         } catch {
             // The records stay in memory, so they are not lost until the process
@@ -302,6 +316,7 @@ actor EventStore {
                 data.append(UInt8(ascii: "\n"))
             }
             try data.write(to: fileURL, options: .atomic)
+            restrictPermissions()
             needsRewrite = false
         } catch {
             needsRewrite = true
@@ -312,7 +327,39 @@ actor EventStore {
     private func ensureDirectory() throws {
         let directory = fileURL.deletingLastPathComponent()
         if !FileManager.default.fileExists(atPath: directory.path) {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            // 0700 on the directory the SDK owns. `withIntermediateDirectories`
+            // applies these attributes only to directories it actually creates,
+            // so an existing `Application Support` is left alone.
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+    }
+
+    /// Owner-only (0600) on the queue file.
+    ///
+    /// Necessary on every write, not once at creation: `Data.write(options:
+    /// .atomic)` writes a *new* temporary file and renames it over the old one,
+    /// so the replacement carries the process umask's 0644 rather than inheriting
+    /// the mode of the file it replaced. Best-effort — a failure here must not
+    /// cost the write that just succeeded, and the file holds queued events, not
+    /// a secret.
+    ///
+    /// The queue file has no `installId` an attacker could not derive anyway, but
+    /// it does carry event names, `props` and a hashed `userId` for an install
+    /// that has not yet flushed, and on macOS another user's process can read a
+    /// 0644 file under `~/Library/Application Support`.
+    private func restrictPermissions() {
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: fileURL.path
+            )
+        } catch {
+            logger.error(
+                "could not restrict the queue file's permissions: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

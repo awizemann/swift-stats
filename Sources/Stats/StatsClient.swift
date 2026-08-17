@@ -37,14 +37,19 @@ private nonisolated let logger = Logger(subsystem: StatsLog.subsystem, category:
 /// flush-on-background; everything else still works.
 public actor StatsClient {
     private let configuration: StatsConfiguration
-    private let identity: StatsIdentityStore
     private let store: EventStore
     private let dispatcher: Dispatcher
+
+    /// Opened on first use by `prepareIfNeeded()`, never in `init`.
+    private var identityStore: StatsIdentityStore?
+    /// `false` until `prepareIfNeeded()` has run.
+    private var didPrepare = false
 
     private var consent: StatsConsent
     private var enabled: Bool
     /// The validated `projectId`, or `nil` when the configured one is malformed.
-    private let projectId: String?
+    /// Resolved in `prepareIfNeeded()`, because the validation logs.
+    private var projectId: String?
 
     /// Session state. All of it is in memory: a session never survives a
     /// process restart (schema §10 — a launch always begins a session).
@@ -92,28 +97,69 @@ public actor StatsClient {
         var didEmitAppOpen: Bool
     }
 
+    /// Creates a client. **Cheap and non-blocking**: no disk I/O, no directory
+    /// creation, no `UserDefaults` suite opened — so it is safe to call directly
+    /// on the main actor during launch, with no `Task.detached` around it.
+    ///
+    /// Everything that touches the filesystem happens lazily inside the actor on
+    /// first use (see `prepareIfNeeded()` and `EventStore.fileURL`), which is
+    /// also where it belongs: an app that is configured with `consent: .none`, or
+    /// opted out, must not create a directory or a defaults suite at all, and
+    /// before this was lazy it created both just by being constructed.
+    ///
     /// - Parameter configuration: everything, including the sink and the test
     ///   seams. Nothing is read from a global.
     public init(configuration: StatsConfiguration) {
         self.configuration = configuration
-        self.identity = StatsIdentityStore(
+
+        // The closure captures only value-typed configuration and is not called
+        // here: resolving the default location runs
+        // `FileManager.url(…, create: true)`, which is synchronous disk I/O that
+        // *creates directories*. It runs on the `EventStore` actor, on demand.
+        let appId = configuration.appId
+        let storageDirectory = configuration.storageDirectory
+        self.store = EventStore(
+            fileURL: {
+                if let storageDirectory {
+                    return storageDirectory.appendingPathComponent("queue.jsonl", isDirectory: false)
+                }
+                if let defaultURL = try? EventStore.defaultFileURL(appId: appId) {
+                    return defaultURL
+                }
+                // No Application Support (a sandbox oddity): fall back to a
+                // temporary file rather than losing the queue entirely.
+                logger.error("Application Support is unavailable; the queue is in a temporary directory")
+                return URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("swift-stats-\(appId).jsonl")
+            },
+            maxQueued: configuration.maxQueued
+        )
+        self.dispatcher = Dispatcher(store: store, configuration: configuration)
+
+        // Provisional: `prepareIfNeeded()` replaces these with the persisted
+        // choice, which wins (§11). Until then they are what the configuration
+        // asked for, and nothing can be captured without going through an entry
+        // point that prepares first.
+        self.consent = configuration.consent
+        self.enabled = configuration.enabled
+        self.projectId = configuration.projectId
+    }
+
+    /// Opens the `UserDefaults` suite, loads the persisted consent / opt-out /
+    /// `userId` hash, and validates the configured ids — once, on the actor, on
+    /// the first entry point that needs any of it.
+    ///
+    /// Synchronous on purpose. It adds no suspension point, so the ordering
+    /// invariants `capture()` and `setConsent()` depend on — every synchronous
+    /// teardown completing before the first `await` — are unchanged.
+    private func prepareIfNeeded() {
+        guard !didPrepare else { return }
+        didPrepare = true
+
+        let identity = StatsIdentityStore(
             appId: configuration.appId, salt: configuration.installIdSalt
         )
-
-        let fileURL: URL
-        if let directory = configuration.storageDirectory {
-            fileURL = directory.appendingPathComponent("queue.jsonl", isDirectory: false)
-        } else if let defaultURL = try? EventStore.defaultFileURL(appId: configuration.appId) {
-            fileURL = defaultURL
-        } else {
-            // No Application Support (a sandbox oddity): fall back to a
-            // temporary file rather than losing the queue type entirely.
-            fileURL = URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("swift-stats-\(configuration.appId).jsonl")
-            logger.error("Application Support is unavailable; the queue is in a temporary directory")
-        }
-        self.store = EventStore(fileURL: fileURL, maxQueued: configuration.maxQueued)
-        self.dispatcher = Dispatcher(store: store, configuration: configuration)
+        self.identityStore = identity
 
         // The persisted choice wins; the configuration's values apply only the
         // first time this app runs (§11).
@@ -133,12 +179,21 @@ public actor StatsClient {
                 it will not be sent, so the backend derives it from the write key
                 """)
             self.projectId = nil
-        } else {
-            self.projectId = configuration.projectId
         }
         if !identity.isAvailable {
             logger.error("collection is disabled: the SDK could not open its own UserDefaults suite")
         }
+    }
+
+    /// The identity store, opening it on first use.
+    private var identity: StatsIdentityStore {
+        prepareIfNeeded()
+        // Non-optional after `prepareIfNeeded()`: it is the only writer, it
+        // always assigns, and it runs to completion without suspending.
+        guard let identityStore else {
+            preconditionFailure("prepareIfNeeded() did not open the identity store")
+        }
+        return identityStore
     }
 
     /// `[A-Za-z0-9._-]`, 1–64 scalars (§2).
@@ -196,6 +251,7 @@ public actor StatsClient {
             logger.error("identify() was given an empty id; ignoring")
             return
         }
+        prepareIfNeeded()
         guard enabled else {
             logger.warning("identify() ignored: the client is opted out")
             return
@@ -207,7 +263,10 @@ public actor StatsClient {
 
     // MARK: - Consent and opt-out
 
-    public var currentConsent: StatsConsent { consent }
+    public var currentConsent: StatsConsent {
+        prepareIfNeeded()
+        return consent
+    }
 
     /// Records a consent choice.
     ///
@@ -222,6 +281,7 @@ public actor StatsClient {
     /// opt-out does not. See ``setEnabled(_:)`` for why, and ``reset()`` for the
     /// call that forgets the UUID without touching either switch.
     public func setConsent(_ groups: StatsConsent) async {
+        prepareIfNeeded()
         let revoked = consent.subtracting(groups)
         consent = groups
         identity.storeConsent(groups)
@@ -242,7 +302,10 @@ public actor StatsClient {
 
     /// The master opt-out. `true` by default; `false` means no capture at all,
     /// whatever consent says.
-    public var isEnabled: Bool { enabled }
+    public var isEnabled: Bool {
+        prepareIfNeeded()
+        return enabled
+    }
 
     /// The master opt-out. `false` clears the queue, ends the session and forgets
     /// any hashed `userId`; the choice is persisted, so it survives relaunch.
@@ -265,6 +328,7 @@ public actor StatsClient {
     /// it — that is the call that regenerates (or deletes) the UUID, and the only
     /// one that does so without changing a switch.
     public func setEnabled(_ newValue: Bool) async {
+        prepareIfNeeded()
         guard newValue != enabled else { return }
         enabled = newValue
         identity.storeEnabled(newValue)
@@ -299,6 +363,7 @@ public actor StatsClient {
     /// only deletes it on a revocation. Pair it with an opt-out when you want
     /// "stop collecting *and* forget me".
     public func reset() async {
+        prepareIfNeeded()
         await dispatcher.flushNow()
         if consent.contains(.identity) {
             _ = identity.regenerateInstallUUID(makeUUID: configuration.uuidProvider.uuid)
@@ -364,7 +429,13 @@ public actor StatsClient {
 
     // MARK: - Internals
 
-    private var isCollecting: Bool { enabled && consent.contains(.usage) && identity.isAvailable }
+    /// `prepareIfNeeded()` FIRST, before any of the three are read: `&&` is
+    /// left-to-right, so reading `enabled` before preparing would test the
+    /// configuration's provisional value rather than the persisted opt-out.
+    private var isCollecting: Bool {
+        prepareIfNeeded()
+        return enabled && consent.contains(.usage) && identity.isAvailable
+    }
 
     /// Session bookkeeping plus the actual enqueue.
     ///

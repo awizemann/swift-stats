@@ -309,9 +309,8 @@ struct DispatchTests {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("swift-stats-oversized-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = EventStore(
-            fileURL: directory.appendingPathComponent("queue.jsonl"), maxQueued: 100
-        )
+        let url = directory.appendingPathComponent("queue.jsonl")
+        let store = EventStore(fileURL: { url }, maxQueued: 100)
         let sink = InMemorySink()
         let clock = ManualClock()
         let configuration = StatsConfiguration(

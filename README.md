@@ -82,7 +82,9 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
 ```swift
 import Stats
 
-// 1. Configure once during launch. The sink is yours; see "Writing a sink".
+// 1. Configure once during launch. Constructing a client is cheap and does no
+//    disk I/O, so this is safe directly in `App.init` or on the main actor — no
+//    `Task.detached` wrapper needed. The sink is yours; see "Writing a sink".
 let stats = StatsClient(configuration: StatsConfiguration(
     appId: "com.example.MyApp",
     projectId: "myapp",                          // advisory: the write key is authoritative (schema §2.4)
@@ -210,7 +212,12 @@ let stats = StatsClient(configuration: StatsConfiguration(
 
 ## Consumer checklist
 
-Five things the SDK cannot do for you:
+Five things the SDK cannot do for you. One thing you do **not** have to do:
+`StatsClient(configuration:)` performs no disk I/O — no directory is created, no
+`UserDefaults` suite is opened, no queue file is read. The path is resolved and
+the suite opened lazily inside the actor on the first `track()` or
+`applicationDidBecomeActive()`. Construct it wherever is convenient, including
+`App.init` on the main actor, with no `Task.detached` around it.
 
 1. **Call the two lifecycle methods.** `applicationDidBecomeActive()` and
    `applicationDidEnterBackground()`, typically from `scenePhase`. swift-stats
