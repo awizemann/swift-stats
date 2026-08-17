@@ -13,6 +13,13 @@ database_name = "stats"
 database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 migrations_dir = "migrations"
 
+# Custom domain (optional). Wrangler creates the DNS record for you on deploy.
+# The reference deployment is api.swiftstats.co; self-hosters set their own
+# or delete this block and use the workers.dev URL.
+# [[routes]]
+# pattern = "api.swiftstats.co"
+# custom_domain = true
+
 [triggers]
 # 02:10 UTC — comfortably after midnight UTC so "yesterday" is closed, and off
 # the top of the hour where Cloudflare's cron fleet is busiest.

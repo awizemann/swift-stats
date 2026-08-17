@@ -159,6 +159,11 @@ rolls up closed days and deletes raw events past 90 days. Distinct counts are
 exact. Keys are stored only as SHA-256 hashes, and `projectId` is derived from
 the write key's scope. Deploying it is `npx wrangler login && npm run deploy`.
 
+You can self-host it on your own Cloudflare account, or use the hosted
+instance at **`https://api.swiftstats.co`** (same Worker, same contract, keys
+issued per project). Hosted sign-up is not open yet; self-hosting is fully
+supported today.
+
 The matching Swift adapter is the `StatsCloudflare` product: `CloudflareSink`
 for emitting, and `StatsQuery` for reading a project's own numbers back into an
 app.
