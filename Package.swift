@@ -31,6 +31,15 @@ let package = Package(
         .target(
             name: "StatsCloudflare",
             dependencies: ["Stats"],
+            // `CloudflareSink` conforms to `StatsSink` and returns `SinkOutcome`
+            // for a `StatsBatch` — types that land in `Sources/Stats` with the
+            // P12b emitter. It is written against those exact names and excluded
+            // until they exist, rather than compiled against duplicate local
+            // copies that would collide on merge. Its testable part — §7's
+            // status-to-behavior table — lives in `IngestDisposition`, which IS
+            // built and tested. Re-enabling is a two-line change; see the header
+            // comment in CloudflareSink.swift.
+            exclude: ["CloudflareSink.swift"],
             swiftSettings: swiftSettings
         ),
         .target(
@@ -46,6 +55,10 @@ let package = Package(
         .testTarget(
             name: "StatsCloudflareTests",
             dependencies: ["StatsCloudflare", "StatsTesting"],
+            // Paired with the exclusion above: these tests exercise
+            // `CloudflareSink`, so they compile only once the core sink types
+            // exist. Everything else in this target builds and runs today.
+            exclude: ["CloudflareSinkTests.swift"],
             swiftSettings: swiftSettings
         )
     ]

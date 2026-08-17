@@ -1,0 +1,29 @@
+{
+  "name": "stats-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker + D1 backend for swift-stats (wire schema v1)",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "migrate:local": "wrangler d1 migrations apply stats --local",
+    "migrate:remote": "wrangler d1 migrations apply stats --remote",
+    "deploy": "wrangler d1 migrations apply stats --remote && wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "@cloudflare/workers-types": "^5.20260817.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.123.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "workerd@1.20260811.1": true
+  }
+}

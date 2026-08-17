@@ -1,0 +1,27 @@
+name = "stats-worker"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+# The Worker holds no secrets of its own: keys are stored *hashed* in D1
+# (table `keys`), so a D1 read cannot recover a usable key and there is no
+# `[vars]` or secret to rotate here. See README "Keys".
+
+[[d1_databases]]
+binding = "DB"
+database_name = "stats"
+# Replace with the id printed by `wrangler d1 create stats`.
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[triggers]
+# 02:10 UTC — comfortably after midnight UTC so "yesterday" is closed, and off
+# the top of the hour where Cloudflare's cron fleet is busiest.
+crons = ["10 2 * * *"]
+
+[observability]
+enabled = true
+
+[observability.logs]
+# Ingest bodies are never logged (schema §7: never echo the body). Only
+# status/shape counters reach the log.
+invocation_logs = true

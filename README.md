@@ -121,6 +121,40 @@ nonisolated protocol UsageTracking: Sendable {
 let sink = InMemoryStatsSink()          // from StatsTesting
 ```
 
+## Cloudflare backend
+
+[`backends/cloudflare/`](backends/cloudflare/README.md) is a complete,
+conformance-checked backend: a Worker on **D1** serving `POST /v1/events`,
+`GET /v1/summary` and `GET /v1/events/top`, plus a nightly Cron Trigger that
+rolls up closed days and deletes raw events past 90 days. Distinct counts are
+exact. Keys are stored only as SHA-256 hashes, and `projectId` is derived from
+the write key's scope. Deploying it is `npx wrangler login && npm run deploy`.
+
+The matching Swift adapter is the `StatsCloudflare` product: `CloudflareSink`
+for emitting, and `StatsQuery` for reading a project's own numbers back into an
+app.
+
+```swift
+import StatsCloudflare
+
+let query = StatsQuery(
+    endpoint: try CloudflareEndpoint(string: "https://stats.example.com"),
+    readKey: readKey                     // NOT embeddable in a shipped app — schema §8
+)
+
+let summary = try await query.summary(
+    projectId: "myapp",
+    from: StatsDay("2026-08-01")!,
+    to: StatsDay(utcDayOf: .now)
+)
+for row in summary.rows {
+    print(row.date, row.opens, row.sessions, row.activeInstalls, row.events)
+}
+```
+
+`StatsQuery` and its supporting types ship today. `CloudflareSink` conforms to
+the core `StatsSink` protocol and is enabled once the P12b emitter lands.
+
 ## Repo map
 
 ```
@@ -130,7 +164,8 @@ docs/
                              sessions, consent, reserved names, never-collected list
 backends/
   README.md                How backends plug in + the shared conformance checklist
-  cloudflare/              Reserved for the Cloudflare backend (Worker + D1)
+  cloudflare/              Cloudflare backend: Worker + D1, migrations, admin CLI,
+                             conformance suite (npm test)
 Sources/
   Stats/                   Core emitter (scaffold today)
     Resources/
@@ -150,7 +185,7 @@ CHANGELOG.md               Keep-a-changelog, semver
 |---|---|---|
 | P12a | Package scaffold, wire schema `v1`, backend contract, CI | **done** |
 | P12b | `Stats` core: file-backed queue, dispatcher, identity, sessions, consent, tests | next |
-| P12c | `backends/cloudflare/`: ingest Worker on D1 + read helper | planned |
+| P12c | `backends/cloudflare/`: ingest Worker on D1 + read helper | **done** |
 | P12d | First consumer emits events | planned |
 | P12e | Read side: per-project usage in a consumer app | planned |
 | P12f | Tag 0.1.0, semver policy | planned |

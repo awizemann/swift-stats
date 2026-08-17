@@ -137,9 +137,12 @@ PRs welcome. To add one:
 
 | | `cloudflare` |
 |---|---|
-| Status | Reserved — store decided, not yet implemented |
-| Store | **D1** (decided) — Worker ingest, relational rows + daily rollups |
-| Distinct counts | **Exact** (`COUNT(DISTINCT …)`) |
+| Status | **Implemented** — conformance checklist filled in |
+| Store | **D1** — Worker ingest, relational rows + daily rollups |
+| Distinct counts | **Exact**, except `/v1/events/top`'s `installs` past 90 days (upper bound) |
 | Retention | Raw events 90 days; daily rollups indefinite |
+| gzip | Not supported (400) |
+| Props limits | Truncate/drop |
+| Swift adapter | `StatsCloudflare` |
 
 More rows land here as backends do.
