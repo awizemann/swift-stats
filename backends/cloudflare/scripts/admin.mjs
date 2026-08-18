@@ -31,6 +31,19 @@ const PROJECT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const INSTALL_ID_RE = /^[0-9a-f]{64}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 
+// Human-readable free text: a project's display name and a key's label.
+//
+// `q()` escapes the quote, so this is not the injection guard — it is the second
+// of the two the file's header describes, and it is the one that stops a value
+// that is merely absurd. Printable ASCII plus spaces, bounded: `wrangler d1
+// execute --command` puts the whole statement on a command line, so an unbounded
+// value is an ARG_MAX failure with a confusing message, and a newline or a
+// control character in a stored label is a log-injection hazard the moment
+// `list-keys` prints it back. No `'` and no `;`, so a value that would need
+// escaping is refused outright rather than escaped and stored.
+const FREE_TEXT_RE = /^[A-Za-z0-9 ._,()/+&#@:-]{1,120}$/;
+const FREE_TEXT_HELP = "1-120 chars of letters, digits, spaces and . _ , ( ) / + & # @ : -";
+
 const argv = process.argv.slice(2);
 const flags = new Set(argv.filter((a) => a.startsWith('--')));
 // The label is consumed BY INDEX, not by value. Filtering positionals by
@@ -99,6 +112,57 @@ function execute(sql) {
   if (result.status !== 0) die(`wrangler exited with ${result.status ?? 'a signal'}`);
 }
 
+/** Run a SELECT and return its rows, or `null` if the query could not be run. */
+function query(sql) {
+  if (!local && !remote) return null;
+  const args = [
+    'd1', 'execute', DB_NAME, local ? '--local' : '--remote', '--json', '--command', sql,
+  ];
+  if (!local) args.push('--yes');
+  const result = spawnSync('wrangler', args, { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  try {
+    const parsed = JSON.parse(result.stdout);
+    // wrangler returns an array of per-statement results.
+    const first = Array.isArray(parsed) ? parsed[0] : parsed;
+    return first?.results ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refuse to mint a key for a project that does not exist.
+ *
+ * Without this, `mint-key overwtach write` (one transposition) printed a
+ * perfectly convincing key, banner and all, and inserted a `keys` row pointing at
+ * nothing. The key then 401s on every request, and the 401 is deliberately
+ * indistinguishable from a revoked or wrong-scope key (§8), so the mistake
+ * surfaces as "the SDK does not work" days later, in someone else's app.
+ *
+ * `null` from `query` means we could not check — `--dry-run`, or wrangler failing
+ * for its own reasons — and a check that could not run must not block the
+ * operator. The `keys.project_id` foreign key is the backstop in that case.
+ */
+function requireProjectExists(projectId) {
+  if (dryRun) return;
+  const rows = query(`SELECT id FROM projects WHERE id = ${q(projectId)};`);
+  if (rows === null) {
+    console.warn('warning: could not verify the project exists; continuing');
+    return;
+  }
+  if (rows.length === 0) {
+    die(
+      `no project "${projectId}" exists. Create it first:\n` +
+        `  node scripts/admin.mjs create-project ${projectId} "<name>" ${local ? '--local' : '--remote'}`,
+    );
+  }
+}
+
+if (label !== null && !FREE_TEXT_RE.test(label)) {
+  die(`--label must be ${FREE_TEXT_HELP}`);
+}
+
 const [command, ...rest] = positionals;
 
 switch (command) {
@@ -106,6 +170,7 @@ switch (command) {
     const [id, name] = rest;
     if (!id || !PROJECT_ID_RE.test(id)) die('project id must match [A-Za-z0-9._-]{1,64}');
     if (!name) die('usage: create-project <id> <name>');
+    if (!FREE_TEXT_RE.test(name)) die(`project name must be ${FREE_TEXT_HELP}`);
     execute(
       `INSERT INTO projects (id, name, created_at) VALUES (${q(id)}, ${q(name)}, ${q(nowIso())});`,
     );
@@ -116,6 +181,10 @@ switch (command) {
     const [projectId, kind] = rest;
     if (!projectId || !PROJECT_ID_RE.test(projectId)) die('project id must match [A-Za-z0-9._-]{1,64}');
     if (kind !== 'write' && kind !== 'read') die("kind must be 'write' or 'read'");
+    // BEFORE minting: a key printed for a nonexistent project looks entirely
+    // valid and 401s forever, and §8 makes that 401 indistinguishable from a
+    // revoked key.
+    requireProjectExists(projectId);
 
     const { key, hash } = await mint(kind);
     execute(

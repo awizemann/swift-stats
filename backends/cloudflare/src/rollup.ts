@@ -46,6 +46,72 @@ export const MAX_ROLLED_VALUES_PER_PROP = 200;
 export const DEDUPE_RETENTION_DAYS = 30;
 
 /**
+ * How long a lease is considered held before it is treated as abandoned.
+ *
+ * Long enough that a slow pass over a large database is not overtaken by the next
+ * cron (which is 24 hours away anyway), short enough that a pass killed mid-run —
+ * the isolate evicted, the invocation cut off — does not lock the job out for
+ * days. A crash is the only way a lease outlives its run: the normal exit paths
+ * release it.
+ */
+export const LEASE_TTL_MS = 30 * 60 * 1_000;
+
+/**
+ * Take the exclusive lease on the scheduled job, or return `null` if another
+ * invocation holds it.
+ *
+ * The acquire is ONE statement, so it is atomic against a concurrent acquire: the
+ * upsert's `WHERE` only lets the update through when the existing lease is older
+ * than the TTL, and `meta.changes` reports whether this caller was the one that
+ * wrote. A `SELECT` followed by an `INSERT` would have exactly the race the lease
+ * exists to close — both passes would read "free" and both would proceed.
+ *
+ * Why this matters more than tidiness: two overlapping passes both reach the raw
+ * retention DELETE, and their DELETE-then-INSERT rollups can interleave at the day
+ * granularity such that one pass deletes rows the other had just inserted. The
+ * result is a day whose rollups read as zero and whose raw rows have been removed
+ * — the one unrecoverable outcome in this backend.
+ */
+export async function acquireRollupLease(
+  env: Env,
+  now: Date,
+): Promise<string | null> {
+  const holder = crypto.randomUUID();
+  const nowIso = now.toISOString();
+  const staleBefore = new Date(now.getTime() - LEASE_TTL_MS).toISOString();
+
+  const result = await env.DB.prepare(
+    `INSERT INTO rollup_lease (id, holder, acquired_at)
+     VALUES (1, ?1, ?2)
+     ON CONFLICT (id) DO UPDATE
+       SET holder = excluded.holder, acquired_at = excluded.acquired_at
+       WHERE rollup_lease.acquired_at < ?3`,
+  )
+    .bind(holder, nowIso, staleBefore)
+    .run();
+
+  return (result.meta.changes ?? 0) > 0 ? holder : null;
+}
+
+/**
+ * Release the lease, but only if we still hold it.
+ *
+ * `AND holder = ?1` so a pass that overran the TTL and was superseded cannot
+ * release the lease of the pass that took over from it.
+ */
+export async function releaseRollupLease(env: Env, holder: string): Promise<void> {
+  try {
+    await env.DB.prepare(`DELETE FROM rollup_lease WHERE id = 1 AND holder = ?1`)
+      .bind(holder)
+      .run();
+  } catch (cause) {
+    // A failure to release costs at most one skipped pass, once the TTL expires.
+    // It must never turn a completed run into a thrown error.
+    logger.error('rollup_lease_release_failed', {}, cause);
+  }
+}
+
+/**
  * Roll one closed UTC day into the three rollup tables, for both
  * `include_debug` variants, across every project.
  *
@@ -186,6 +252,26 @@ export function rollupStatements(env: Env, day: string, rolledAt: string): D1Pre
  * is only testable if the clock is a parameter.
  */
 export async function runScheduled(env: Env, now: Date): Promise<{
+  rolled: string[];
+  deletedEvents: number;
+  /** True when another invocation held the lease and this one did nothing. */
+  skipped: boolean;
+}> {
+  const holder = await acquireRollupLease(env, now);
+  if (holder === null) {
+    logger.warn('rollup_lease_held');
+    return { rolled: [], deletedEvents: 0, skipped: true };
+  }
+  try {
+    return { ...(await runRollupAndSweep(env, now)), skipped: false };
+  } finally {
+    // `finally`, so a throw anywhere below cannot leave the job locked out until
+    // the TTL expires.
+    await releaseRollupLease(env, holder);
+  }
+}
+
+async function runRollupAndSweep(env: Env, now: Date): Promise<{
   rolled: string[];
   deletedEvents: number;
 }> {

@@ -1,14 +1,9 @@
 // POST /v1/events — schema §7.
 
-import {
-  badRequest,
-  HttpError,
-  json,
-  payloadTooLarge,
-  rateLimited,
-} from './errors.js';
+import { badRequest, HttpError, json, payloadTooLarge } from './errors.js';
 import { bucketDay } from './dates.js';
 import { resolveKey } from './keys.js';
+import { checkPreAuthRate, checkProjectRate } from './ratelimit.js';
 import { MAX_BODY_BYTES, parseJsonBody, validateBatch } from './validate.js';
 import { logger } from './log.js';
 import type { Env } from './env.js';
@@ -23,29 +18,6 @@ import type { Env } from './env.js';
  * chunked request has none.
  */
 const MAX_WIRE_BYTES = 2 * 1024 * 1024;
-
-/**
- * Per-isolate best-effort limiter. Deliberately NOT the real rate limit — see
- * README "Rate limiting": the durable global limit is a Cloudflare Rate
- * Limiting rule in front of the Worker. This is a cheap backstop that costs no
- * storage read, and it is set high enough (§7: at most one request in flight per
- * client) that a conforming emitter cannot trip it.
- */
-const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT_PER_WINDOW = 600;
-const buckets = new Map<string, { count: number; resetAt: number }>();
-
-function checkRate(projectId: string, now: number): void {
-  const bucket = buckets.get(projectId);
-  if (bucket === undefined || now >= bucket.resetAt) {
-    buckets.set(projectId, { count: 1, resetAt: now + RATE_WINDOW_MS });
-    return;
-  }
-  bucket.count += 1;
-  if (bucket.count > RATE_LIMIT_PER_WINDOW) {
-    throw rateLimited(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)));
-  }
-}
 
 function checkContentType(header: string | null): void {
   if (header === null) {
@@ -85,19 +57,86 @@ async function readBody(request: Request): Promise<string> {
     }
   }
 
-  const buffer = await request.arrayBuffer();
-  if (buffer.byteLength > MAX_WIRE_BYTES) {
-    throw payloadTooLarge('Body exceeds the wire limit.');
+  // Read through a COUNTING loop that aborts at the wire cap, rather than
+  // `await request.arrayBuffer()` followed by a length check.
+  //
+  // The old order buffered the whole body first and only then compared its size,
+  // which means the cap bounded what we *kept*, not what we *read*: a client that
+  // understated (or omitted) `Content-Length` and then streamed 500 MB got us to
+  // allocate all of it before being told 413. The declared length is a claim, and
+  // §5 requires the cap hold regardless of it, so the only place the cap can
+  // actually be enforced is while the bytes arrive.
+  const body = request.body;
+  if (body === null) {
+    throw badRequest('bad_json', 'Body is not valid JSON.');
   }
-  // §5's limit is on UTF-8 BYTES of the serialized JSON, which is exactly
-  // `byteLength` here — not the decoded string's length.
-  if (buffer.byteLength > MAX_BODY_BYTES) {
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total > MAX_WIRE_BYTES) {
+        // Stop pulling immediately, and tell the peer we are done with its body.
+        // Without the cancel, the runtime keeps draining a stream nobody will
+        // read, which is the thing the cap exists to prevent.
+        await reader.cancel().catch(() => {});
+        throw payloadTooLarge('Body exceeds the wire limit.');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  // §5's limit is on UTF-8 BYTES of the serialized JSON — the byte total above,
+  // not the decoded string's length. Checked after the wire cap so that a body
+  // between the two limits gets the specific "re-split the batch" message §7's
+  // 413 row expects an emitter to act on.
+  if (total > MAX_BODY_BYTES) {
     throw payloadTooLarge(`Body exceeds the ${MAX_BODY_BYTES}-byte limit. Re-split the batch.`);
   }
+
   // Non-fatal by default: invalid UTF-8 becomes U+FFFD rather than throwing, and
   // the resulting JSON.parse failure is a clean 400 (§0: the body is UTF-8 JSON
-  // with no BOM, which TextDecoder strips for us anyway).
-  return new TextDecoder().decode(buffer);
+  // with no BOM, which TextDecoder strips for us anyway). Decoded in one pass
+  // over a single joined buffer so a multi-byte scalar split across two chunks
+  // cannot become U+FFFD.
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
+/**
+ * Is this D1 failure about the SHAPE of the data rather than the health of the
+ * database?
+ *
+ * Message matching, reluctantly. SQLite reports these as text and D1 surfaces no
+ * error code, so there is nothing else to match on — but note what this is and is
+ * not used for. It is NOT used to detect a duplicate batch: that question is
+ * answered by asking the database (`SELECT … FROM batches`, above), precisely so
+ * that a D1 message change cannot turn duplicates into 500s. Here the fallback is
+ * safe in the other direction: an unrecognized message falls through to the 503,
+ * which retains the batch. A message change therefore costs us the improvement,
+ * never data.
+ *
+ * The patterns are the constraint classes a STRICT schema raises for bad values:
+ * an out-of-range integer, a NULL in a NOT NULL column, a failed CHECK, a bad
+ * type for a STRICT column, and a string longer than SQLite will store.
+ */
+function isDataShapedFailure(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : '';
+  return /datatype mismatch|cannot store .* value|NOT NULL constraint failed|CHECK constraint failed|string or blob too big|too large|out of range/i.test(
+    message,
+  );
 }
 
 export async function handleIngest(request: Request, env: Env, now: Date): Promise<Response> {
@@ -110,8 +149,17 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
   checkContentType(request.headers.get('content-type'));
   checkContentEncoding(request.headers.get('content-encoding'));
 
-  const scope = await resolveKey(env.DB, request.headers.get('x-stats-key'), 'write');
-  checkRate(scope.projectId, now.getTime());
+  const presentedKey = request.headers.get('x-stats-key');
+  // PRE-AUTH, keyed on SHA-256 of the presented key and never on the IP (§13).
+  // Before `resolveKey`, because `resolveKey` costs a D1 read: running the
+  // limiter after it would hand a key-guessing loop one free storage read per
+  // attempt, which is the expensive half of the request.
+  await checkPreAuthRate(presentedKey, now.getTime());
+
+  const scope = await resolveKey(env.DB, presentedKey, 'write');
+  // And again per project, so minting more keys for one project does not multiply
+  // its share.
+  checkProjectRate(scope.projectId, now.getTime());
 
   const batch = validateBatch(parseJsonBody(await readBody(request)));
 
@@ -232,6 +280,24 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
       // the emitter deletes it from its queue instead of retrying forever.
       logger.info('batch_duplicate', { projectId, events: batch.events.length });
       return json({ accepted: batch.events.length, duplicate: true }, 202);
+    }
+
+    // A DATA-SHAPED failure is not a fault, and must not be signalled as one.
+    // §7 makes a 5xx retain-and-retry, so answering 503 for a row the database
+    // will never accept is an infinite retry loop: the emitter re-sends the same
+    // bytes until the 24-hour ceiling drops them, having hit the backend every
+    // time. Those are 400s — permanent, which is the truth.
+    //
+    // The validator bounds every field that can produce one of these, so reaching
+    // here means the validator and the schema have drifted apart; it is logged at
+    // `error` for exactly that reason, and the emitter is still told the honest
+    // answer rather than being asked to retry forever.
+    if (isDataShapedFailure(cause)) {
+      logger.error('ingest_rejected_by_storage', { projectId, events: batch.events.length }, cause);
+      throw badRequest(
+        'invalid_event',
+        'A field in this batch is outside the range this backend can store. It will not become valid on retry.',
+      );
     }
 
     logger.error('ingest_failed', { projectId, events: batch.events.length }, cause);

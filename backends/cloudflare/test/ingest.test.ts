@@ -15,8 +15,18 @@ import {
   makeBatch,
   makeContext,
   makeEvent,
+  readRequest,
   resetDatabase,
+  WRITE_KEY,
 } from './helpers.js';
+import {
+  PRE_AUTH_LIMIT_PER_WINDOW,
+  RATE_WINDOW_MS,
+  checkPreAuthRate,
+  countAgainst,
+  resetRateLimiter,
+} from '../src/ratelimit.js';
+import type { HttpError } from '../src/errors.js';
 
 async function post(body: unknown, init?: Parameters<typeof ingestRequest>[1]): Promise<Response> {
   const request = ingestRequest(body, init);
@@ -33,6 +43,9 @@ async function eventCount(): Promise<number> {
 
 beforeEach(async () => {
   await resetDatabase();
+  // The limiter's buckets are module state shared across every test in this
+  // isolate; a test that deliberately fills one must not leak into the next.
+  resetRateLimiter();
 });
 
 describe('happy path', () => {
@@ -541,5 +554,245 @@ describe('routing', () => {
     await waitOnExecutionContext(ctx);
     expect(response.status).toBe(405);
     expect(response.headers.get('allow')).toBe('POST');
+  });
+});
+
+describe('integer bounds (§0: a data error is a 400, never a retriable 5xx)', () => {
+  /**
+   * `Number.isInteger(1e21)` is `true` — it is an integral `double` — so an
+   * unbounded integer check accepted it, and D1 then threw on the STRICT INTEGER
+   * insert. That throw was reported as **503 with Retry-After**, which §7 makes
+   * RETAIN-and-retry: the emitter re-sent the identical bytes on a backoff until
+   * the 24-hour ceiling dropped them, hitting the backend on every attempt, for a
+   * row the database was never going to accept.
+   *
+   * These must be 400 — permanent, which is the truth — and they must be caught
+   * by the validator, not by the database.
+   */
+  it.each([
+    ['seq 1e21', () => makeBatch({ events: [makeEvent({ seq: 1e21 })] })],
+    ['seq beyond MAX_SAFE_INTEGER', () => makeBatch({ events: [makeEvent({ seq: 2 ** 53 })] })],
+    ['screenWidth 1e21', () => makeBatch({ context: makeContext({ screenWidth: 1e21 }) })],
+    ['screenHeight 1e21', () => makeBatch({ context: makeContext({ screenHeight: 1e21 }) })],
+    ['screenWidth negative', () => makeBatch({ context: makeContext({ screenWidth: -1 }) })],
+    ['screenHeight negative', () => makeBatch({ context: makeContext({ screenHeight: -1 }) })],
+    ['screenScale 1e21', () => makeBatch({ context: makeContext({ screenScale: 1e21 }) })],
+  ])('400s %s rather than 503ing into an infinite retry', async (_label, build) => {
+    const response = await post(build());
+    expect(response.status).toBe(400);
+    // Specifically NOT a 503 with a Retry-After, which is what made it a loop.
+    expect(response.headers.get('retry-after')).toBeNull();
+    expect(await eventCount()).toBe(0);
+  });
+
+  it('still accepts the values a real device and §3 fallbacks produce', async () => {
+    // The bounds must not reject anything legal. §3's consent-reduced fallback is
+    // 0/0/1.0, and `seq` is monotonic per install without a practical ceiling.
+    const response = await post(
+      makeBatch({
+        context: makeContext({ screenWidth: 0, screenHeight: 0, screenScale: 1.0 }),
+        events: [makeEvent({ seq: Number.MAX_SAFE_INTEGER })],
+      }),
+    );
+    expect(response.status).toBe(202);
+
+    const wide = await post(
+      makeBatch({
+        batchId: batchId(),
+        context: makeContext({ screenWidth: 7680, screenHeight: 4320, screenScale: 3 }),
+        events: [makeEvent({ seq: 0 })],
+      }),
+    );
+    expect(wide.status).toBe(202);
+  });
+});
+
+describe('the 2 MiB wire cap is enforced while reading (§5)', () => {
+  /**
+   * The cap used to be applied AFTER `await request.arrayBuffer()`, so it bounded
+   * what the Worker kept, not what it read. `Content-Length` is a claim: a client
+   * can understate it, or send a chunked request with none at all, and then stream
+   * as much as it likes. Here the declared length is 10 bytes and the body is
+   * ~2.5 MiB.
+   */
+  function streamingRequest(totalBytes: number, declaredLength: string | null): Request {
+    const chunkSize = 64 * 1024;
+    const chunk = new TextEncoder().encode('x'.repeat(chunkSize));
+    const chunks = Math.ceil(totalBytes / chunkSize);
+    let sent = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        if (sent++ < chunks) controller.enqueue(chunk);
+        else controller.close();
+      },
+    });
+    const headers = new Headers({
+      'content-type': 'application/json',
+      'x-stats-key': WRITE_KEY,
+    });
+    if (declaredLength !== null) headers.set('content-length', declaredLength);
+    return new Request('https://stats.example.com/v1/events', {
+      method: 'POST',
+      headers,
+      body,
+      // @ts-expect-error `duplex` is required for a stream body and is not in the
+      // ambient Request type used here.
+      duplex: 'half',
+    });
+  }
+
+  async function send(request: Request): Promise<Response> {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, env as never, ctx);
+    await waitOnExecutionContext(ctx);
+    return response;
+  }
+
+  it('413s a 2.5 MiB body that declares a Content-Length of 10', async () => {
+    const response = await send(streamingRequest(2_621_440, '10'));
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ error: 'payload_too_large' });
+    expect(await eventCount()).toBe(0);
+  });
+
+  it('413s a 2.5 MiB body with no Content-Length at all', async () => {
+    const response = await send(streamingRequest(2_621_440, null));
+    expect(response.status).toBe(413);
+    expect(await eventCount()).toBe(0);
+  });
+
+  it('a body between the 256 KiB batch limit and the wire cap gets the re-split message', async () => {
+    // §7's 413 row tells the emitter to RE-SPLIT, which is only actionable for a
+    // body under the wire cap. Ordering the two checks the other way round would
+    // give this body the generic wire-cap message.
+    const response = await send(streamingRequest(512 * 1024, null));
+    expect(response.status).toBe(413);
+    const body = (await response.json()) as { message: string };
+    expect(body.message).toMatch(/Re-split/i);
+  });
+
+  it('still accepts a normal-sized streamed body', async () => {
+    // The counting loop must not break the happy path, including a body that
+    // arrives in more than one chunk.
+    const json = JSON.stringify(makeBatch());
+    const encoded = new TextEncoder().encode(json);
+    const half = Math.floor(encoded.byteLength / 2);
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoded.slice(0, half));
+        controller.enqueue(encoded.slice(half));
+        controller.close();
+      },
+    });
+    const request = new Request('https://stats.example.com/v1/events', {
+      method: 'POST',
+      headers: new Headers({ 'content-type': 'application/json', 'x-stats-key': WRITE_KEY }),
+      body,
+      // @ts-expect-error see above
+      duplex: 'half',
+    });
+    expect((await send(request)).status).toBe(202);
+    expect(await eventCount()).toBe(1);
+  });
+});
+
+describe('rate limiting (§7 429, §8.3 429)', () => {
+  it('429s past the pre-auth limit, with a Retry-After', async () => {
+    // Driven through the limiter directly: a hundred real requests per test is a
+    // slow way to assert an arithmetic threshold.
+    const now = Date.now();
+    const bucket = `test:${crypto.randomUUID()}`;
+    for (let i = 0; i < 3; i += 1) countAgainst(bucket, now, 3);
+    expect(() => countAgainst(bucket, now, 3)).toThrow();
+
+    try {
+      countAgainst(bucket, now, 3);
+      expect.unreachable('the limiter must throw past the limit');
+    } catch (cause) {
+      const response = (cause as HttpError).toResponse();
+      expect(response.status).toBe(429);
+      // §7/§8.3: a 429 carries `Retry-After` in integer seconds, which is what
+      // the emitter's disposition table reads.
+      const retryAfter = response.headers.get('retry-after');
+      expect(retryAfter).not.toBeNull();
+      expect(Number.isInteger(Number(retryAfter))).toBe(true);
+      expect(Number(retryAfter)).toBeGreaterThan(0);
+      expect(await response.json()).toMatchObject({ error: 'rate_limited' });
+    }
+  });
+
+  it('the window resets, so a limited client is not locked out forever', () => {
+    const now = Date.now();
+    const bucket = `test:${crypto.randomUUID()}`;
+    for (let i = 0; i < 2; i += 1) countAgainst(bucket, now, 2);
+    expect(() => countAgainst(bucket, now, 2)).toThrow();
+    // One window later the bucket is fresh.
+    expect(() => countAgainst(bucket, now + RATE_WINDOW_MS, 2)).not.toThrow();
+  });
+
+  it('buckets on the key hash, and never on the IP (§13)', async () => {
+    // Two different keys must not share a bucket, and the same key must share one
+    // with itself regardless of any request header.
+    const nowMs = Date.now();
+    resetRateLimiter();
+
+    // Fill one key's bucket to the limit.
+    for (let i = 0; i < PRE_AUTH_LIMIT_PER_WINDOW; i += 1) {
+      await checkPreAuthRate(WRITE_KEY, nowMs);
+    }
+    await expect(checkPreAuthRate(WRITE_KEY, nowMs)).rejects.toThrow();
+    // A different key is untouched — so the bucket is per key, not global.
+    await expect(checkPreAuthRate(OTHER_WRITE_KEY, nowMs)).resolves.toBeUndefined();
+
+    resetRateLimiter();
+  });
+
+  it('the ingest path is limited BEFORE the key is resolved', async () => {
+    // Pre-auth matters: `resolveKey` costs a D1 read, so limiting after it hands a
+    // key-guessing loop one free storage read per attempt. An UNKNOWN key must
+    // therefore be able to trip the limiter and get a 429 rather than a 401.
+    resetRateLimiter();
+    const unknownKey = 'sk_stats_this_key_does_not_exist_00000000000';
+
+    // Below the limit it is a plain 401.
+    expect((await post(makeBatch(), { key: unknownKey })).status).toBe(401);
+
+    // Fill the bucket for that key, from empty — the 401 above already spent one.
+    resetRateLimiter();
+    const nowMs = Date.now();
+    for (let i = 0; i < PRE_AUTH_LIMIT_PER_WINDOW; i += 1) {
+      await checkPreAuthRate(unknownKey, nowMs);
+    }
+    const limited = await post(makeBatch({ batchId: batchId() }), { key: unknownKey });
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get('retry-after')).not.toBeNull();
+
+    resetRateLimiter();
+  });
+
+  it('both read endpoints can emit §8.3 429s', async () => {
+    // Before this there was no limiter on the read path at all, so §8.3's
+    // documented 429 was unreachable — nothing in the Worker could produce one.
+    resetRateLimiter();
+    const nowMs = Date.now();
+    for (let i = 0; i < PRE_AUTH_LIMIT_PER_WINDOW; i += 1) {
+      await checkPreAuthRate(READ_KEY, nowMs);
+    }
+
+    const day = new Date().toISOString().slice(0, 10);
+    for (const path of ['/v1/summary', '/v1/events/top']) {
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(
+        readRequest(path, { projectId: PROJECT, from: day, to: day }, READ_KEY),
+        env as never,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      expect(response.status, path).toBe(429);
+      expect(response.headers.get('retry-after'), path).not.toBeNull();
+      expect(await response.json()).toMatchObject({ error: 'rate_limited' });
+    }
+
+    resetRateLimiter();
   });
 });

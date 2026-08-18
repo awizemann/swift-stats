@@ -3,6 +3,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src/index.js';
+import { addDays, today } from '../src/dates.js';
 import {
   INSTALLS,
   OTHER_READ_KEY,
@@ -21,6 +22,19 @@ async function get(path: string, params: Record<string, string>, key: string | n
   return response;
 }
 
+/**
+ * Every fixture day is an OFFSET FROM TODAY, never a literal.
+ *
+ * The Worker reads `new Date()`, and the read path routes a day to raw rows or to
+ * the rollups depending on how old it is. Hard-coded 2026-08-xx fixtures were
+ * inside raw retention when they were written and would have silently crossed the
+ * 90-day boundary about two months later — at which point these tests would start
+ * asserting rollup behavior while claiming to assert raw behavior, or just fail
+ * for a reason that has nothing to do with the code.
+ */
+const TODAY = today(new Date());
+const D = (daysAgo: number): string => addDays(TODAY, -daysAgo);
+
 const S1 = '1786012978-40371852';
 const S2 = '1786013999-11112222';
 const S3 = '1786099999-33334444';
@@ -28,7 +42,7 @@ const S3 = '1786099999-33334444';
 /**
  * The summary fixture. Hand-computed expectations, from §8.1's definitions:
  *
- * 2026-08-01  install A session S1: app_open, project_opened
+ * D(16)  install A session S1: app_open, project_opened
  *             install A session S2: app_open
  *             install B session S1: app_open            <- SAME sessionId as A's
  *   opens 3 · sessions 3 · activeInstalls 2 · events 4
@@ -37,23 +51,23 @@ const S3 = '1786099999-33334444';
  *   DISTINCT session_id alone would say 2 — that is the discriminating case for
  *   §10's "a sessionId is not globally unique; key on (installId, sessionId)".
  *
- * 2026-08-02  install A session S3: project_opened, project_opened
+ * D(15)  install A session S3: project_opened, project_opened
  *             install A session S3 (debug build): app_open
  *   Excluding debug: opens 0 · sessions 1 · activeInstalls 1 · events 2
  *   Including debug: opens 1 · sessions 1 · activeInstalls 1 · events 3
  *
- * 2026-08-03  nothing at all -> an explicit zero row.
+ * D(14)  nothing at all -> an explicit zero row.
  */
 async function seedSummaryFixture(): Promise<void> {
   await seedEvents([
-    { day: '2026-08-01', name: 'app_open', installId: INSTALLS.a, sessionId: S1 },
-    { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.a, sessionId: S1 },
-    { day: '2026-08-01', name: 'app_open', installId: INSTALLS.a, sessionId: S2 },
-    { day: '2026-08-01', name: 'app_open', installId: INSTALLS.b, sessionId: S1 },
+    { day: D(16), name: 'app_open', installId: INSTALLS.a, sessionId: S1 },
+    { day: D(16), name: 'project_opened', installId: INSTALLS.a, sessionId: S1 },
+    { day: D(16), name: 'app_open', installId: INSTALLS.a, sessionId: S2 },
+    { day: D(16), name: 'app_open', installId: INSTALLS.b, sessionId: S1 },
 
-    { day: '2026-08-02', name: 'project_opened', installId: INSTALLS.a, sessionId: S3 },
-    { day: '2026-08-02', name: 'project_opened', installId: INSTALLS.a, sessionId: S3 },
-    { day: '2026-08-02', name: 'app_open', installId: INSTALLS.a, sessionId: S3, isDebug: true },
+    { day: D(15), name: 'project_opened', installId: INSTALLS.a, sessionId: S3 },
+    { day: D(15), name: 'project_opened', installId: INSTALLS.a, sessionId: S3 },
+    { day: D(15), name: 'app_open', installId: INSTALLS.a, sessionId: S3, isDebug: true },
   ]);
 }
 
@@ -63,7 +77,7 @@ beforeEach(async () => {
 
 describe('read authentication (§8)', () => {
   it('401s a missing read key', async () => {
-    expect((await get('/v1/summary', { projectId: PROJECT, from: '2026-08-01', to: '2026-08-01' }, null)).status).toBe(401);
+    expect((await get('/v1/summary', { projectId: PROJECT, from: D(16), to: D(16) }, null)).status).toBe(401);
   });
 
   it('401s a WRITE key on a read endpoint', async () => {
@@ -71,7 +85,7 @@ describe('read authentication (§8)', () => {
     // binary, so this is the assertion that keeps a public key from reading.
     const response = await get(
       '/v1/summary',
-      { projectId: PROJECT, from: '2026-08-01', to: '2026-08-01' },
+      { projectId: PROJECT, from: D(16), to: D(16) },
       WRITE_KEY,
     );
     expect(response.status).toBe(401);
@@ -82,12 +96,12 @@ describe('read authentication (§8)', () => {
     // projects exist. Byte-identical responses is the strongest form of that.
     const outOfScope = await get(
       '/v1/summary',
-      { projectId: PROJECT, from: '2026-08-01', to: '2026-08-01' },
+      { projectId: PROJECT, from: D(16), to: D(16) },
       OTHER_READ_KEY,
     );
     const nonexistent = await get(
       '/v1/summary',
-      { projectId: 'no-such-project-at-all', from: '2026-08-01', to: '2026-08-01' },
+      { projectId: 'no-such-project-at-all', from: D(16), to: D(16) },
       OTHER_READ_KEY,
     );
 
@@ -99,7 +113,7 @@ describe('read authentication (§8)', () => {
   it('401s rather than 400s a malformed projectId', async () => {
     // Answering 400 here would let a caller tell "bad syntax" from "not yours",
     // which is a probe for which projects exist.
-    const response = await get('/v1/summary', { projectId: 'has spaces', from: '2026-08-01', to: '2026-08-01' });
+    const response = await get('/v1/summary', { projectId: 'has spaces', from: D(16), to: D(16) });
     expect(response.status).toBe(401);
   });
 });
@@ -107,25 +121,25 @@ describe('read authentication (§8)', () => {
 describe('GET /v1/summary (§8.1)', () => {
   it('computes opens, sessions, activeInstalls and events per the §8.1 definitions', async () => {
     await seedSummaryFixture();
-    const response = await get('/v1/summary', { projectId: PROJECT, from: '2026-08-01', to: '2026-08-03' });
+    const response = await get('/v1/summary', { projectId: PROJECT, from: D(16), to: D(14) });
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as { rows: unknown[]; from: string; to: string; includeDebug: boolean };
     expect(body.includeDebug).toBe(false);
     expect(body.rows).toEqual([
-      { date: '2026-08-01', opens: 3, sessions: 3, activeInstalls: 2, events: 4 },
-      { date: '2026-08-02', opens: 0, sessions: 1, activeInstalls: 1, events: 2 },
-      { date: '2026-08-03', opens: 0, sessions: 0, activeInstalls: 0, events: 0 },
+      { date: D(16), opens: 3, sessions: 3, activeInstalls: 2, events: 4 },
+      { date: D(15), opens: 0, sessions: 1, activeInstalls: 1, events: 2 },
+      { date: D(14), opens: 0, sessions: 0, activeInstalls: 0, events: 0 },
     ]);
   });
 
   it('keys sessions on (installId, sessionId), not sessionId alone', async () => {
     // Discriminating on its own: install A and install B share sessionId S1 on
-    // 2026-08-01, so COUNT(DISTINCT session_id) gives 2 and the correct
+    // the same day, so COUNT(DISTINCT session_id) gives 2 and the correct
     // COUNT(DISTINCT install||session) gives 3.
     await seedSummaryFixture();
     const body = (await (
-      await get('/v1/summary', { projectId: PROJECT, from: '2026-08-01', to: '2026-08-01' })
+      await get('/v1/summary', { projectId: PROJECT, from: D(16), to: D(16) })
     ).json()) as { rows: Array<{ sessions: number }> };
     expect(body.rows[0]?.sessions).toBe(3);
   });
@@ -133,10 +147,10 @@ describe('GET /v1/summary (§8.1)', () => {
   it('includeDebug defaults to false and true changes the answer', async () => {
     await seedSummaryFixture();
     const off = (await (
-      await get('/v1/summary', { projectId: PROJECT, from: '2026-08-02', to: '2026-08-02' })
+      await get('/v1/summary', { projectId: PROJECT, from: D(15), to: D(15) })
     ).json()) as { rows: Array<{ opens: number; events: number }> };
     const on = (await (
-      await get('/v1/summary', { projectId: PROJECT, from: '2026-08-02', to: '2026-08-02', includeDebug: 'true' })
+      await get('/v1/summary', { projectId: PROJECT, from: D(15), to: D(15), includeDebug: 'true' })
     ).json()) as { rows: Array<{ opens: number; events: number }> };
 
     expect(off.rows[0]).toMatchObject({ opens: 0, events: 2 });
@@ -144,24 +158,24 @@ describe('GET /v1/summary (§8.1)', () => {
   });
 
   it('zero-fills every day in the range and sorts ascending', async () => {
-    await seedEvents([{ day: '2026-08-10', name: 'app_open', installId: INSTALLS.a, sessionId: S1 }]);
+    await seedEvents([{ day: D(7), name: 'app_open', installId: INSTALLS.a, sessionId: S1 }]);
     const body = (await (
-      await get('/v1/summary', { projectId: PROJECT, from: '2026-08-08', to: '2026-08-12' })
+      await get('/v1/summary', { projectId: PROJECT, from: D(9), to: D(5) })
     ).json()) as { rows: Array<{ date: string; events: number }> };
 
     expect(body.rows.map((r) => r.date)).toEqual([
-      '2026-08-08', '2026-08-09', '2026-08-10', '2026-08-11', '2026-08-12',
+      D(9), D(8), D(7), D(6), D(5),
     ]);
     expect(body.rows.map((r) => r.events)).toEqual([0, 0, 1, 0, 0]);
   });
 
   it('sees no other project’s events', async () => {
     await seedEvents([
-      { day: '2026-08-01', name: 'app_open', installId: INSTALLS.a, sessionId: S1 },
-      { day: '2026-08-01', name: 'app_open', installId: INSTALLS.b, sessionId: S2, projectId: 'someone-else' },
+      { day: D(16), name: 'app_open', installId: INSTALLS.a, sessionId: S1 },
+      { day: D(16), name: 'app_open', installId: INSTALLS.b, sessionId: S2, projectId: 'someone-else' },
     ]);
     const body = (await (
-      await get('/v1/summary', { projectId: PROJECT, from: '2026-08-01', to: '2026-08-01' })
+      await get('/v1/summary', { projectId: PROJECT, from: D(16), to: D(16) })
     ).json()) as { rows: Array<{ events: number; activeInstalls: number }> };
     expect(body.rows[0]).toMatchObject({ events: 1, activeInstalls: 1 });
   });
@@ -180,22 +194,22 @@ describe('GET /v1/summary (§8.1)', () => {
   });
 
   it('400s a `to` before `from`', async () => {
-    const response = await get('/v1/summary', { projectId: PROJECT, from: '2026-08-05', to: '2026-08-01' });
+    const response = await get('/v1/summary', { projectId: PROJECT, from: D(12), to: D(16) });
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: 'invalid_range' });
   });
 
   it('400s a span over 400 days with range_too_large', async () => {
-    // 401 days inclusive: 2025-01-01 .. 2026-02-05.
-    const response = await get('/v1/summary', { projectId: PROJECT, from: '2025-01-01', to: '2026-02-05' });
+    // 401 days inclusive, ending today.
+    const response = await get('/v1/summary', { projectId: PROJECT, from: D(400), to: TODAY });
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: 'range_too_large' });
   });
 
   it('accepts exactly 400 days', async () => {
-    // The off-by-one guard on the other side of the boundary: 2025-01-01 ..
-    // 2026-02-04 is 400 days inclusive and must be accepted.
-    const response = await get('/v1/summary', { projectId: PROJECT, from: '2025-01-01', to: '2026-02-04' });
+    // The off-by-one guard on the other side of the boundary: exactly 400 days
+    // inclusive, ending today, must be accepted.
+    const response = await get('/v1/summary', { projectId: PROJECT, from: D(399), to: TODAY });
     expect(response.status).toBe(200);
     const body = (await response.json()) as { rows: unknown[] };
     expect(body.rows).toHaveLength(400);
@@ -209,7 +223,7 @@ describe('GET /v1/summary (§8.1)', () => {
 
   it('400s a malformed includeDebug', async () => {
     const response = await get('/v1/summary', {
-      projectId: PROJECT, from: '2026-08-01', to: '2026-08-01', includeDebug: 'yes',
+      projectId: PROJECT, from: D(16), to: D(16), includeDebug: 'yes',
     });
     expect(response.status).toBe(400);
   });
@@ -219,7 +233,7 @@ describe('GET /v1/summary (§8.1)', () => {
     const before = await (env as never as { DB: D1Database }).DB.prepare(
       `SELECT COUNT(*) AS n FROM events`,
     ).first<{ n: number }>();
-    await get('/v1/summary', { projectId: PROJECT, from: '2026-08-01', to: '2026-08-03' });
+    await get('/v1/summary', { projectId: PROJECT, from: D(16), to: D(14) });
     const after = await (env as never as { DB: D1Database }).DB.prepare(
       `SELECT COUNT(*) AS n FROM events`,
     ).first<{ n: number }>();
@@ -230,19 +244,19 @@ describe('GET /v1/summary (§8.1)', () => {
 describe('GET /v1/events/top without name (§8.2)', () => {
   beforeEach(async () => {
     await seedEvents([
-      { day: '2026-08-01', name: 'app_open', installId: INSTALLS.a, sessionId: S1 },
-      { day: '2026-08-01', name: 'app_open', installId: INSTALLS.b, sessionId: S1 },
-      { day: '2026-08-01', name: 'app_open', installId: INSTALLS.b, sessionId: S2 },
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.a, sessionId: S1 },
+      { day: D(16), name: 'app_open', installId: INSTALLS.a, sessionId: S1 },
+      { day: D(16), name: 'app_open', installId: INSTALLS.b, sessionId: S1 },
+      { day: D(16), name: 'app_open', installId: INSTALLS.b, sessionId: S2 },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.a, sessionId: S1 },
       // Two names with the SAME count, to pin the documented tiebreak.
-      { day: '2026-08-01', name: 'beta_event', installId: INSTALLS.a, sessionId: S1 },
-      { day: '2026-08-01', name: 'alpha_event', installId: INSTALLS.a, sessionId: S1 },
+      { day: D(16), name: 'beta_event', installId: INSTALLS.a, sessionId: S1 },
+      { day: D(16), name: 'alpha_event', installId: INSTALLS.a, sessionId: S1 },
     ]);
   });
 
   it('sorts by count desc, then name ascending', async () => {
     const body = (await (
-      await get('/v1/events/top', { projectId: PROJECT, from: '2026-08-01', to: '2026-08-01' })
+      await get('/v1/events/top', { projectId: PROJECT, from: D(16), to: D(16) })
     ).json()) as { rows: Array<{ name: string; count: number; installs: number }>; name: null; limit: number };
 
     expect(body.name).toBeNull();
@@ -258,7 +272,7 @@ describe('GET /v1/events/top without name (§8.2)', () => {
 
   it('honors limit as a total row cap', async () => {
     const body = (await (
-      await get('/v1/events/top', { projectId: PROJECT, from: '2026-08-01', to: '2026-08-01', limit: '2' })
+      await get('/v1/events/top', { projectId: PROJECT, from: D(16), to: D(16), limit: '2' })
     ).json()) as { rows: unknown[] };
     expect(body.rows).toHaveLength(2);
   });
@@ -266,7 +280,7 @@ describe('GET /v1/events/top without name (§8.2)', () => {
   it('400s a limit outside 1..100 or a non-integer', async () => {
     for (const limit of ['0', '101', '-1', 'abc', '20.0', '2e1', '']) {
       const response = await get('/v1/events/top', {
-        projectId: PROJECT, from: '2026-08-01', to: '2026-08-01', limit,
+        projectId: PROJECT, from: D(16), to: D(16), limit,
       });
       expect(response.status, `limit=${limit}`).toBe(400);
       expect(await response.json()).toMatchObject({ error: 'invalid_limit' });
@@ -278,24 +292,24 @@ describe('GET /v1/events/top with name (§8.2)', () => {
   beforeEach(async () => {
     await seedEvents([
       // section=analytics ×3 (installs A, A, B)
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: { section: 'analytics', cached: true } },
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: { section: 'analytics', cached: false } },
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.b, sessionId: S1, props: { section: 'analytics', cached: true } },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: { section: 'analytics', cached: true } },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: { section: 'analytics', cached: false } },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.b, sessionId: S1, props: { section: 'analytics', cached: true } },
       // section=overview ×1
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: { section: 'overview' } },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: { section: 'overview' } },
       // section explicitly null ×1
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.b, sessionId: S1, props: { section: null } },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.b, sessionId: S1, props: { section: null } },
       // section ABSENT ×1, plus a numeric prop that must never be broken down
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.b, sessionId: S1, props: { tile_count: 6 } },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.b, sessionId: S1, props: { tile_count: 6 } },
       // no props at all ×1 — also folds into every prop's null row
-      { day: '2026-08-01', name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: null },
+      { day: D(16), name: 'project_opened', installId: INSTALLS.a, sessionId: S1, props: null },
     ]);
   });
 
   async function rows(params: Record<string, string> = {}) {
     const body = (await (
       await get('/v1/events/top', {
-        projectId: PROJECT, from: '2026-08-01', to: '2026-08-01', name: 'project_opened', ...params,
+        projectId: PROJECT, from: D(16), to: D(16), name: 'project_opened', ...params,
       })
     ).json()) as { rows: Array<{ prop: string; value: unknown; count: number; installs: number }> };
     return body.rows;
@@ -349,7 +363,7 @@ describe('GET /v1/events/top with name (§8.2)', () => {
 
   it('returns 200 with empty rows for an unknown name', async () => {
     const response = await get('/v1/events/top', {
-      projectId: PROJECT, from: '2026-08-01', to: '2026-08-01', name: 'never_emitted',
+      projectId: PROJECT, from: D(16), to: D(16), name: 'never_emitted',
     });
     expect(response.status).toBe(200);
     expect((await response.json() as { rows: unknown[] }).rows).toEqual([]);
@@ -357,7 +371,7 @@ describe('GET /v1/events/top with name (§8.2)', () => {
 
   it('400s a syntactically invalid name', async () => {
     const response = await get('/v1/events/top', {
-      projectId: PROJECT, from: '2026-08-01', to: '2026-08-01', name: 'Not A Name',
+      projectId: PROJECT, from: D(16), to: D(16), name: 'Not A Name',
     });
     expect(response.status).toBe(400);
   });

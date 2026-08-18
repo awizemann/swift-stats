@@ -250,12 +250,89 @@ once the day's raw rows are past retention there is nothing left to re-roll from
 
 ### Rate limiting
 
-The Worker carries a per-isolate backstop of 600 batches/minute per project and
-emits `Retry-After` on the 429. It is deliberately not the real limit — an isolate
-is not a global counter. For a durable limit put a **Cloudflare Rate Limiting
-rule** in front of the Worker, keyed on the `X-Stats-Key` header. A well-behaved
-emitter following §7 (at most one request in flight, exponential backoff) never
-comes close to either.
+Two layers, and only one of them is real.
+
+**In the Worker (backstop).** `src/ratelimit.ts` counts requests per minute in a
+per-isolate `Map` and throws a 429 with `Retry-After` past the limit:
+
+| Bucket | Limit | Where |
+|---|---|---|
+| SHA-256 of the presented key | 600/min | **pre-auth**, on `/v1/events`, `/v1/summary`, `/v1/events/top` |
+| `projectId` | 600/min | post-auth, on `/v1/events` |
+| `anonymous` (no key, or one of impossible length) | 600/min | pre-auth, all three |
+
+Two properties, both load-bearing:
+
+- **The bucket key is never the IP.** §13 forbids storing or logging the client
+  IP or anything derived from it, and a `Map` keyed on `CF-Connecting-IP` is
+  storage — just short-lived. The SHA-256 of the presented key is available
+  before authentication, is already what `keys.key_hash` holds, and is
+  per-client in the way that matters.
+- **It runs before `resolveKey`.** `resolveKey` costs a D1 read, so limiting
+  after it would hand a key-guessing loop one free storage read per attempt.
+
+It is deliberately *not* the real limit: an isolate is not a global counter, so a
+client spread across isolates sees a multiple of these numbers.
+
+**In front of the Worker (the durable limit).** A Cloudflare Rate Limiting rule,
+global and counted at the edge. Create it once per zone —
+**Security → WAF → Rate limiting rules → Create rule** — or with the API:
+
+```jsonc
+// PUT /client/v4/zones/{zone_id}/rulesets/phases/http_ratelimit/entrypoint
+{
+  "rules": [
+    {
+      "description": "swift-stats ingest, per write key",
+      "expression": "(http.request.uri.path eq \"/v1/events\")",
+      "action": "block",
+      "action_parameters": {
+        "response": {
+          "status_code": 429,
+          "content_type": "application/json",
+          "content": "{\"error\":\"rate_limited\",\"message\":\"Too many requests.\"}"
+        }
+      },
+      "ratelimit": {
+        // Per write key, NOT per IP: many installs share an IP behind a carrier
+        // NAT, and §13 keeps this backend out of the IP business anyway.
+        "characteristics": ["cf.colo.id", "http.request.headers[\"x-stats-key\"]"],
+        "period": 60,
+        "requests_per_period": 600,
+        "mitigation_timeout": 60
+      }
+    },
+    {
+      "description": "swift-stats reads, per read key",
+      "expression": "(http.request.uri.path in {\"/v1/summary\" \"/v1/events/top\"})",
+      "action": "block",
+      "action_parameters": {
+        "response": {
+          "status_code": 429,
+          "content_type": "application/json",
+          "content": "{\"error\":\"rate_limited\",\"message\":\"Too many requests.\"}"
+        }
+      },
+      "ratelimit": {
+        "characteristics": ["cf.colo.id", "http.request.headers[\"x-stats-read-key\"]"],
+        "period": 60,
+        "requests_per_period": 120,
+        "mitigation_timeout": 60
+      }
+    }
+  ]
+}
+```
+
+Keep the response body in the §8.3 shape (`{"error": …, "message": …}`) and the
+status at 429, so an emitter's `IngestDisposition` table and a reader both see
+the documented contract rather than Cloudflare's default block page.
+Header-keyed characteristics need a paid Cloudflare plan; on the free plan the
+rule falls back to IP keying, which is worse — but it stays outside the Worker
+either way, so nothing in this backend stores or sees it.
+
+A well-behaved emitter following §7 (at most one request in flight, exponential
+backoff) never comes close to any of these.
 
 ### Cost
 

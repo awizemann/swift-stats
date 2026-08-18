@@ -33,6 +33,7 @@ import {
   addDays,
 } from './dates.js';
 import { requireScope, resolveKey, type KeyScope } from './keys.js';
+import { checkPreAuthRate } from './ratelimit.js';
 import { SCHEMA_VERSION } from './validate.js';
 import { logger } from './log.js';
 import type { Env } from './env.js';
@@ -72,7 +73,7 @@ interface Range {
  * Doing dates first would let an unauthenticated caller distinguish a 400 from a
  * 401 and so probe which projects exist — the thing §8 forbids.
  */
-function parseRange(url: URL, scope: KeyScope, now: Date): Range {
+function parseRange(url: URL, scope: KeyScope, rawFromDay: string, now: Date): Range {
   const projectId = url.searchParams.get('projectId');
   if (projectId === null || !PROJECT_ID_RE.test(projectId)) {
     // A malformed projectId is a 401, not a 400. It cannot be in the key's
@@ -120,15 +121,82 @@ function parseRange(url: URL, scope: KeyScope, now: Date): Range {
     includeDebug = debugParam === 'true';
   }
 
-  const cutoff = rawCutoffDay(now);
+  // `rawFromDay` is the OBSERVED boundary (see `rawBoundaryDay`), not the clock's
+  // — every day at or above it is answered from raw rows, every day below it from
+  // the rollups, and the two sets stay disjoint and complete.
   return {
     projectId,
     from,
     to,
     includeDebug,
-    rawFrom: to < cutoff ? null : (from > cutoff ? from : cutoff),
-    rollupTo: from >= cutoff ? null : (to < cutoff ? to : addDays(cutoff, -1)),
+    rawFrom: to < rawFromDay ? null : (from > rawFromDay ? from : rawFromDay),
+    rollupTo: from >= rawFromDay ? null : (to < rawFromDay ? to : addDays(rawFromDay, -1)),
   };
+}
+
+/**
+ * The oldest day this read will answer from raw event rows.
+ *
+ * The clock alone gets this wrong, and the window is real. `rawCutoffDay(now)` is
+ * `today - 89`, while the retention sweep that actually deletes `day < cutoff`
+ * runs on a cron at **02:10 UTC**. So between 00:00 and 02:10 every day, `today`
+ * has already ticked over but the sweep has not run: day `today - 90` still has
+ * all its raw rows, and the clock-derived boundary routed it to the rollups
+ * anyway. If that day's rollup was never written — the cron was down while the
+ * day was inside the re-roll window, the rollup failed for it, a batch for it
+ * arrived after it left the window — the day read as a confident, zero-filled
+ * ZERO while its raw rows sat right there in the table. §8.1 promises a row per
+ * day and no way to distinguish "no data" from "missing row", which makes a false
+ * zero indistinguishable from the truth.
+ *
+ * So the boundary is derived from observed state instead: the oldest day for which
+ * raw rows exist, when that is older than the clock's cutoff. A day never reads as
+ * zero while its raw rows exist.
+ *
+ * Both directions of the resulting boundary stay safe:
+ *
+ *  * Surviving raw rows are always a contiguous SUFFIX `[minDay, today]` — the
+ *    sweep deletes `day < cutoff` and `cutoff` only moves forward — so no day
+ *    above the boundary can be missing raw rows that a rollup would have covered.
+ *    (The one exception is a per-`installId` erasure emptying a day, and there
+ *    reading zero from raw is the *correct* answer; the day's stale rollup is the
+ *    wrong one.)
+ *  * Below the boundary there are no raw rows at all, so the rollups cannot
+ *    double-count with them.
+ *
+ * One indexed `MIN(day)` on `events_scope`, scoped to the project.
+ */
+async function rawBoundaryDay(env: Env, projectId: string, now: Date): Promise<string> {
+  const cutoff = rawCutoffDay(now);
+  const row = await env.DB.prepare(
+    `SELECT MIN(day) AS oldest FROM events WHERE project_id = ?1`,
+  )
+    .bind(projectId)
+    .first<{ oldest: string | null }>();
+
+  const oldest = row?.oldest ?? null;
+  if (oldest === null) return cutoff;
+  // Never move the boundary UP past the clock's cutoff: a project whose oldest
+  // raw row is recent (a new project, or one that went quiet) must still have its
+  // older days served from rollups rather than reported as zero.
+  return oldest < cutoff ? oldest : cutoff;
+}
+
+/**
+ * Authorize, then parse, then resolve the raw/rollup boundary.
+ *
+ * `resolveKey` and `requireScope` still run before anything else — an
+ * unauthenticated caller must not be able to tell a 400 from a 401 and so probe
+ * which projects exist (§8) — and the boundary query runs only once the key is
+ * known to cover the project it names.
+ */
+async function resolveRange(url: URL, env: Env, scope: KeyScope, now: Date): Promise<Range> {
+  // A first pass with the clock's cutoff, purely to get the validated projectId
+  // and the 400s out of the way in the order §8 fixes. Its `rawFrom`/`rollupTo`
+  // are discarded.
+  const validated = parseRange(url, scope, rawCutoffDay(now), now);
+  const boundary = await rawBoundaryDay(env, validated.projectId, now);
+  return parseRange(url, scope, boundary, now);
 }
 
 function parseLimit(url: URL): number {
@@ -165,8 +233,13 @@ interface SummaryCounts {
 
 export async function handleSummary(request: Request, env: Env, now: Date): Promise<Response> {
   const url = new URL(request.url);
-  const scope = await resolveKey(env.DB, request.headers.get('x-stats-read-key'), 'read');
-  const range = parseRange(url, scope, now);
+  const presentedKey = request.headers.get('x-stats-read-key');
+  // Pre-auth, keyed on SHA-256 of the presented key, never the IP (§13). §8.3
+  // documents a 429 with `Retry-After` on the read endpoints; without a limiter
+  // here there was no code path that could ever emit one.
+  await checkPreAuthRate(presentedKey, now.getTime());
+  const scope = await resolveKey(env.DB, presentedKey, 'read');
+  const range = await resolveRange(url, env, scope, now);
 
   const byDay = new Map<string, SummaryCounts>();
 
@@ -419,7 +492,12 @@ async function breakdown(env: Env, range: Range, name: string, limit: number) {
 
   if (range.rollupTo !== null) {
     const { results } = await env.DB.prepare(
-      `SELECT prop, value_type AS type, value, is_null AS isNull,
+      // `"isNull"` MUST stay quoted: `ISNULL` is a postfix operator in SQLite,
+      // so a bare `is_null AS isNull` is a syntax error, not an alias. It made
+      // every `/v1/events/top?name=` request whose range reached past raw
+      // retention answer 500 — and nothing exercised it, because the suite only
+      // ever read `/v1/summary` past the boundary.
+      `SELECT prop, value_type AS type, value, is_null AS "isNull",
               SUM(count) AS count, SUM(installs) AS installs
          FROM daily_prop_rollups
         WHERE project_id = ?1 AND include_debug = ?2 AND day >= ?3 AND day <= ?4 AND name = ?5
@@ -437,11 +515,37 @@ async function breakdown(env: Env, range: Range, name: string, limit: number) {
     }
   }
 
+  // THE PROP CAP, applied ONCE over the merged result rather than per source.
+  //
+  // The raw branch has always had `LIMIT MAX_BREAKDOWN_PROPS` in SQL; the rollup
+  // branch had no cap at all, so a range served from rollups could return an
+  // unbounded number of props, and a MIXED range returned "raw's top 20, plus
+  // every prop the rollups knew about" — a prop set that depended on which side of
+  // the retention boundary the range happened to straddle, and that could exceed
+  // the documented cap without ever saying so.
+  //
+  // Ranking here, on merged totals, makes the answer one thing: the 20 most
+  // frequent props across the whole requested range, `prop` ascending as the
+  // deterministic tiebreak §8.2 requires, whatever the range's sources are. The
+  // SQL `LIMIT` stays as a cheap pre-filter on the raw side; it uses the same
+  // criterion, so it cannot promote a prop this ranking would not have kept.
+  const totalsByProp = new Map<string, number>();
+  for (const row of merged.values()) {
+    totalsByProp.set(row.prop, (totalsByProp.get(row.prop) ?? 0) + row.count);
+  }
+  const keptProps = new Set(
+    [...totalsByProp.entries()]
+      .sort((a, b) => b[1] - a[1] || byteCompare(a[0], b[0]))
+      .slice(0, MAX_BREAKDOWN_PROPS)
+      .map(([prop]) => prop),
+  );
+
   // §8.2 ordering: grouped by `prop` (props ascending), and within each prop by
   // count descending, then value ascending, with the `null` row LAST regardless
   // of its count.
   const grouped = new Map<string, PropRow[]>();
   for (const row of merged.values()) {
+    if (!keptProps.has(row.prop)) continue;
     const list = grouped.get(row.prop);
     if (list === undefined) grouped.set(row.prop, [row]);
     else list.push(row);
@@ -467,8 +571,10 @@ async function breakdown(env: Env, range: Range, name: string, limit: number) {
 
 export async function handleTopEvents(request: Request, env: Env, now: Date): Promise<Response> {
   const url = new URL(request.url);
-  const scope = await resolveKey(env.DB, request.headers.get('x-stats-read-key'), 'read');
-  const range = parseRange(url, scope, now);
+  const presentedKey = request.headers.get('x-stats-read-key');
+  await checkPreAuthRate(presentedKey, now.getTime());
+  const scope = await resolveKey(env.DB, presentedKey, 'read');
+  const range = await resolveRange(url, env, scope, now);
   const limit = parseLimit(url);
 
   const nameParam = url.searchParams.get('name');

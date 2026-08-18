@@ -24,12 +24,57 @@ export interface Fields {
   readonly source?: 'raw' | 'rollup' | 'mixed';
 }
 
+/**
+ * Stable classification codes for a caught error. The log carries one of these,
+ * never the driver's message text. Adding a code is fine; renaming one breaks
+ * anything alerting on the logs.
+ */
+export type ErrorClass =
+  | 'constraint_violation'
+  | 'datatype_mismatch'
+  | 'value_too_large'
+  | 'no_such_table'
+  | 'syntax_error'
+  | 'timeout'
+  | 'network'
+  | 'non_error_thrown'
+  | 'unclassified';
+
+/**
+ * Map an error to a fixed code.
+ *
+ * Logging `cause.message` verbatim was the hole this closes. SQLite constraint
+ * messages already name the table and column, and a D1 or driver change can widen
+ * them to include the BOUND PARAMETER VALUE — which on the ingest path is an
+ * `installId`, a hashed `userId`, or a prop value. This module's rule is that
+ * nothing person-scale is ever logged (§13), and a rule that holds only as long as
+ * a dependency's message format does not change is not a rule.
+ *
+ * The trade is real and accepted: a genuinely novel fault logs as `unclassified`
+ * with no detail. That is the right side to err on for a backend whose privacy
+ * claims are the product, and the `event` name plus the surrounding fields
+ * (project, counts, day) already localize a fault to one code path.
+ */
+export function classifyError(cause: unknown): ErrorClass {
+  if (!(cause instanceof Error)) return 'non_error_thrown';
+  const message = cause.message;
+  if (/no such table|no such column/i.test(message)) return 'no_such_table';
+  if (/datatype mismatch|cannot store .* value/i.test(message)) return 'datatype_mismatch';
+  if (/string or blob too big|too large|out of range/i.test(message)) return 'value_too_large';
+  if (/constraint failed|UNIQUE constraint|NOT NULL constraint|CHECK constraint/i.test(message)) {
+    return 'constraint_violation';
+  }
+  if (/syntax error|malformed/i.test(message)) return 'syntax_error';
+  if (/timed out|timeout|exceeded/i.test(message)) return 'timeout';
+  if (/network|connection|fetch failed|socket/i.test(message)) return 'network';
+  return 'unclassified';
+}
+
 function emit(level: 'info' | 'warn' | 'error', event: string, fields: Fields, cause?: unknown): void {
   const line: Record<string, unknown> = { level, event, ...fields };
   if (cause !== undefined) {
-    // The message only — never a body, and never a bound parameter value, both
-    // of which a driver may include in a stringified error object.
-    line.error = cause instanceof Error ? cause.message : 'non-error thrown';
+    // A fixed code, never the driver's message — see `classifyError`.
+    line.error = classifyError(cause);
   }
   const text = JSON.stringify(line);
   if (level === 'error') console.error(text);

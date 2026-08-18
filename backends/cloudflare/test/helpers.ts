@@ -33,6 +33,7 @@ const TABLES = [
   'daily_event_rollups',
   'daily_prop_rollups',
   'rollup_state',
+  'rollup_lease',
   'keys',
   'projects',
   'rollup_state',

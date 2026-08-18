@@ -26,6 +26,36 @@ export const MAX_PROPS_KEYS = 32;
 export const MAX_PROP_KEY_SCALARS = 40;
 export const MAX_PROP_VALUE_SCALARS = 200;
 
+/**
+ * Upper bounds on the integers that reach a `STRICT` `INTEGER` column.
+ *
+ * `Number.isInteger(1e21)` is `true` — it is an integral `double` — but 1e21 is
+ * far outside int64, so binding it to a STRICT INTEGER column makes D1 throw at
+ * INSERT time. That throw used to surface as a 503 with `Retry-After`, which §7
+ * makes RETAIN-and-retry: a single malformed event would be re-sent forever, by
+ * every client that produced it, and never accepted. These are data errors, so
+ * they must be 400 — a permanent drop — and caught here rather than by the
+ * database.
+ *
+ * `MAX_SAFE_INTEGER` for `seq` because that is the largest integer a JSON
+ * `double` represents exactly; above it, two distinct `seq` values on the wire
+ * would parse to the same number, so there is nothing to preserve. §2.2 only
+ * requires `seq` be a non-negative integer monotonic per install, and an install
+ * emitting 2^53 events is not a thing.
+ */
+export const MAX_SEQ = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Screen dimensions in points. §3's consent-reduced fallback is `0`, so zero is
+ * legal; the ceiling is a sanity bound, generous enough for any real or future
+ * display (an 8K panel is 7680 wide) and small enough that no value can escape
+ * int64 or make a rollup arithmetic overflow.
+ */
+export const MAX_SCREEN_DIMENSION = 1_000_000;
+
+/** `screenScale` is a REAL column, but an absurd value is still a data error. */
+export const MAX_SCREEN_SCALE = 1_000;
+
 const EVENT_NAME_RE = /^[a-z][a-z0-9_]*$/;
 const PROP_KEY_RE = /^[a-z][a-z0-9_]*$/;
 const PROJECT_ID_RE = /^[A-Za-z0-9._-]+$/;
@@ -129,19 +159,30 @@ function reqString(v: unknown, field: string, maxScalars?: number): string {
   return v;
 }
 
-function reqInt(v: unknown, field: string): number {
+/**
+ * A bounded integer. `min`/`max` are not optional on purpose: an unbounded
+ * `Number.isInteger` check accepts `1e21`, which then fails the STRICT INTEGER
+ * insert and used to be mis-signalled as a retriable 503.
+ */
+function reqInt(v: unknown, field: string, min: number, max: number): number {
   if (typeof v !== 'number' || !Number.isInteger(v)) {
     throw badRequest('invalid_context', `Field \`${field}\` must be an integer.`);
+  }
+  if (v < min || v > max) {
+    throw badRequest('invalid_context', `Field \`${field}\` must be between ${min} and ${max}.`);
   }
   return v;
 }
 
-function reqFinite(v: unknown, field: string): number {
+function reqFinite(v: unknown, field: string, min: number, max: number): number {
   // §0: numbers MUST be finite. JSON.parse cannot produce NaN/Infinity from
   // valid JSON, but it can from `1e999` (which parses to Infinity), so this is
   // a real check, not a formality.
   if (typeof v !== 'number' || !Number.isFinite(v)) {
     throw badRequest('invalid_context', `Field \`${field}\` must be a finite number.`);
+  }
+  if (v < min || v > max) {
+    throw badRequest('invalid_context', `Field \`${field}\` must be between ${min} and ${max}.`);
   }
   return v;
 }
@@ -264,9 +305,9 @@ function validateContext(raw: unknown): ValidatedContext {
     // checks above and below. That is deliberate: §3 says a backend MUST accept
     // them, so there is no stricter shape check on these fields to accept them
     // *past*.
-    screenWidth: reqInt(raw.screenWidth, 'context.screenWidth'),
-    screenHeight: reqInt(raw.screenHeight, 'context.screenHeight'),
-    screenScale: reqFinite(raw.screenScale, 'context.screenScale'),
+    screenWidth: reqInt(raw.screenWidth, 'context.screenWidth', 0, MAX_SCREEN_DIMENSION),
+    screenHeight: reqInt(raw.screenHeight, 'context.screenHeight', 0, MAX_SCREEN_DIMENSION),
+    screenScale: reqFinite(raw.screenScale, 'context.screenScale', 0, MAX_SCREEN_SCALE),
     isDebug: reqBool(raw.isDebug, 'context.isDebug'),
     isTestFlight: reqBool(raw.isTestFlight, 'context.isTestFlight'),
     colorScheme: absent(raw.colorScheme)
@@ -320,8 +361,19 @@ function validateEvent(raw: unknown, index: number): {
 
   const appId = reqString(raw.appId, `events[${index}].appId`, 128);
 
-  if (typeof raw.seq !== 'number' || !Number.isInteger(raw.seq) || raw.seq < 0) {
-    throw badRequest('invalid_event', `Event ${index}: \`seq\` must be a non-negative integer.`);
+  // Bounded, not just non-negative: `Number.isInteger(1e21)` is true, and 1e21
+  // is outside int64, so it failed the STRICT INTEGER insert and was reported as
+  // a retriable 503 — an infinite retry loop for an event that can never land.
+  if (
+    typeof raw.seq !== 'number' ||
+    !Number.isInteger(raw.seq) ||
+    raw.seq < 0 ||
+    raw.seq > MAX_SEQ
+  ) {
+    throw badRequest(
+      'invalid_event',
+      `Event ${index}: \`seq\` must be an integer between 0 and ${MAX_SEQ}.`,
+    );
   }
   const seq = raw.seq;
 
