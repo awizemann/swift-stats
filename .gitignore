@@ -52,3 +52,6 @@ dist/
 .vscode/
 .idea/
 *.swp
+
+# Reference-deployment config (real D1 id + route)
+backends/cloudflare/wrangler.prod.toml

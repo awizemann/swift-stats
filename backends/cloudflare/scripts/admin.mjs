@@ -59,6 +59,10 @@ const positionals = argv.filter(
 const dryRun = flags.has('--dry-run');
 const remote = flags.has('--remote');
 const local = flags.has('--local');
+// Optional: WRANGLER_CONFIG=wrangler.prod.toml — forwarded as `--config` so an
+// operator who keeps the real D1 id in a git-ignored file (as the reference
+// deployment does) can act on it without editing the shipped wrangler.toml.
+const configArgs = process.env.WRANGLER_CONFIG ? ['--config', process.env.WRANGLER_CONFIG] : [];
 
 function die(message) {
   console.error(`error: ${message}`);
@@ -106,7 +110,7 @@ function execute(sql) {
   if (!local && !remote) {
     die('pass --local or --remote (or --dry-run to just print the SQL)');
   }
-  const args = ['d1', 'execute', DB_NAME, local ? '--local' : '--remote', '--command', sql];
+  const args = ['d1', 'execute', DB_NAME, local ? '--local' : '--remote', ...configArgs, '--command', sql];
   if (!local) args.push('--yes');
   const result = spawnSync('wrangler', args, { stdio: 'inherit' });
   if (result.status !== 0) die(`wrangler exited with ${result.status ?? 'a signal'}`);
@@ -116,7 +120,7 @@ function execute(sql) {
 function query(sql) {
   if (!local && !remote) return null;
   const args = [
-    'd1', 'execute', DB_NAME, local ? '--local' : '--remote', '--json', '--command', sql,
+    'd1', 'execute', DB_NAME, local ? '--local' : '--remote', ...configArgs, '--json', '--command', sql,
   ];
   if (!local) args.push('--yes');
   const result = spawnSync('wrangler', args, { encoding: 'utf8' });
