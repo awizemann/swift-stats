@@ -231,6 +231,28 @@ value.
   prop) per day. The null row is always kept regardless of the cap. Rollups live
   forever, so unbounded value cardinality would be an unbounded bill forever.
 - Numeric props are omitted from breakdowns entirely, per §8.2.
+- The cap is applied once over the **merged** result, so a range straddling the
+  90-day boundary returns the same 20 props a range on either side alone would.
+
+**Integer bounds** (§0 and §3 say "integer" without a range; this backend states
+its own, because SQLite's `STRICT INTEGER` is int64 and the alternative is worse):
+
+| Field | Accepted | Otherwise |
+|---|---|---|
+| `seq` | `0 … 2^53 - 1` | **400** |
+| `context.screenWidth`, `context.screenHeight` | `0 … 1000000` | **400** |
+| `context.screenScale` | `0 … 1000` | **400** |
+
+`2^53 - 1` is the largest integer a JSON number represents exactly, so above it
+two distinct `seq` values on the wire parse to the same number and there is
+nothing to preserve. Zero is legal throughout: §3's consent-reduced fallback for
+screen is `0`/`0`/`1.0`.
+
+These are **400s, not 5xx**, and the distinction is the whole point. §7 makes a
+5xx retain-and-retry, so a value the database will never accept reported as a
+server fault becomes an infinite retry loop — the emitter re-sends the identical
+bytes on a backoff until the 24-hour ceiling drops them, hitting this backend
+every time. A data error is permanent, and saying so is the honest answer.
 
 ## 10. Operational notes
 

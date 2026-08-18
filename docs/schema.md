@@ -604,12 +604,22 @@ Error bodies are `{"error": "<machine_code>", "message": "<human text>"}`;
 
 ## 11. Consent
 
-- **Opt-out by default**: with no explicit configuration, an emitter collects
-  **nothing** — no queue file, no install id generated, no context sampled. The
-  first thing a consumer must do is record a choice.
+- **Opt-out by default, per app.** An emitter's default consent SHOULD be
+  `usage` + `diagnostics`, and MUST NOT include `identity` — a stable
+  `installId` and a `userId` change what the consuming *app* has to disclose
+  (§14), so `identity` is granted in code or not at all.
+- **A recorded `none` collects nothing.** With no groups granted, an emitter
+  MUST collect nothing whatsoever: no queue file, no install id generated, no
+  context sampled. An app whose privacy policy or jurisdiction requires
+  opt-*in* configures `none` and records a choice before anything is collected.
 - The choice is **per app**, persisted in the SDK's own UserDefaults suite, and
-  survives relaunch. An app MAY default it to on where its own privacy policy
-  and jurisdiction allow; the *SDK's* default is off.
+  survives relaunch. The persisted choice always wins over the configured
+  default, which therefore applies exactly once, on first run.
+- The end-user opt-out an app ships is the **master switch**, not consent, and
+  the two differ deliberately about the install id: the master switch discards
+  the queue but KEEPS the persisted install UUID (a person who turns it off and
+  on again expects the same install, and nothing is collected while it is off),
+  whereas revoking a consent group deletes it — see the revocation bullet below.
 - Consent groups, independently togglable:
   | Group | Covers |
   |---|---|
