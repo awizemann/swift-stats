@@ -20,14 +20,60 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned, not "whatever xcode-select happens to point at". The package is
+      # swift-tools-version 6.2 in language mode 6, so it needs Xcode 26.x, and a
+      # runner image bumping its default Xcode should fail here with a clear
+      # message rather than somewhere inside a compile log.
+      #
+      # A specific 26.0 is preferred and a newer 26.x accepted, so an image
+      # refresh does not take CI down for a version the package builds against.
+      # Anything outside 26.x is a hard failure.
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          preferred=/Applications/Xcode_26.0.app
+          if [ -d "$preferred" ]; then
+            selected="$preferred"
+          else
+            selected=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          fi
+          if [ -z "${selected:-}" ]; then
+            echo "::error::No Xcode 26.x on this runner. Available:"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          echo "Selected $selected"
+          echo "DEVELOPER_DIR=$selected/Contents/Developer" >> "$GITHUB_ENV"
+
       - name: Show toolchain
-        run: swift --version
+        run: |
+          xcodebuild -version
+          swift --version
 
       - name: Build
         run: swift build --build-tests
 
       - name: Test
         run: swift test
+
+      # The macOS build above cannot catch a typo inside an `#if os(iOS)` fork,
+      # and there are real ones: StatsEnvironment.swift branches per platform for
+      # `osName` and the device model, and StatsConfiguration's default session
+      # gap is 30 minutes on macOS and 5 everywhere else. The branch that is not
+      # taken is never type-checked, so it can sit broken indefinitely and ship
+      # broken. `swift test` cannot cover this — there is no running tests on a
+      # generic simulator destination without booting one — so the assertion is
+      # that it COMPILES, which is exactly the class of bug at issue.
+      #
+      # `swift-stats-Package` is the aggregate scheme SwiftPM generates: one
+      # invocation builds Stats, StatsCloudflare and StatsTesting.
+      - name: Build for iOS
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -scheme swift-stats-Package \
+            -destination 'generic/platform=iOS Simulator' \
+            build
 
   cloudflare-backend:
     name: Cloudflare backend (Worker + D1)

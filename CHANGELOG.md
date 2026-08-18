@@ -46,16 +46,27 @@ First tagged release: wire schema `v1`, the `Stats` core emitter, the
     regenerates. Sessions per §10 (launch + monotonic inactivity gap, default 30
     min on macOS / 5 min elsewhere, id `<epochSeconds>-<8 digits>`), auto-events
     per §12 in their fixed boundary order, all opt-in.
-  - Consent per §11: `usage` / `diagnostics` / `identity`, default `[]`, denial
-    of `diagnostics` sending the documented fallbacks, denial of `identity`
-    switching to a per-session ephemeral install id, and any revocation
-    discarding the queue and deleting the stored install UUID.
+  - Consent per §11: `usage` / `diagnostics` / `identity`, defaulting to
+    `[.usage, .diagnostics]` — opt-**out** by default for an app, whose own
+    end-user opt-out is `setEnabled(false)`. `.identity` is never in the
+    default, since a stable install id and a `userId` change what the consumer
+    must disclose (§14). `consent: .none` still means collect nothing at all,
+    down to not creating a queue file. Denying `diagnostics` sends the
+    documented fallbacks, denying `identity` switches to a per-session ephemeral
+    install id, and any revocation discards the queue and deletes the stored
+    install UUID.
+  - `StatsClient.init` performs **no disk I/O**: the queue path and the
+    `UserDefaults` suite are resolved lazily inside the actor on first use, so
+    constructing a client on the main actor during launch is safe and needs no
+    `Task.detached`. The queue file is created 0600 and its directory 0700, with
+    the mode re-applied on every write (an atomic `Data.write` replaces the file
+    and would otherwise carry the umask's 0644).
   - Injected `StatsClock` / `StatsUUIDProvider` / `StatsRandomSource` seams; the
     package never calls `Date.now` or `Task.sleep` directly.
 - **`StatsTesting`**: `InMemorySink` (recording, scriptable outcomes),
   `ManualClock` (conforms to both `StatsClock` and the standard `Clock`; a test
   advances it rather than sleeping), `FixedUUIDProvider`, `FixedRandomSource`.
-- **`StatsTests`**: 65 tests covering schema encoding round-trips, props
+- **`StatsTests`**: 76 tests covering schema encoding round-trips, props
   truncation and the byte-wise 32-key cap, identity hashing and `reset()`,
   session-gap and boundary ordering, consent gating, opt-out, all three flush
   triggers, batch splitting by count and bytes, retry/backoff/drop semantics,
@@ -105,7 +116,7 @@ First tagged release: wire schema `v1`, the `Stats` core emitter, the
   to schema `v1` and shipping with its checklist filled in. Ingest on
   `POST /v1/events`, reads on `GET /v1/summary` and `GET /v1/events/top`, and a
   Cron Trigger that rolls up closed days *before* deleting raw events past 90
-  days. 105 tests run against a local D1 with no account and no network
+  days. 140 tests run against a local D1 with no account and no network
   (`npm test`). Notable decisions, all documented in its README:
   - Keys are stored **only as SHA-256 hashes**; the plaintext is printed once at
     mint time and is unrecoverable by design. `scripts/admin.mjs` creates
@@ -113,7 +124,16 @@ First tagged release: wire schema `v1`, the `Stats` core emitter, the
     erasure.
   - `batchId` dedupe is a D1 primary key inserted in the **same transaction** as
     the events, so a duplicate cannot double-write and there is no
-    read-then-write race. Window: 30 days. A duplicate returns 202.
+    read-then-write race. Window: 30 days, well past §6's 24-hour minimum, and
+    the boundary is asserted rather than assumed.
+  - The scheduled job takes an exclusive **lease** before it rolls and sweeps.
+    Two overlapping passes could interleave the rollups' delete-then-insert and
+    then both delete the same day's raw rows — the one irreversible operation in
+    the backend.
+  - **Rate limiting** runs pre-auth on all three endpoints, keyed on the SHA-256
+    of the presented key and never on the IP (§13), before `resolveKey` costs a
+    D1 read. §8.3's 429 is reachable on the read endpoints. The durable global
+    limit is a Cloudflare Rate Limiting rule, shipped as documented config.
   - Distinct counts are **exact**, except `/v1/events/top`'s `installs` for a
     range reaching past 90 days, which becomes an upper bound because per-day
     distinct counts are not additive.
@@ -133,7 +153,78 @@ First tagged release: wire schema `v1`, the `Stats` core emitter, the
   dispatcher size-checked are the bytes on the wire) and maps 413 to
   `.tooLarge`, so the dispatcher re-splits rather than dropping.
 - MIT `LICENSE`, `README.md`, this changelog, `.gitignore`, and a GitHub
-  Actions workflow running `swift build` and `swift test` on `macos-15`.
+  Actions workflow on `macos-15` with `DEVELOPER_DIR` pinned to Xcode 26.x,
+  running `swift build`, `swift test`, an **iOS Simulator build** (`xcodebuild
+  -scheme swift-stats-Package`) so a typo inside an `#if os(iOS)` fork cannot
+  ship, and the backend's typecheck and vitest conformance suite.
+
+### Fixed
+A pre-release audit pass, all of it behavior-preserving on the wire — `v1` in
+`docs/schema.md` is unchanged.
+
+- **Client**
+  - `StatsClient.init` no longer does synchronous disk I/O (an
+    `applicationSupportDirectory` resolution with `create: true`, plus a
+    `UserDefaults` suite open) on the caller's thread.
+  - A server `Retry-After` is honored up to the 24-hour retention ceiling
+    instead of being clamped to the 5-minute backoff cap. §7 caps the *backoff
+    schedule*; a `Retry-After: 1800` used to be truncated to 300 s, so a backend
+    shedding load was hit every five minutes by the clients it had asked to stay
+    away. Only the floor clamp remains.
+  - `StatsTimestamp.date(from:)` rejects `second == 60` and validates
+    days-per-month with leap years. Both used to pass and then silently roll
+    over, so a queued `2026-02-30` decoded to March 2nd and re-encoded as a
+    different string than the one on disk.
+  - `StatsConfiguration.contextOverride` and `StatsTesting`'s
+    `Duration.statsSeconds` are `package`, not `public`.
+  - The queue file is chmod 0600 and its directory 0700.
+
+- **Cloudflare backend**
+  - A day no longer reads as **zero while its raw rows exist**. Reads routed
+    `day < today - 89` to the rollups, but the sweep runs at 02:10 UTC, so
+    between midnight and 02:10 the day `today - 90` still had every raw row and
+    was answered from a rollup that may never have been written. The boundary is
+    now derived from observed state.
+  - `/v1/events/top?name=` answered **500** for any range reaching past raw
+    retention: the rollup branch aliased `is_null AS isNull`, and `ISNULL` is a
+    postfix operator in SQLite, so it was a syntax error rather than an alias.
+  - `seq`, `screenWidth` and `screenHeight` are bounded. `Number.isInteger(1e21)`
+    is `true`, so those values passed validation, failed the STRICT INTEGER
+    insert, and were reported as a **503** — which §7 makes retain-and-retry, so
+    a single malformed event became an infinite retry loop. They are 400s now,
+    as is any data-shaped D1 constraint failure that still reaches the handler.
+  - The 2 MiB wire cap is enforced by a counting read that aborts the stream at
+    the cap, rather than after buffering the whole body. `Content-Length` is a
+    claim, and the old order bounded what was kept, not what was read.
+  - The §8.2 breakdown prop cap applies to the rollup branch too, and is applied
+    once over merged totals — so a mixed range no longer returns a prop set that
+    depends on which side of the retention boundary it straddles.
+  - New migration `0002`: the rollup lease table, and `ON DELETE CASCADE` from
+    the three rollup tables to `projects`, which previously left a deleted
+    project's rollups in the database forever. `0001` is not edited.
+  - `scripts/admin.mjs` bounds project names and `--label`, and refuses to mint a
+    key for a project that does not exist — such a key printed a convincing
+    banner and then 401d forever, indistinguishably from a revoked one (§8).
+  - `log.ts` maps a caught error to a fixed vocabulary of codes instead of
+    logging `cause.message`, which can name a bound parameter value — on the
+    ingest path, an `installId`, a hashed `userId`, or a prop value (§13).
+
+- **Tests and docs**
+  - Read and rollup date fixtures are derived from today rather than hard-coded
+    `2026-08-xx`, which would have crossed the 90-day boundary within months and
+    started asserting rollup behavior while claiming to assert raw behavior.
+  - The dedupe-retention test asserted `COUNT(*) > 0` after a sweep with nothing
+    to purge — true even with the purge removed entirely — and now pins the
+    §6 24-hour boundary from both sides.
+  - The `StatsCloudflare` smoke test compared `StatsCloudflare.schemaVersion` to
+    `Stats.schemaVersion`, which is what it is *defined* as; it asserts the
+    literal `v1`.
+  - README: the quick start uses `CloudflareSink` rather than an undefined
+    `MyHTTPSink`, throwing initializers are wrapped rather than left at file
+    scope, the `setEnabled` / `setConsent` install-id asymmetry is documented,
+    and the hosted `api.swiftstats.co` paragraph states retention (raw 90 days,
+    daily rollups indefinitely), that keys are issued per project by the
+    operator, and that hosted sign-up is not open yet.
 
 ### Not yet implemented
 - Known and accepted: a crash between a `202` and the queue file being rewritten

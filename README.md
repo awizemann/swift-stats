@@ -81,20 +81,33 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
 
 ```swift
 import Stats
+import StatsCloudflare
 
 // 1. Configure once during launch. Constructing a client is cheap and does no
 //    disk I/O, so this is safe directly in `App.init` or on the main actor — no
-//    `Task.detached` wrapper needed. The sink is yours; see "Writing a sink".
-let stats = StatsClient(configuration: StatsConfiguration(
-    appId: "com.example.MyApp",
-    projectId: "myapp",                          // advisory: the write key is authoritative (schema §2.4)
-    installIdSalt: "a-constant-per-app-string",  // schema §9 — not a secret
-    sink: MyHTTPSink(baseURL: url, writeKey: writeKey),
-    flushAt: 20,                                 // flush at N queued events
-    flushInterval: .seconds(30),                 // …or T since the last flush
-    autoEvents: [.appOpen, .appBackground, .sessions]  // opt-in, default none
-    // sessionGap defaults to 30 min on macOS, 5 min on iOS
-))
+//    `Task.detached` wrapper needed. The sink is yours; `CloudflareSink` is the
+//    one shipped in this repo, and "Writing a sink" covers rolling your own.
+//
+//    `CloudflareEndpoint` validates the URL (HTTPS only), so it throws — hence a
+//    function rather than a top-level `let`.
+func makeStats(writeKey: String) throws -> StatsClient {
+    StatsClient(configuration: StatsConfiguration(
+        appId: "com.example.MyApp",
+        projectId: "myapp",                          // advisory: the write key is authoritative (schema §2.4)
+        installIdSalt: "a-constant-per-app-string",  // schema §9 — not a secret
+        sink: CloudflareSink(
+            endpoint: try CloudflareEndpoint(string: "https://stats.example.com"),
+            writeKey: writeKey                       // ships in the binary; append-only, one project
+        ),
+        flushAt: 20,                                 // flush at N queued events
+        flushInterval: .seconds(30),                 // …or T since the last flush
+        autoEvents: [.appOpen, .appBackground, .sessions]  // opt-in, default none
+        // consent defaults to [.usage, .diagnostics]
+        // sessionGap defaults to 30 min on macOS, 5 min on iOS
+    ))
+}
+
+let stats = try makeStats(writeKey: writeKey)
 
 // 2. Consent already defaults to [.usage, .diagnostics], so this line is only
 //    needed to CHANGE it — to grant .identity (a stable install id + userId), or
@@ -169,10 +182,18 @@ rolls up closed days and deletes raw events past 90 days. Distinct counts are
 exact. Keys are stored only as SHA-256 hashes, and `projectId` is derived from
 the write key's scope. Deploying it is `npx wrangler login && npm run deploy`.
 
-You can self-host it on your own Cloudflare account, or use the hosted
-instance at **`https://api.swiftstats.co`** (same Worker, same contract, keys
-issued per project). Hosted sign-up is not open yet; self-hosting is fully
-supported today.
+You can self-host it on your own Cloudflare account, or — eventually — use the
+hosted instance at **`https://api.swiftstats.co`**. It runs the same Worker from
+this repo against the same wire contract, with the same retention: **raw event
+rows for 90 days, daily rollups kept indefinitely** (so per-day history survives,
+while the individual events behind it do not — [schema
+§13](docs/schema.md#13-deliberately-never-collected)). Keys are **issued per
+project by the operator**; there is no self-serve key minting, and a write key is
+scoped to exactly one project.
+
+**Hosted sign-up is not open yet.** There is no way to get a hosted key today —
+self-hosting is the supported path, and it is the whole backend, not a reduced
+one.
 
 The matching Swift adapter is the `StatsCloudflare` product: `CloudflareSink`
 for emitting, and `StatsQuery` for reading a project's own numbers back into an
@@ -181,34 +202,28 @@ app.
 ```swift
 import StatsCloudflare
 
-let query = StatsQuery(
-    endpoint: try CloudflareEndpoint(string: "https://stats.example.com"),
-    readKey: readKey                     // NOT embeddable in a shipped app — schema §8
-)
+// `CloudflareEndpoint` and `summary` both throw, so this lives in a function
+// rather than at file scope.
+func printLastMonth(readKey: String) async throws {
+    let query = StatsQuery(
+        endpoint: try CloudflareEndpoint(string: "https://stats.example.com"),
+        readKey: readKey                 // NOT embeddable in a shipped app — schema §8
+    )
 
-let summary = try await query.summary(
-    projectId: "myapp",
-    from: StatsDay("2026-08-01")!,
-    to: StatsDay(utcDayOf: .now)
-)
-for row in summary.rows {
-    print(row.date, row.opens, row.sessions, row.activeInstalls, row.events)
+    let summary = try await query.summary(
+        projectId: "myapp",
+        from: StatsDay(utcDayOf: .now.addingTimeInterval(-29 * 86_400)),
+        to: StatsDay(utcDayOf: .now)
+    )
+    for row in summary.rows {
+        print(row.date, row.opens, row.sessions, row.activeInstalls, row.events)
+    }
 }
 ```
 
 `CloudflareSink` is the `StatsSink` for it — HTTPS-only, no cookies, redirects
-refused, uncompressed, and mapping every §7 status onto the right `SinkOutcome`:
-
-```swift
-let stats = StatsClient(configuration: StatsConfiguration(
-    appId: "com.example.MyApp",
-    installIdSalt: "a-constant-per-app-string",
-    sink: CloudflareSink(
-        endpoint: try CloudflareEndpoint(string: "https://stats.example.com"),
-        writeKey: writeKey          // ships in the binary; append-only, one project
-    )
-))
-```
+refused, uncompressed, and mapping every §7 status onto the right `SinkOutcome`.
+See the quick start above for how it is wired into a `StatsConfiguration`.
 
 ## Consumer checklist
 
@@ -305,8 +320,9 @@ Tests/
   StatsTests/              Encoding, props, identity, sessions, consent, dispatch
                              — plus a test asserting the privacy manifest's contents
   StatsCloudflareTests/
-.github/workflows/ci.yml   swift build + swift test on macos-15, plus the
-                             backend's vitest conformance suite
+.github/workflows/ci.yml   macos-15 pinned to Xcode 26.x: swift build + swift test,
+                             an iOS Simulator build (so an #if os(iOS) fork is
+                             compiled), plus the backend's typecheck and vitest suite
 CHANGELOG.md               Keep-a-changelog, semver
 ```
 
