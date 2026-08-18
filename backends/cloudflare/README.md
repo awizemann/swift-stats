@@ -382,10 +382,109 @@ discipline.
 
 ---
 
+## 11. Reusing the query layer
+
+Another Worker bound to the **same D1 database** — a dashboard, an internal
+report, a scheduled digest — must not re-implement these reads. Every number the
+public API serves comes out of `src/lib/queries.ts`, and that module is importable
+as-is.
+
+```
+src/lib/queries.ts   the read contract: routing, counts, caps, ordering, validation
+src/lib/index.ts     the `./lib` entry point (queries + day arithmetic + HttpError)
+src/read.ts          HTTP only: auth, query-string parsing, the §8 response envelope
+```
+
+`src/lib/` takes a `D1Database` and plain values. No `Request`, no `Response`, no
+router, no `Env`, and no Worker-only global touched at module scope, so it also
+runs under `vitest`, `wrangler dev`, or plain Node with a D1 client.
+
+### Depending on it
+
+Nothing is published to npm; the package stays `private`. A sibling repo depends
+on this directory directly:
+
+```jsonc
+// the dashboard's package.json
+"dependencies": {
+  "stats-worker": "file:../swift-stats/backends/cloudflare"
+}
+```
+
+…or vendors it as a git submodule / subtree and imports by relative path. Either
+way the import is the same:
+
+```ts
+import { summary, topEvents, propBreakdown, HttpError } from 'stats-worker/lib';
+
+const { range, rows } = await summary(env.DB, {
+  projectId: 'overwatch',
+  from: '2026-07-01',
+  to: '2026-07-31',
+  includeDebug: false,
+});
+// range.to is the range actually SERVED (a future `to` is clamped to today).
+// rows is one row per day, ascending, zero-filled.
+```
+
+It is TypeScript **source**, bundled by the consumer's esbuild/wrangler exactly as
+this Worker bundles it — there is no compiled copy that can lag behind. A consumer
+that cannot read `.ts` can run `npm run build:types` here for `.d.ts` only.
+
+What is exported, and what each thing is for:
+
+| Export | Use |
+|---|---|
+| `summary(db, {projectId, from, to, includeDebug?, now?})` | per-day `opens` / `sessions` / `activeInstalls` / `events` |
+| `topEvents(db, {…, limit?})` | event names ranked by count |
+| `propBreakdown(db, {…, name, limit?})` | the §8.2 prop breakdown for one event name |
+| `resolveRange(db, {…}, now)` | validate + clamp + resolve the raw/rollup boundary once, to reuse across several queries |
+| `summaryRows` / `topEventRows` / `propBreakdownRows` | the same three computations over an already-resolved range |
+| `rawBoundaryDay(db, projectId, now)` | the observed raw/rollup boundary |
+| `resolveDayRange` / `clampAndValidateDays` | the pure date rules, database-free |
+| `parseLimit` / `parseIncludeDebug` / `parseEventName` / `requireBothDays` | the same query-string parsing, so a consumer rejects exactly what the public API rejects |
+| `MAX_BREAKDOWN_PROPS`, `DEFAULT_LIMIT`, `MAX_LIMIT`, `MAX_RANGE_DAYS`, `RAW_RETENTION_DAYS` | the documented caps, as values rather than numbers to copy |
+| `addDays`, `eachDay`, `today`, `daysInclusive`, `isValidDate`, `rawCutoffDay` | UTC day arithmetic; a range built any other way is a bug (§8.1 buckets by UTC day) |
+
+The convenience functions take an optional `now: Date`. Pass it in tests; leave it
+out in production. The clock is never read inside the module.
+
+### What the consumer still owns
+
+**Authorization.** `src/lib/` assumes `projectId` is already authorized —
+deliberately, because §8 fixes the check order at *key → scope → dates*, and a
+consumer with a different auth model (a session cookie, an operator login) has a
+different first step. Do that step first, then call these functions. Reusing this
+backend's model is `resolveKey(db, key, 'read')` + `requireScope(scope, projectId)`
+from `src/keys.ts`.
+
+**Transport.** Validation failures throw `HttpError`, carrying the same stable
+`code` and the same `message` this API returns; `err.toResponse()` produces the
+byte-identical §8.3 body if the consumer wants it, and `err.code` is there if it
+does not.
+
+### Why not just copy the SQL
+
+Because the read contract is not the SQL — it is the SQL *plus* a dozen decisions
+that are invisible until they are wrong. Sessions keyed on `(installId, sessionId)`
+and not `sessionId`. The boundary derived from observed state rather than the
+clock. A prop cap applied once over merged sources rather than per source. The
+null row folding "explicitly null" together with "absent", placed last regardless
+of count. `to` clamped before the span check. A copy is correct on the day it is
+made and silently diverges afterwards, and a dashboard whose numbers disagree with
+the API is worse than a dashboard that is simply down — nothing tells you which one
+is lying.
+
+If a computation has to change, it changes in `src/lib/queries.ts` and both sides
+move together. `test/queries.test.ts` covers the module directly; `test/read.test.ts`
+covers the endpoints over it.
+
+---
+
 ## Conformance checklist
 
 Verified at the commit that introduced this file, by `npm test`
-(105 tests, `backends/cloudflare/test/`).
+(169 tests, `backends/cloudflare/test/`).
 
 ### Ingest — `POST /v1/events`
 

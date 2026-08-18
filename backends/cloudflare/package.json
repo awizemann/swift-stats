@@ -5,11 +5,29 @@
   "description": "Cloudflare Worker + D1 backend for swift-stats (wire schema v1)",
   "type": "module",
   "license": "MIT",
+  "//exports": "The read/query layer, importable by a sibling Worker bound to the same D1 (README §11). This is TypeScript SOURCE, not a build artifact: the consumer bundles it with esbuild/wrangler exactly as this Worker does, so there is no compiled copy that can lag behind the source. Nothing is published to npm — `private` stays true and a consumer depends on this directory by `file:` path or a git subpath. `npm run build:types` emits .d.ts for a consumer that cannot read the .ts directly.",
+  "exports": {
+    "./lib": {
+      "types": "./src/lib/index.ts",
+      "default": "./src/lib/index.ts"
+    },
+    "./lib/queries": {
+      "types": "./src/lib/queries.ts",
+      "default": "./src/lib/queries.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "migrations",
+    "README.md"
+  ],
   "scripts": {
     "dev": "wrangler dev --local",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "build:types": "tsc -p tsconfig.build.json",
     "migrate:local": "wrangler d1 migrations apply stats --local",
     "migrate:remote": "wrangler d1 migrations apply stats --remote",
     "deploy": "wrangler d1 migrations apply stats --remote && wrangler deploy"
