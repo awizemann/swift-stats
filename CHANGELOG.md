@@ -9,6 +9,8 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+## [backend-cloudflare-0.3.0] — 2026-08-19
+
 **Cloudflare backend `0.3.0` — key liveness, first-seen installs, per-project
 retention.** Three additive changes to the Worker + D1 backend, one migration
 each. No wire change: the SDK, the batch format and the `/v1` request and
