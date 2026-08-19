@@ -28,6 +28,7 @@ export const INSTALLS = { a: INSTALL_A, b: INSTALL_B };
 const TABLES = [
   'events',
   'installs',
+  'backend_markers',
   'batch_context',
   'batches',
   'daily_rollups',

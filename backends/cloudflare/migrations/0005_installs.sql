@@ -78,3 +78,44 @@ INSERT OR IGNORE INTO installs (project_id, install_id, first_seen_day)
 SELECT project_id, install_id, MIN(day)
   FROM events
  GROUP BY project_id, install_id;
+
+-- The boundary that backfill left behind, so a reader can LABEL it.
+--
+-- The backfill above is honest but unmarked, and that is a real gap: for an
+-- install whose first event has already aged out, `MIN(day)` is the oldest
+-- SURVIVING day, so the install reads as having arrived on the retention
+-- boundary. Nothing in the data says which rows those are, so a cohort chart
+-- drawn across the migration date shows a spike at the boundary that a consumer
+-- cannot distinguish from a real one — it would just be wrong, confidently.
+--
+-- One row is enough to fix that. Record the UTC day this migration ran; the
+-- floor a reader must not trust below is then derivable per project from that
+-- day and the project's own retention window (`firstSeenFloorDay` in
+-- src/lib/queries.ts). Deliberately NOT a `first_seen_is_exact` column on
+-- `installs`: that would be a per-row flag carrying one repository-wide fact,
+-- and it would have to be written for every future row forever to stay true.
+--
+-- A generic key/value table rather than `installs_backfill_day` as its own
+-- table, because the next such fact should not need another migration. It is
+-- deliberately tiny and deliberately not a config store: nothing in the request
+-- path reads it, and every value in it is a fact about the DEPLOYMENT's history,
+-- not a setting anyone may change.
+CREATE TABLE backend_markers (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+) STRICT;
+
+-- `date('now')` is the UTC day, matching the `YYYY-MM-DD` form every other day
+-- in this schema takes. Written in the SAME migration as the backfill, so the
+-- marker and the rows it describes cannot disagree.
+--
+-- `OR IGNORE` for the same reason the backfill has it: re-applying this file by
+-- hand must not move a marker that already describes an earlier, real backfill.
+--
+-- A FRESH deployment runs this migration against an empty `events` table, so the
+-- backfill inserts nothing and there is nothing to distrust. The marker is still
+-- written — it names the day, and on a fresh database the floor it implies simply
+-- sits below every install there will ever be. A deployment created BEFORE 0005
+-- existed is the case the marker is for.
+INSERT OR IGNORE INTO backend_markers (key, value)
+VALUES ('installs_backfill_day', date('now'));

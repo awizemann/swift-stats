@@ -12,7 +12,13 @@ import worker from '../src/index.js';
 import { runScheduled } from '../src/rollup.js';
 import { addDays, clampRetentionDays, rawCutoffDay, today, RAW_RETENTION_DAYS } from '../src/dates.js';
 import { KEY_TOUCH_INTERVAL_MS } from '../src/keys.js';
-import { firstSeenRows, rawBoundaryDay, resolveRange, totalInstalls } from '../src/lib/queries.js';
+import {
+  firstSeenFloorDay,
+  firstSeenRows,
+  rawBoundaryDay,
+  resolveRange,
+  totalInstalls,
+} from '../src/lib/queries.js';
 import {
   DB,
   INSTALLS,
@@ -303,6 +309,60 @@ describe('installs', () => {
       { installId: INSTALLS.b, day: addDays(TODAY, -1) },
     ]);
   });
+
+  it('is excluded from the dedupe tally: a returning install reports deduped=0', async () => {
+    // The regression test for the bug the 0.2.0 rebase surfaced. The dedupe count
+    // walks `db.batch()` results looking for `meta.changes === 0`, which is how a
+    // `DO NOTHING` event conflict reports itself. The `installs` statement is
+    // appended AFTER the events in the SAME batch, and an `INSERT OR IGNORE` that
+    // hits a KNOWN install reports zero changed rows in exactly the same way.
+    //
+    // Bounded wrongly, this test's second batch — brand new events, from an
+    // install we have merely seen before — would log `events_deduped` with
+    // `deduped: 1`. Every returning user would read as a replayed event, and the
+    // one signal ADOPTION tells operators to watch for an SDK bug would sit at a
+    // sustained non-zero on perfectly healthy traffic.
+    //
+    // The first batch is what makes the install KNOWN; the assertion is entirely
+    // about the second. Note the upstream "does not log events_deduped when
+    // nothing was deduped" case cannot catch this: it ingests a single batch into
+    // a freshly reset database, so its `installs` insert really does change a row.
+    await post(makeBatch({ batchId: batchId(9201), events: [makeEvent({ seq: 0 })] }));
+    expect(
+      (await DB.prepare(`SELECT COUNT(*) AS n FROM installs`).first<{ n: number }>())?.n,
+    ).toBe(1);
+
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    };
+    try {
+      const request = ingestRequest(
+        makeBatch({ batchId: batchId(9202), events: [makeEvent({ seq: 1 })] }),
+      );
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env as never, ctx);
+      expect(response.status).toBe(202);
+      await waitOnExecutionContext(ctx);
+    } finally {
+      console.log = realLog;
+    }
+
+    // Nothing was deduped, so there is no line at all — `events_deduped` is only
+    // emitted when the count is non-zero.
+    expect(lines.filter((l) => l.includes('events_deduped'))).toEqual([]);
+    // …and the batch really was processed, so the absence above is a real zero
+    // rather than a request that never got that far.
+    expect(lines.filter((l) => l.includes('batch_accepted')).length).toBe(1);
+    // The second batch's event landed, and the install stayed a single row.
+    expect(
+      (await DB.prepare(`SELECT COUNT(*) AS n FROM events`).first<{ n: number }>())?.n,
+    ).toBe(2);
+    expect(
+      (await DB.prepare(`SELECT COUNT(*) AS n FROM installs`).first<{ n: number }>())?.n,
+    ).toBe(1);
+  });
 });
 
 describe('firstSeenRows', () => {
@@ -487,5 +547,68 @@ describe('projects.retention_days', () => {
     expect(body.rows).toEqual([
       { date: day100, opens: 2, sessions: 2, activeInstalls: 2, events: 2 },
     ]);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// 0005 — backend_markers / firstSeenFloorDay
+// -----------------------------------------------------------------------------
+
+/** The marker row 0005 writes, or `null` if it is absent. */
+async function backfillMarker(): Promise<string | null> {
+  const row = await DB.prepare(
+    `SELECT value AS v FROM backend_markers WHERE key = 'installs_backfill_day'`,
+  ).first<{ v: string }>();
+  return row?.v ?? null;
+}
+
+describe('firstSeenFloorDay', () => {
+  it('the migration itself writes the backfill marker', async () => {
+    // The harness applies the real migration files, so this asserts the SQL that
+    // ships wrote the row — not that a fixture did. Without it every other case
+    // here would pass against a marker the test suite invented.
+    expect(await backfillMarker()).toBe(today(new Date()));
+  });
+
+  it('is null with no marker — a deployment with nothing to distrust', async () => {
+    await DB.prepare(`DELETE FROM backend_markers WHERE key = 'installs_backfill_day'`).run();
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBeNull();
+  });
+
+  it('is the raw cutoff as of the marker day when the marker is present', async () => {
+    const marker = (await backfillMarker()) as string;
+    // The oldest day that still had raw rows when the migration ran, and so the
+    // oldest day its `MIN(day)` backfill could possibly have returned.
+    const expected = rawCutoffDay(new Date(`${marker}T00:00:00.000Z`), RAW_RETENTION_DAYS);
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(expected);
+    // Stated the other way, so a change to either helper has to break one of the
+    // two: the default window puts the floor 89 days before the backfill.
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(addDays(marker, -(RAW_RETENTION_DAYS - 1)));
+  });
+
+  it('respects the project’s own retention window, not the global default', async () => {
+    const marker = (await backfillMarker()) as string;
+    await setRetention(PROJECT, 180);
+
+    // A project keeping 180 days had raw rows 90 days further back on the day the
+    // migration ran, so its backfill could reach further back and its floor sits
+    // there too. Using the global default here would mark 90 days of exact rows
+    // as suspect.
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(addDays(marker, -179));
+    // The untouched project is unaffected — the floor is per project, from the
+    // same column the sweep reads.
+    expect(await firstSeenFloorDay(DB, OTHER_PROJECT)).toBe(
+      addDays(marker, -(RAW_RETENTION_DAYS - 1)),
+    );
+  });
+
+  it('clamps an out-of-range retention_days rather than moving the floor to it', async () => {
+    const marker = (await backfillMarker()) as string;
+    // Same clamp every other reader applies (0006). A hand-edited absurdity must
+    // not be able to push the floor past the longest window the sweep can hold.
+    await DB.prepare(`UPDATE projects SET retention_days = 10000 WHERE id = ?1`).bind(PROJECT).run();
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(
+      addDays(marker, -(clampRetentionDays(10000) - 1)),
+    );
   });
 });

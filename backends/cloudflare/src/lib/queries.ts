@@ -844,3 +844,63 @@ export async function totalInstalls(
     .first<{ n: number }>();
   return row?.n ?? 0;
 }
+
+/**
+ * The oldest day this project's `first_seen_day` values can be trusted — or
+ * `null` when every one of them is exact.
+ *
+ * Migration 0005 backfilled `installs` from whatever raw `events` rows were still
+ * present, as `MIN(day)` per install. For an install whose first event was still
+ * inside the raw window that is exactly right. For an older one it is the oldest
+ * SURVIVING day, which reads as "arrived on the retention boundary" — an install
+ * that may have been first seen months or years earlier. The migration says so;
+ * the DATA cannot, which is what this function is for: a cohort chart drawn
+ * across the backfill would otherwise show a spike at that boundary that a
+ * consumer has no way to tell from a real one.
+ *
+ * The floor is `rawCutoffDay(backfillDay, project.retention_days)` — the oldest
+ * day that had raw rows on the day the migration ran, and therefore the oldest
+ * day the backfill's `MIN(day)` could possibly have returned. Every install
+ * stored with `first_seen_day` at or below it may have been first seen EARLIER;
+ * everything strictly above it is exact.
+ *
+ * Per project, not global: the boundary is derived from the same
+ * `retention_days` (0006) the sweep uses, so a project keeping 180 days has a
+ * floor 90 days further back than a default one, and using the global default for
+ * it would mark good rows as suspect.
+ *
+ * `null` means "no floor" and is the answer for a FRESH deployment: no marker row
+ * means 0005 has not run against a populated `events` table under a schema that
+ * records it, so there is no backfilled cohort to distrust and every
+ * `first_seen_day` was written by ingest at the moment it happened. A consumer
+ * should read `null` as "all exact", never as "unknown".
+ *
+ * Cheap: two indexed point lookups, or one round trip if a consumer caches it —
+ * the value only changes when a project's retention does, and it is a label on a
+ * chart, not part of any count.
+ */
+export async function firstSeenFloorDay(
+  db: D1Database,
+  projectId: string,
+): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT (SELECT value FROM backend_markers WHERE key = 'installs_backfill_day') AS markerDay,
+              (SELECT retention_days FROM projects WHERE id = ?1) AS retentionDays`,
+    )
+    .bind(projectId)
+    .first<{ markerDay: string | null; retentionDays: number | null }>();
+
+  const markerDay = row?.markerDay ?? null;
+  // No marker: a deployment whose `installs` table was never backfilled over
+  // existing events. Nothing to distrust.
+  if (markerDay === null || !isValidDate(markerDay)) return null;
+
+  // Same clamp every other reader of this column applies (0006): a NULL from an
+  // older row, or a hand-edited absurdity, degrades to the 90-day default rather
+  // than moving the floor somewhere it would mislabel real rows.
+  const retentionDays = clampRetentionDays(row?.retentionDays ?? RAW_RETENTION_DAYS);
+  // `rawCutoffDay` takes the clock as a `Date`; the marker is a UTC day, so
+  // midnight UTC on that day is the instant the migration's `date('now')` named.
+  return rawCutoffDay(new Date(`${markerDay}T00:00:00.000Z`), retentionDays);
+}
