@@ -1,6 +1,6 @@
 {
   "name": "stats-worker",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Cloudflare Worker + D1 backend for swift-stats (wire schema v1)",
   "type": "module",

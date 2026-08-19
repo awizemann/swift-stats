@@ -45,10 +45,12 @@
 import { badRequest } from '../errors.js';
 import {
   addDays,
+  clampRetentionDays,
   daysInclusive,
   eachDay,
   isValidDate,
   MAX_RANGE_DAYS,
+  RAW_RETENTION_DAYS,
   rawCutoffDay,
   today,
 } from '../dates.js';
@@ -213,12 +215,24 @@ export async function rawBoundaryDay(
   projectId: string,
   now: Date,
 ): Promise<string> {
-  const cutoff = rawCutoffDay(now);
+  // Both halves of the boundary in ONE round trip: the project's retention window
+  // (0006) and its oldest surviving raw day. The window has to be per project or
+  // the routing is wrong in the expensive direction — a project keeping 180 days
+  // would have every day older than 90 answered from rollups while its raw rows
+  // sat right there, which is not a false zero but is a different, coarser answer
+  // than the same request gets for a day one older, for no reason a reader can
+  // see.
   const row = await db
-    .prepare(`SELECT MIN(day) AS oldest FROM events WHERE project_id = ?1`)
+    .prepare(
+      `SELECT (SELECT retention_days FROM projects WHERE id = ?1) AS retentionDays,
+              (SELECT MIN(day) FROM events WHERE project_id = ?1) AS oldest`,
+    )
     .bind(projectId)
-    .first<{ oldest: string | null }>();
+    .first<{ retentionDays: number | null; oldest: string | null }>();
 
+  // A project row that is absent (deleted mid-request) falls back to the default
+  // window rather than throwing: this function routes days, it does not authorize.
+  const cutoff = rawCutoffDay(now, clampRetentionDays(row?.retentionDays ?? RAW_RETENTION_DAYS));
   const oldest = row?.oldest ?? null;
   if (oldest === null) return cutoff;
   // Never move the boundary UP past the clock's cutoff: a project whose oldest
@@ -724,4 +738,109 @@ export async function propBreakdown(
     range,
     rows: await propBreakdownRows(db, range, request.name, request.limit ?? DEFAULT_LIMIT),
   };
+}
+
+// -----------------------------------------------------------------------------
+// first-seen cohorts
+// -----------------------------------------------------------------------------
+
+export interface FirstSeenRow {
+  /** UTC day, `YYYY-MM-DD`. */
+  readonly date: string;
+  /** How many installs were seen for the FIRST time on that day. */
+  readonly installs: number;
+}
+
+/**
+ * Per-day counts of installs first seen in `[fromDay, toDay]` (table `installs`,
+ * migration 0005).
+ *
+ * This is the whole of the read contract for that table, and it is deliberately
+ * the only one: it returns COUNTS PER DAY, never an `install_id`. A consumer
+ * building retention cohorts or a "new installs" chart gets what it needs, and
+ * there is no function here it can call to get the ids — which is what keeps the
+ * §13 story about this table true no matter which Worker imports the lib.
+ *
+ * Unlike `summaryRows` this needs no raw/rollup routing and no `now`: `installs`
+ * is EXEMPT from the raw purge, so one row per install survives indefinitely and
+ * there is exactly one source. It reaches back further than `/v1/summary` can
+ * report activity for, which is the point of the table.
+ *
+ * Zero-filled over every day in the range, ascending, matching §8.1's rule for
+ * `/v1/summary` — a consumer chart can trust the row count and never has to tell
+ * "no data" from "missing row".
+ *
+ * Note what a count here is NOT: it is not "installs still active", and cohort
+ * retention is this joined against `summary`-style activity, not derivable from
+ * this alone.
+ *
+ * Throws `HttpError` (400) with the same `invalid_range` / `range_too_large`
+ * codes and messages the public read endpoints use, so a consumer mapping this
+ * onto its own transport reports failures identically. `projectId` must already
+ * be authorized against the caller's key — as everywhere in this module, this
+ * function does not authorize.
+ */
+export async function firstSeenRows(
+  db: D1Database,
+  projectId: string,
+  fromDay: string,
+  toDay: string,
+): Promise<FirstSeenRow[]> {
+  if (!isValidDate(fromDay) || !isValidDate(toDay)) {
+    throw badRequest('invalid_range', '`from` and `to` must be real calendar days as YYYY-MM-DD.');
+  }
+  if (toDay < fromDay) {
+    throw badRequest('invalid_range', '`to` must not be before `from`.');
+  }
+  // The same 400-day ceiling the read endpoints enforce (§8.1). There is no
+  // clamp-to-today here: unlike an activity series, a future `to` on a cohort
+  // query is harmless — no install can be first seen on a day that has not
+  // happened, so those days zero-fill honestly rather than inventing a row.
+  if (daysInclusive(fromDay, toDay) > MAX_RANGE_DAYS) {
+    throw badRequest('range_too_large', `A range may span at most ${MAX_RANGE_DAYS} days.`);
+  }
+
+  const { results } = await db
+    .prepare(
+      // COUNT(*), not COUNT(DISTINCT install_id): (project_id, install_id) is the
+      // primary key, so a row IS a distinct install and the distinct is free.
+      // Served entirely by the `installs_first_seen` index.
+      `SELECT first_seen_day AS day, COUNT(*) AS installs
+         FROM installs
+        WHERE project_id = ?1 AND first_seen_day >= ?2 AND first_seen_day <= ?3
+        GROUP BY first_seen_day`,
+    )
+    .bind(projectId, fromDay, toDay)
+    .all<{ day: string; installs: number }>();
+
+  const byDay = new Map(results.map((r) => [r.day, r.installs]));
+  return eachDay(fromDay, toDay).map((day) => ({ date: day, installs: byDay.get(day) ?? 0 }));
+}
+
+/**
+ * How many installs this project has EVER been seen to have, first seen on or
+ * before `throughDay` (default: all of them).
+ *
+ * The cumulative companion to `firstSeenRows`, kept here rather than left to a
+ * consumer summing rows: a sum over a 400-day window is not the total, and a
+ * consumer that computed it that way would silently report "total installs" as
+ * "installs first seen in the last 400 days".
+ */
+export async function totalInstalls(
+  db: D1Database,
+  projectId: string,
+  throughDay?: string,
+): Promise<number> {
+  if (throughDay !== undefined && !isValidDate(throughDay)) {
+    throw badRequest('invalid_range', '`through` must be a real calendar day as YYYY-MM-DD.');
+  }
+  const row = await db
+    .prepare(
+      throughDay === undefined
+        ? `SELECT COUNT(*) AS n FROM installs WHERE project_id = ?1`
+        : `SELECT COUNT(*) AS n FROM installs WHERE project_id = ?1 AND first_seen_day <= ?2`,
+    )
+    .bind(...(throughDay === undefined ? [projectId] : [projectId, throughDay]))
+    .first<{ n: number }>();
+  return row?.n ?? 0;
 }

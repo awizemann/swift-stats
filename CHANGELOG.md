@@ -9,6 +9,73 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+**Cloudflare backend `0.3.0` — key liveness, first-seen installs, per-project
+retention.** Three additive changes to the Worker + D1 backend, one migration
+each. No wire change: the SDK, the batch format and the `/v1` request and
+response bodies are untouched, so an existing emitter and an existing reader
+keep working with no edits. Migrations `0001`–`0003` are not modified.
+
+The version number skips `0.2.0`: `backends/cloudflare/package.json` was never
+bumped for the repo's `v0.2.0` tag (it still read `0.1.0` while the tag shipped
+the hardening pass), so `0.3.0` is the first backend version that is ahead of
+every released tag rather than colliding with one.
+
+### Added
+
+- **`keys.last_used_at`** (migration `0004_keys_last_used_at.sql`) — when a key
+  last authenticated a request, written by `POST /v1/events` (write keys) and by
+  both read endpoints (read keys). This is what makes the documented
+  mint-then-revoke rotation checkable: "is the key I am about to revoke still
+  carrying traffic?" had no answer before. The write is **coalesced** — only when
+  the stored value is `NULL` or older than 60 seconds — so a busy key costs at
+  most one row written per minute rather than one per request. A revoked key
+  never updates it (it does not resolve), so the column freezes at the last live
+  use. Nothing about the caller is recorded, and the key itself is still never
+  logged or stored in plaintext. `admin.mjs list-keys` shows the column.
+- **`installs (project_id, install_id, first_seen_day)`** (migration
+  `0005_installs.sql`) — first sighting per install, written at ingest as one
+  `INSERT OR IGNORE` per batch (not per event), in the same `db.batch()` as the
+  events. **Exempt from the raw purge** and cascaded on project delete. It exists
+  because first sighting is the one fact no aggregate can recover: rollups store
+  per-day distinct counts, which cannot say whether an install was new that day,
+  so retention cohorts and "new vs returning" were unanswerable beyond the raw
+  window. Backfilled from surviving `events` (`MIN(day)` per install). The read
+  side is `firstSeenRows()` / `totalInstalls()` in `src/lib/queries.ts`, which
+  return **counts per day only** — no exported function returns an install id.
+  `admin.mjs delete-install` now clears this table too, so the §13 erasure stays
+  complete.
+- **`projects.retention_days`** (migration `0006_project_retention_days.sql`,
+  default `90`, bounds 90–400) — raw retention becomes per project. The nightly
+  sweep deletes per project instead of globally, `bucketDay` clamps an
+  implausibly old `ts` into the *project's* window, and `rawBoundaryDay` routes
+  each day to raw or rollup at that same per-project boundary, so a project
+  keeping 180 days both keeps and reads its day-100 rows while a default project
+  is unaffected. 90 stays the default and the documented minimum; 400 is the cap,
+  matching `MAX_RANGE_DAYS` (raw rows beyond the longest answerable range could
+  never be read as raw rows). Bounds are clamped on read rather than enforced as
+  a CHECK, so a hand-edited row degrades to 90 instead of deleting history. New
+  `admin.mjs set-retention <projectId> <days>`.
+- 29 new conformance cases (`backends/cloudflare/test/additions.test.ts`) cover
+  the coalescing window, the revoked-key case, ingest and purge behavior for
+  `installs`, the project-delete cascade, and per-project sweep and boundary
+  routing.
+
+### Changed
+
+- **The read endpoints are no longer literally free of writes.** They are still
+  safe and idempotent in the §8 sense — no answer depends on them and nothing
+  client-visible changes — but `GET /v1/summary` and `GET /v1/events/top` now
+  perform the coalesced `keys.last_used_at` touch described above. The touch is
+  scheduled with `ctx.waitUntil` on both the read and the ingest paths, so it
+  never sits between the caller and its response, and it never throws. The
+  backend README and the header comment in `src/read.ts` say so where they used
+  to claim "no writes".
+- **These migrations are numbered `0004`–`0006`,** after the `0003_event_idempotency.sql`
+  shipped in 0.2.0. `0005_installs.sql`'s backfill (`MIN(day) GROUP BY
+  project_id, install_id`) is now index-assisted: 0.2.0's `events_identity`
+  UNIQUE index on `(project_id, install_id, seq)` has exactly that grouping key
+  as its prefix.
+
 ## [0.2.0] — 2026-08-19
 
 ### Upgrade notes (read before adopting)

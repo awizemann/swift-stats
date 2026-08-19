@@ -9,6 +9,7 @@
 
 import {
   addDays,
+  clampRetentionDays,
   RAW_RETENTION_DAYS,
   rawCutoffDay,
   today,
@@ -308,7 +309,24 @@ async function runRollupAndSweep(env: Env, now: Date): Promise<{
     return { rolled, deletedEvents: 0 };
   }
 
-  const cutoff = rawCutoffDay(now);
+  // Each project's own cutoff (0006). The sweep is no longer one global delete:
+  // a project keeping 180 days and a project keeping the default 90 share this
+  // table and must not share a boundary.
+  const projects = await env.DB.prepare(
+    `SELECT id, retention_days AS retentionDays FROM projects`,
+  ).all<{ id: string; retentionDays: number | null }>();
+
+  const cutoffs = projects.results.map((p) => ({
+    projectId: p.id,
+    cutoff: rawCutoffDay(now, clampRetentionDays(p.retentionDays)),
+  }));
+
+  // The OLDEST cutoff across all projects, for logging and for the fallback
+  // below. Not a delete boundary — nothing is deleted by this value.
+  const cutoff = cutoffs.reduce<string>(
+    (min, c) => (c.cutoff < min ? c.cutoff : min),
+    rawCutoffDay(now),
+  );
 
   // 2. Roll EVERY day that is about to be deleted.
   //
@@ -329,13 +347,23 @@ async function runRollupAndSweep(env: Env, now: Date): Promise<{
   //    So the set to roll is not "the last four days", it is "every day whose raw
   //    rows this pass is about to remove". In the steady state that is one day,
   //    already rolled minutes ago, and re-rolling it is cheap and idempotent.
-  const expiring = await env.DB.prepare(
-    `SELECT DISTINCT day FROM events WHERE day < ?1 ORDER BY day`,
-  )
-    .bind(cutoff)
-    .all<{ day: string }>();
+  //
+  //    Asked per project, because the set of expiring days is now per project —
+  //    but note that `rollupStatements` rolls a whole DAY across every project at
+  //    once. That is deliberate and still correct: rolling a day for a project
+  //    that is not expiring it is idempotent and cheap, and doing it per project
+  //    would mean three DELETE-then-INSERTs per project per day for no gain.
+  const expiringDays = new Set<string>();
+  for (const { projectId, cutoff: projectCutoff } of cutoffs) {
+    const rows = await env.DB.prepare(
+      `SELECT DISTINCT day FROM events WHERE project_id = ?1 AND day < ?2`,
+    )
+      .bind(projectId, projectCutoff)
+      .all<{ day: string }>();
+    for (const r of rows.results) expiringDays.add(r.day);
+  }
 
-  for (const { day } of expiring.results) {
+  for (const day of [...expiringDays].sort()) {
     try {
       await env.DB.batch(rollupStatements(env, day, rolledAt));
       await env.DB.prepare(
@@ -364,9 +392,26 @@ async function runRollupAndSweep(env: Env, now: Date): Promise<{
     // `day < cutoff` deletes strictly older than the oldest day reads will look
     // for in raw rows — `rawCutoffDay` is the shared definition of that
     // boundary, so read and delete cannot drift apart into either a silently
-    // zeroed day or a day served from two sources.
-    const result = await env.DB.prepare(`DELETE FROM events WHERE day < ?1`).bind(cutoff).run();
-    deletedEvents = result.meta.changes ?? 0;
+    // zeroed day or a day served from two sources. Since 0006 that boundary is
+    // per project on BOTH sides: `rawBoundaryDay` derives the read boundary from
+    // the same column this loop deletes by, so a project with a longer window
+    // keeps its raw rows AND reads them, and a project with the default is
+    // untouched by its neighbour's setting.
+    //
+    // What this deliberately does NOT touch is `installs` (0005): first sighting
+    // is the one fact that cannot be recovered from any aggregate, and the whole
+    // reason that table exists is to outlive this delete. There is no statement
+    // anywhere in the scheduled job that removes an install row — the only paths
+    // that do are a project delete (the FK cascade) and the §13 per-install
+    // erasure.
+    for (const { projectId, cutoff: projectCutoff } of cutoffs) {
+      const result = await env.DB.prepare(
+        `DELETE FROM events WHERE project_id = ?1 AND day < ?2`,
+      )
+        .bind(projectId, projectCutoff)
+        .run();
+      deletedEvents += result.meta.changes ?? 0;
+    }
 
     // Context rows follow their events: they are diagnostic only (nothing in the
     // v1 read contract is dimensioned by them), so they have no reason to

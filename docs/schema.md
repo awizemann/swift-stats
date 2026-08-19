@@ -698,9 +698,19 @@ them would break the privacy manifest in §14 and, mostly, the Apple
 - Third-party dependencies in the emitter.
 
 Retention: a backend MUST document its raw-event retention and SHOULD keep raw
-events no longer than **90 days**, aggregating beyond that. A backend MUST
-provide a way to delete all events for a given `installId` on request, which is
-the only per-person deletion this schema can support.
+events no longer than **90 days**, aggregating beyond that. A backend MAY vary
+that window per project, and MUST then document the range it permits and the
+default. A backend MUST provide a way to delete all events for a given
+`installId` on request, which is the only per-person deletion this schema can
+support.
+
+A backend MAY keep, beyond its raw-event window, a record of an `installId`'s
+**first-seen day** and nothing else — the one fact that cannot be reconstructed
+from per-day aggregates, and what any honest new-versus-returning number rests
+on. If it does, it MUST say so where it documents retention (a raw window stated
+without this exception is not truthful), the per-`installId` deletion above MUST
+remove it, and its read contract MUST NOT expose an `installId` — counts per day
+only. Nothing else about the install may be retained this way.
 
 ## 14. Privacy manifest
 

@@ -27,6 +27,7 @@ export const INSTALLS = { a: INSTALL_A, b: INSTALL_B };
 
 const TABLES = [
   'events',
+  'installs',
   'batch_context',
   'batches',
   'daily_rollups',
@@ -82,6 +83,42 @@ export async function resetDatabase(): Promise<void> {
   await seed(OTHER_WRITE_KEY, OTHER_PROJECT, 'write', null);
   await seed(OTHER_READ_KEY, OTHER_PROJECT, 'read', null);
   await seed(REVOKED_WRITE_KEY, PROJECT, 'write', '2026-08-16T00:00:00.000Z');
+}
+
+/** Set a project's raw-retention window (migration 0006). */
+export async function setRetention(projectId: string, days: number): Promise<void> {
+  await DB.prepare(`UPDATE projects SET retention_days = ?2 WHERE id = ?1`)
+    .bind(projectId, days)
+    .run();
+}
+
+/** `keys.last_used_at` for a presented key, by hash (migration 0004). */
+export async function lastUsedAt(key: string): Promise<string | null> {
+  const row = await DB.prepare(`SELECT last_used_at AS v FROM keys WHERE key_hash = ?1`)
+    .bind(await hashKey(key))
+    .first<{ v: string | null }>();
+  return row?.v ?? null;
+}
+
+/** Overwrite `keys.last_used_at`, to fake the passage of time in a test. */
+export async function setLastUsed(key: string, iso: string | null): Promise<void> {
+  await DB.prepare(`UPDATE keys SET last_used_at = ?2 WHERE key_hash = ?1`)
+    .bind(await hashKey(key), iso)
+    .run();
+}
+
+/** Seed `installs` rows directly, for cohort-read fixtures (migration 0005). */
+export async function seedInstalls(
+  rows: Array<{ installId: string; firstSeenDay: string; projectId?: string }>,
+): Promise<void> {
+  await DB.batch(
+    rows.map((r) =>
+      DB.prepare(
+        `INSERT OR IGNORE INTO installs (project_id, install_id, first_seen_day)
+         VALUES (?1, ?2, ?3)`,
+      ).bind(r.projectId ?? PROJECT, r.installId, r.firstSeenDay),
+    ),
+  );
 }
 
 let uuidCounter = 0;

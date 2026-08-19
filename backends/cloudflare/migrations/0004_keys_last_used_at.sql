@@ -1,0 +1,41 @@
+-- swift-stats Cloudflare/D1 backend — migration 0004.
+--
+-- `keys.last_used_at`: when this key was last seen on a request that
+-- authenticated with it.
+--
+-- Why it exists. `keys` records what was MINTED and what was REVOKED, and
+-- nothing about what is actually in use. That gap is felt at exactly the moment
+-- an operator most needs it: rotation. §7 of the backend README describes
+-- rotation as mint-then-revoke with both keys live in between, and the whole
+-- question in the middle of that dance — "has the old key stopped being used, or
+-- am I about to 401 a shipped app?" — had no answer here. The alternatives are
+-- worse: logs are sampled and expire, and a *hash* in a log is still a key
+-- identifier in a place with a different retention story than D1.
+--
+-- What it is NOT. It is not analytics, and it is deliberately not a request
+-- counter or a "last IP". §13 forbids identifiers of the backend's own invention
+-- about a person and forbids storing anything derived from the client IP; a
+-- coarse timestamp on a KEY — an operator-minted artifact, one per app build, not
+-- one per person — is on the other side of that line. Nothing about the caller is
+-- recorded, and the plaintext key never appears here or in a log (only the
+-- SHA-256 is stored at all, per 0001).
+--
+-- Nullable, with no default. NULL means "not seen since this migration ran",
+-- which is the honest answer for every existing row — a backfill from `batches`
+-- or `events` would be a guess, since neither records which key wrote them, and a
+-- guessed `last_used_at` is worse than none when the decision it feeds is
+-- "revoke this or not".
+--
+-- On write volume. The Worker COALESCES the update: it writes only when the
+-- stored value is NULL or older than 60 seconds (see `touchKey` in src/keys.ts),
+-- so a key doing 100 rps costs at most one row written per minute rather than one
+-- per request. D1 bills rows written, and turning every ingest into a `keys`
+-- write to service a diagnostic column would have been a real cost for an
+-- operator's convenience. The 60-second granularity is far finer than the
+-- question ("is anything still using this key today?") requires.
+--
+-- Additive: an `ALTER TABLE … ADD COLUMN` on a STRICT table with no default and
+-- no rewrite. The existing rows are untouched and every existing statement in
+-- this backend names its columns explicitly, so nothing reads it by position.
+
+ALTER TABLE keys ADD COLUMN last_used_at TEXT;   -- ISO 8601 UTC ms, §0; NULL = never seen
