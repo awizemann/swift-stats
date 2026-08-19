@@ -43,8 +43,9 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
   domains, because first-party data with a non-correlatable id is not tracking.
   No ATT prompt. The bundled `PrivacyInfo.xcprivacy` says exactly that, and a
   test asserts it.
-- **Zero dependencies.** Foundation and `os` only. No swift-log, no
-  OpenTelemetry — nothing to audit but this package.
+- **Zero dependencies.** System frameworks only — Foundation, `os`,
+  CryptoKit (the install-id hash) and Synchronization (the `record()` buffer).
+  No swift-log, no OpenTelemetry — nothing to audit but this package.
 - **Pluggable backends.** The load-bearing artifact is the schema, not the SDK.
   Anything that speaks `POST /v1/events` is a valid backend — see
   [`backends/`](backends/README.md).
@@ -151,10 +152,13 @@ They differ in one thing, durability:
   that guarantee, most often right before a deliberate teardown or an operation
   that may end the process.
 
-`flush()`, `waitForFlushes()` and `shutdown()` drain whatever `record()` has
-accepted before they do their own work, so nothing recorded is left behind; a
-test that wants only the drain can `await stats.drainRecorded()`. `identify(userID:)` is opt-in, hashed with your salt
-before it leaves the device, and most apps should never call it.
+`flush()`, `waitForFlushes()`, `shutdown()`, `reset()`, `identify(userID:)` and
+both lifecycle methods drain whatever `record()` has accepted before they do
+their own work, so nothing recorded is left behind or mis-attributed; a test
+that wants only the drain can `await stats.drainRecorded()`.
+
+`identify(userID:)` is opt-in, hashed with your salt before it leaves the
+device, and most apps should never call it.
 
 ### Writing a sink
 
@@ -204,8 +208,11 @@ clock.advance(by: .seconds(30))     // drives the interval flush and the backoff
 conformance-checked backend: a Worker on **D1** serving `POST /v1/events`,
 `GET /v1/summary` and `GET /v1/events/top`, plus a nightly Cron Trigger that
 rolls up closed days and deletes raw events past 90 days. Distinct counts are
-exact. Keys are stored only as SHA-256 hashes, and `projectId` is derived from
-the write key's scope. Deploying it is `npx wrangler login && npm run deploy`.
+exact, ingest is idempotent per batch *and* per event, keys are stored only as
+SHA-256 hashes, and `projectId` is derived from the write key's scope.
+Deploying it is `npx wrangler login && npm run deploy`; upgrading an existing
+deployment to 0.2.0 requires applying migration `0003` (see
+[`ADOPTION.md`](backends/cloudflare/ADOPTION.md)).
 
 You can self-host it on your own Cloudflare account, or — eventually — use the
 hosted instance at **`https://api.swiftstats.co`**. It runs the same Worker from
@@ -267,7 +274,10 @@ at all** — `track()` costs one `write(2)` and nothing else. A marker that
 cannot be parsed, points past the end of the file, does not land on a line
 boundary, or is tagged with a size the file never reached is ignored and the
 queue is read from byte zero: the worst case is re-sending a batch that was
-already accepted, never skipping events that were not.
+already accepted, never skipping events that were not. The bundled Cloudflare
+backend absorbs such a re-send — it stores at most one event per
+`(projectId, installId, seq)` ([schema §6](docs/schema.md#6-idempotency)) — so
+a crash-time replay does not double-count.
 
 **Excluded from backups.** The `swift-stats` directory is marked
 `isExcludedFromBackup` (via `URLResourceValues`) the first time it is created
@@ -306,22 +316,19 @@ no cookies — schema §7) with:
   already maps to "retain and retry later," so the batch stays queued rather
   than silently never leaving.
 
-Both `allowsConstrainedNetworkAccess` and `allowsExpensiveNetworkAccess` are
-now parameters on `URLSessionTransport.defaultConfiguration(...)` and on
-`URLSessionTransport.init(...)`'s default-session path, so you can opt in to
-sending under Low Data Mode (or opt out of an expensive/cellular link too)
-without hand-building a `URLSessionConfiguration`.
-
-A consumer supplying a custom `URLSession` can start from the same baseline
-via `URLSessionTransport.defaultConfiguration()` rather than duplicating these
-values.
+`allowsConstrainedNetworkAccess` and `allowsExpensiveNetworkAccess` are
+parameters on both `URLSessionTransport.defaultConfiguration(...)` and
+`URLSessionTransport.init(...)`, so you can opt in to sending under Low Data
+Mode (or opt out of an expensive/cellular link) without hand-building a
+`URLSessionConfiguration`; a consumer supplying its own `URLSession` can start
+from `defaultConfiguration()` rather than duplicating these values.
 
 ## Consumer checklist
 
 Five things the SDK cannot do for you. One thing you do **not** have to do:
 `StatsClient(configuration:)` performs no disk I/O — no directory is created, no
 `UserDefaults` suite is opened, no queue file is read. The path is resolved and
-the suite opened lazily inside the actor on the first `track()` or
+the suite opened lazily inside the actor on the first `record()`, `track()` or
 `applicationDidBecomeActive()`. Construct it wherever is convenient, including
 `App.init` on the main actor, with no `Task.detached` around it.
 
@@ -391,24 +398,29 @@ Package.swift              Products: Stats, StatsCloudflare, StatsTesting
 docs/
   schema.md                ★ THE CONTRACT — wire schema v1: ingest + read, identity,
                              sessions, consent, reserved names, never-collected list
+  SAAS-HANDOFF.md          Handoff brief for a managed deployment of the engine
 backends/
   README.md                How backends plug in + the shared conformance checklist
   cloudflare/              Cloudflare backend: Worker + D1, migrations, admin CLI,
                              conformance suite (npm test)
+    ADOPTION.md            What the 0.2.0 hardening pass changed and how to adopt it
 Sources/
   Stats/                   Core emitter: value types, client, queue, dispatcher
     StatsClient.swift        The actor: record / track / identify / consent / flush / reset / lifecycle
     Dispatcher.swift         Flush triggers, batching, backoff, drop-vs-retain
-    EventStore.swift         JSON-lines durable queue in Application Support
+    EventStore.swift         JSON-lines durable queue + queue.head marker, compaction,
+                             memory-only fallback
     StatsIdentityStore.swift Own UserDefaults suite: install UUID, seq, consent
     StatsEnvironment.swift   Context sampling (Bundle/ProcessInfo/uname/Locale only)
     Resources/
       PrivacyInfo.xcprivacy  Bundled manifest: tracking=false, UserDefaults CA92.1
   StatsCloudflare/         CloudflareSink (ingest) + StatsQuery (reads)
     IngestDisposition.swift  §7's status-to-behavior table as a pure function
+    StatsTransport.swift     URLSessionTransport + defaultConfiguration()
   StatsTesting/            InMemorySink, ManualClock, fixed uuid/random providers
 Tests/
-  StatsTests/              Encoding, props, identity, sessions, consent, dispatch
+  StatsTests/              Encoding, props, identity, sessions, consent, dispatch,
+                             queue file + marker (QueueFileTests), record() (RecordTests)
                              — plus a test asserting the privacy manifest's contents
   StatsCloudflareTests/
 .github/workflows/ci.yml   macos-15 pinned to Xcode 26.x: swift build + swift test,
@@ -427,6 +439,7 @@ CHANGELOG.md               Keep-a-changelog, semver
 | P12d | First consumer emits events | planned |
 | P12e | Read side: per-project usage in a consumer app | planned |
 | P12f | Tag 0.1.0, semver policy | **done** |
+| 0.2.0 | Production hardening: bounded queue I/O, `record()`, per-event idempotency | **done** |
 
 Until 1.0, minor versions may make breaking API changes. The **wire schema** is
 versioned separately, and `v1` will not break — see
