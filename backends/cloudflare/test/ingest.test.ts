@@ -997,6 +997,9 @@ describe('post-response side effects run under ctx.waitUntil', () => {
     expect(accepted.length).toBe(1);
     const line = JSON.parse(accepted[0] as string) as Record<string, unknown>;
     expect(line).toMatchObject({ level: 'info', event: 'batch_accepted', projectId: PROJECT, events: 1 });
+    // The SDK version rides along so version drift is visible from logs alone.
+    expect(typeof line.sdkVersion).toBe('string');
+    expect((line.sdkVersion as string).length).toBeGreaterThan(0);
     // §13 / src/log.ts: no installId, sessionId, userId, prop or key ever.
     expect(accepted[0]).not.toContain(INSTALLS.a);
     expect(accepted[0]).not.toContain('u-1');

@@ -61,6 +61,11 @@ and `docs/SAAS-HANDOFF.md` for the managed-service handoff.
   when a replay was absorbed. Ephemeral per-session install ids (§11) and
   reinstalls are unaffected because they start a new `installId`.
 - `docs/SAAS-HANDOFF.md`: handoff brief for a managed deployment of the engine.
+- SDK version drift visibility: `StatsQuery` sends the same constant
+  `User-Agent: swift-stats/<version>` header as `CloudflareSink` (fleet-level,
+  never per-install — and more private than CFNetwork's default, which names
+  the app, build and Darwin version), and the Worker's deferred `batch_accepted`
+  log line carries `sdkVersion` from the batch context.
 - **`StatsClient.record(_:props:)`** — a `nonisolated`, non-`async` sibling of
   `track()`. Hands the event to the actor through a lock-protected buffer and
   returns immediately: no suspension, no actor hop, safe in a button action or

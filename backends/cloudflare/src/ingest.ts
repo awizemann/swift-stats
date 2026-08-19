@@ -417,7 +417,13 @@ export async function handleIngest(
   // 202 only now: `db.batch()` has committed, so the batch would survive the
   // process dying (§7). Nothing between that commit and this `return` may block
   // — the success log runs after the response, under `waitUntil`.
-  deferLog(ctx, () => logger.info('batch_accepted', { projectId, events: batch.events.length }));
+  deferLog(ctx, () =>
+    logger.info('batch_accepted', {
+      projectId,
+      events: batch.events.length,
+      sdkVersion: batch.context.sdkVersion,
+    }),
+  );
   if (deduped > 0) {
     // A replay under a fresh `batchId` (see the insert above). Counts only —
     // no event name, no `installId`, no `seq`, no body (§7, §13). Deferred,

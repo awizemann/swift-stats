@@ -1,4 +1,5 @@
 import Foundation
+import Stats
 import os
 
 /// Loggers are `private nonisolated let` at file scope so an actor can use them
@@ -293,6 +294,10 @@ public struct StatsQuery: Sendable {
         var request = URLRequest(url: endpoint.url(path: path, query: query))
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        // Same constant identifier `CloudflareSink` sends: fleet-level, never
+        // per-install, and more private than CFNetwork's default (which names
+        // the app, its build and the Darwin version).
+        request.setValue("swift-stats/\(Stats.sdkVersion)", forHTTPHeaderField: "User-Agent")
         // The read key travels in a header, never in the query string: a URL ends
         // up in proxy logs, crash reports and `os_log` metadata, and a key in one
         // of those is a leaked key.

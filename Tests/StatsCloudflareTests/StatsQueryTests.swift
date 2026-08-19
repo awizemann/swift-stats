@@ -1,4 +1,5 @@
 import Foundation
+import Stats
 import Testing
 @testable import StatsCloudflare
 
@@ -78,6 +79,9 @@ struct StatsQueryTests {
         // The key must NOT be in the URL: a URL reaches proxy logs, crash reports
         // and os_log metadata, and a key in any of those is a leaked key.
         #expect(!url.absoluteString.contains(Self.readKey))
+        // Same constant, fleet-level identifier the sink sends — so a backend can
+        // see SDK version drift on the read path too.
+        #expect(request?.value(forHTTPHeaderField: "User-Agent") == "swift-stats/\(Stats.sdkVersion)")
     }
 
     @Test("includeDebug: true is sent through")

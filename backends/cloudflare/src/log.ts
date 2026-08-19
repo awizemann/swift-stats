@@ -20,6 +20,13 @@ export interface Fields {
   /** Events an insert dropped as already-stored (the identity index, migration 0003). */
   readonly deduped?: number;
   readonly duplicate?: boolean;
+  /**
+   * The emitter's `context.sdkVersion` (schema §3), on `batch_accepted` only —
+   * a fleet-level string shared by every install on that SDK build, so an
+   * operator can see version drift from log analytics without a D1 query.
+   * Not person-scale: it is the same for every install of a release.
+   */
+  readonly sdkVersion?: string;
   readonly durationMs?: number;
   readonly status?: number;
   readonly path?: string;

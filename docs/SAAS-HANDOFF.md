@@ -38,6 +38,26 @@ You do not edit the client, but these change what your backend will see.
 5. **HEAD routed; `/health` method-checked** (ADOPTION §4).
 6. **Maximal batch pinned by test** (100 events × 32 props, ADOPTION §5).
 
+## 2a. SDK version drift (observability)
+
+Every batch carries `context.sdkVersion` (schema §3) and the Worker stores it
+in `batches.sdk_version`; both Swift clients also send a constant
+`User-Agent: swift-stats/<version>` (fleet-level, never per-install). The
+`batch_accepted` log line now includes `sdkVersion`, so drift is visible from
+log analytics alone. For a dashboard, the durable source is D1:
+
+```sql
+-- installs per SDK version over the last 7 days, per project
+SELECT b.project_id, b.sdk_version, COUNT(DISTINCT e.install_id) AS installs
+FROM batches b JOIN events e ON e.batch_id = b.batch_id AND e.project_id = b.project_id
+WHERE b.sent_at >= datetime('now', '-7 days')
+GROUP BY b.project_id, b.sdk_version
+ORDER BY b.project_id, installs DESC;
+```
+
+Use it to flag customers still on `< 0.2.0` (no `record()`, no byte-offset
+marker) and to gate any future schema `v2` rollout.
+
 ## 3. Investigate in the managed engine (not in the OSS Worker)
 
 These were recommended, not implemented, because they need paid products or
