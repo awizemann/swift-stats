@@ -55,3 +55,11 @@ dist/
 
 # Reference-deployment config (real D1 id + route)
 backends/cloudflare/wrangler.prod.toml
+
+# Memophant app-local state (machine-specific, not for git)
+.memophant/
+
+sessions/.raw/
+sessions/.index.json
+
+.claude/memophant-activity.log
