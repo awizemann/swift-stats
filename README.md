@@ -9,7 +9,8 @@ is yours to choose.
 > for `v1`, and the emitter (`StatsClient`, the file-backed queue, the
 > dispatcher, identity, sessions, consent) is implemented and tested. A shipping
 > backend is included: [`backends/cloudflare/`](backends/cloudflare/README.md)
-> (Worker + D1) with the matching `StatsCloudflare` adapter. See [Roadmap](#roadmap).
+> (Worker + D1) with the matching `StatsCloudflare` adapter. See
+> [Status and roadmap](#status-and-roadmap).
 
 ## Why
 
@@ -429,17 +430,25 @@ Tests/
 CHANGELOG.md               Keep-a-changelog, semver
 ```
 
-## Roadmap
+## Status and roadmap
 
-| Phase | Scope | State |
-|---|---|---|
-| P12a | Package scaffold, wire schema `v1`, backend contract, CI | **done** |
-| P12b | `Stats` core: file-backed queue, dispatcher, identity, sessions, consent, tests | **done** |
-| P12c | `backends/cloudflare/`: ingest Worker on D1 + read helper | **done** |
-| P12d | First consumer emits events | planned |
-| P12e | Read side: per-project usage in a consumer app | planned |
-| P12f | Tag 0.1.0, semver policy | **done** |
-| 0.2.0 | Production hardening: bounded queue I/O, `record()`, per-event idempotency | **done** |
+**Shipped (0.2.0).** Wire schema `v1`; the `Stats` core (file-backed queue,
+dispatcher, identity, sessions, consent); the Cloudflare backend (ingest, read
+endpoints, nightly rollup, per-batch and per-event idempotency); the
+`StatsCloudflare` adapter (`CloudflareSink`, `StatsQuery`); a first consumer
+app emitting events in production; and the read side validated end-to-end — a
+Swift client emitting through `CloudflareSink` and reading its own
+`summary` / `topEvents` / `propBreakdown` back through `StatsQuery` against the
+Worker.
+
+**Next.**
+
+| Item | Notes |
+|---|---|
+| Hosted instance sign-up (`api.swiftstats.co`) | Operator-issued keys; the Worker is the same one in this repo |
+| Global rate limiting for the Worker | Rate Limiting binding or a Durable Object per key — see `ADOPTION.md` |
+| Optional background-task hook for the iOS flush-on-background | Consumer-supplied, so the core stays Foundation-only |
+| 1.0 | API freeze once a second backend has shipped against `v1` |
 
 Until 1.0, minor versions may make breaking API changes. The **wire schema** is
 versioned separately, and `v1` will not break — see
