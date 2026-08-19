@@ -24,6 +24,15 @@ const MIGRATIONS_SQL = readdirSync(migrationsDir)
   .sort()
   .map((f) => readFileSync(join(migrationsDir, f), 'utf8'));
 
+// Release bookkeeping, read on the Node side for the same workerd reason as the
+// migrations: the package version and the repo CHANGELOG cross the boundary as
+// data so test/release.test.ts can assert they agree.
+const packageDir = dirname(fileURLToPath(import.meta.url));
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as { version: string }
+).version;
+const CHANGELOG_MD = readFileSync(join(packageDir, '..', '..', 'CHANGELOG.md'), 'utf8');
+
 export default defineConfig({
   plugins: [
     cloudflareTest({
@@ -35,7 +44,7 @@ export default defineConfig({
         // needed for tests, so `database_id` in wrangler.toml stays a
         // placeholder in the repo.
         d1Databases: { DB: 'stats-test' },
-        bindings: { MIGRATIONS_SQL },
+        bindings: { MIGRATIONS_SQL, PACKAGE_VERSION, CHANGELOG_MD },
       },
       // Storage is deliberately shared across tests: every test calls
       // `resetDatabase()`, which drops the tables and re-applies the migrations

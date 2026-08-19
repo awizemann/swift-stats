@@ -581,6 +581,29 @@ covers the endpoints over it.
 
 ---
 
+## Releasing this backend
+
+The backend is versioned by `package.json` here and released with a
+`backend-cloudflare-<version>` tag, independent of the Swift package's `v*`
+tags (which SPM resolves — never reuse those for a backend-only release). The
+steps, in order, all in ONE commit before the tag:
+
+1. Bump `package.json` `version`.
+2. Move the `[Unreleased]` CHANGELOG entries under a
+   `## [backend-cloudflare-<version>] — <date>` heading.
+3. `npm run typecheck && npm test` — the suite includes `test/release.test.ts`,
+   which fails whenever `package.json` and the newest CHANGELOG release heading
+   disagree. That guard exists because the two drifted once (the repo tagged
+   v0.2.0 while this file still said 0.1.0) and the next release had to skip a
+   number.
+4. Tag `backend-cloudflare-<version>` on that commit and push the tag with it.
+5. Deploy (`wrangler d1 migrations apply … && wrangler deploy`) from the tagged
+   commit, never from an unmerged branch or a dirty tree.
+
+Migration numbers are claimed by whatever lands on `main` first; a branch that
+was cut earlier renumbers on rebase. Two branches must never both ship the same
+`NNNN_`.
+
 ## Conformance checklist
 
 Verified at the commit that introduced this file, by `npm test`
