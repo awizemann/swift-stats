@@ -17,6 +17,8 @@ export interface Fields {
   readonly events?: number;
   readonly rows?: number;
   readonly adjustments?: number;
+  /** Events an insert dropped as already-stored (the identity index, migration 0003). */
+  readonly deduped?: number;
   readonly duplicate?: boolean;
   readonly durationMs?: number;
   readonly status?: number;
@@ -80,6 +82,34 @@ function emit(level: 'info' | 'warn' | 'error', event: string, fields: Fields, c
   if (level === 'error') console.error(text);
   else if (level === 'warn') console.warn(text);
   else console.log(text);
+}
+
+/**
+ * Run post-response bookkeeping outside the request's critical path.
+ *
+ * Why this exists at all, for a call as cheap as `console.log`: on the ingest
+ * path §7 makes the 202 a *durability* signal, and everything between the D1
+ * commit and the `return` is latency the emitter pays for nothing. Log emission
+ * on a Worker is not free either — it is serialized and shipped to the
+ * observability pipeline — and it is exactly the kind of work that grows later
+ * (a counter, a KV write, a metrics POST) without anyone revisiting where it
+ * runs.
+ *
+ * `waitUntil` is the half that matters in both directions: the work does not
+ * delay the response, AND it is not cut off when the response is returned, which
+ * a bare floating promise would be.
+ */
+export function deferLog(ctx: ExecutionContext, run: () => void): void {
+  ctx.waitUntil(
+    (async () => {
+      try {
+        run();
+      } catch {
+        // Bookkeeping must never be able to fail a request that already
+        // succeeded — and by the time this runs, the response is already sent.
+      }
+    })(),
+  );
 }
 
 export const logger = {

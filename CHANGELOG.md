@@ -9,6 +9,184 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-19
+
+### Upgrade notes (read before adopting)
+
+**Swift packages (`Stats`, `StatsCloudflare`, `StatsTesting`): no breaking
+API changes.** Every 0.1.0 call site compiles unchanged; everything new is
+additive (`record()`, `drainRecorded()`, `URLSessionTransport.defaultConfiguration()`,
+new defaulted parameters). Behaviour changes to be aware of:
+
+- **Low Data Mode:** the default `URLSessionTransport` now sets
+  `allowsConstrainedNetworkAccess = false`, so under Low Data Mode batches stay
+  queued (and the local queue drops *oldest* past `maxQueued`) until the mode
+  lifts. Pass `allowsConstrainedNetworkAccess: true` to keep sending.
+- **Timeouts:** 20 s per request / 60 s per resource (previously the
+  `URLSession` defaults of 60 s / 7 days).
+- **On-disk queue:** an additive sidecar `queue.head` appears next to
+  `queue.jsonl`; 0.1.0 queue files load unchanged. Downgrading to 0.1.0 after
+  running 0.2.0 re-reads already-sent records (0.1.0 ignores the marker) — the
+  backend's per-event idempotency below absorbs that.
+- **Directories:** a consumer-supplied `storageDirectory` is no longer re-moded
+  to `0700` or excluded from backups — only a directory the SDK creates for
+  itself is. The no-Application-Support fallback now uses its own
+  `swift-stats-<appId>/` subdirectory under the temporary directory.
+
+**Wire schema `v1` — one normative wording change (no field or envelope
+change).** `docs/schema.md` §2.2 and §6 previously said a backend *MUST NOT*
+dedupe individual events by `(installId, seq)`. They now say a backend
+**SHOULD** treat `(projectId, installId, seq)` as a per-event idempotency key
+(first delivery wins), and MUST NOT dedupe on `seq` without `installId` or
+across projects. Emitters are unaffected. A third-party backend that
+implemented the old MUST NOT is still conformant; the new SHOULD is what closes
+the crash-replay case described under "Fixed" below.
+
+**Cloudflare Worker — a migration is required.** `0003_event_idempotency.sql`
+adds `UNIQUE (project_id, install_id, seq)` on `events` after collapsing any
+pre-existing duplicates (first delivery kept). Run it in a quiet window:
+`wrangler d1 migrations apply stats --remote`. Rollups computed *before* the
+migration may be inflated by replays and can be re-rolled only while the raw
+events are inside the 90-day window. `handleIngest` / `route` now take
+`ExecutionContext` (internal signatures; a fork that calls them directly must
+pass `ctx`). See `backends/cloudflare/ADOPTION.md` for the full adoption brief
+and `docs/SAAS-HANDOFF.md` for the managed-service handoff.
+
+### Added
+- Cloudflare Worker: **per-event idempotency.** Migration
+  `0003_event_idempotency.sql` adds a unique index on
+  `events(project_id, install_id, seq)`; ingest inserts with
+  `ON CONFLICT (project_id, install_id, seq) DO NOTHING`, still answers 202,
+  and emits a deferred `events_deduped` log line (count only, never bodies)
+  when a replay was absorbed. Ephemeral per-session install ids (§11) and
+  reinstalls are unaffected because they start a new `installId`.
+- `docs/SAAS-HANDOFF.md`: handoff brief for a managed deployment of the engine.
+- **`StatsClient.record(_:props:)`** — a `nonisolated`, non-`async` sibling of
+  `track()`. Hands the event to the actor through a lock-protected buffer and
+  returns immediately: no suspension, no actor hop, safe in a button action or
+  a view body. Same validation, sanitization, consent/opt-out checks, and call
+  ordering as `track()` (including relative to `track()` calls from the same
+  caller); the in-flight buffer is capped at 10,000 entries, past which the
+  newest are dropped with a rate-limited log. Added `drainRecorded()` (public)
+  so a test or a consumer can wait for everything `record()` has accepted so
+  far to reach the queue; `flush()`, `waitForFlushes()`, and `shutdown()` now
+  drain it automatically first. The README quick start leads with `record()`.
+- **`EventStore.compact()`** — explicit on-demand compaction of the consumed
+  prefix, useful to call when idle (e.g. at shutdown).
+- **`URLSessionTransport.defaultConfiguration()`** (public, static) — the
+  baseline session configuration `URLSessionTransport` uses by default:
+  ephemeral, 20s per-request / 60s per-resource timeouts, `.background`
+  network service type, and `allowsConstrainedNetworkAccess = false` (a batch
+  is not sent at all under Low Data Mode; it stays queued instead). Both
+  `allowsConstrainedNetworkAccess` and `allowsExpensiveNetworkAccess` are now
+  parameters on `defaultConfiguration(...)` and on `init(...)`'s default-session
+  path, so a consumer can opt in to sending under Low Data Mode (or opt out of
+  an expensive/cellular link) without hand-building a `URLSessionConfiguration`.
+  A consumer supplying a custom `URLSession` can start from the same baseline.
+  Documented in a new README "Storage & networking" section.
+- Two `package`-visible test seams, unreachable from outside the package:
+  `StatsClient.init(configuration:maxRecordedBuffer:)` lets a test overflow
+  the `record()` buffer with a handful of calls instead of 10,000, and
+  `EventStore.diagnostics` now reports `appends` — the number of `append(_:)`
+  calls that have reached the store, which is what makes the batching
+  `record()` does upstream (one drained buffer, one append) observable in a
+  test.
+- Cloudflare Worker: `HEAD` is now routed everywhere `GET` is (`/health`,
+  `/v1/summary`, `/v1/events/top`) — `workerd` does not synthesize `HEAD` from
+  `GET`, so an uptime checker that defaults to `HEAD` used to get a 405.
+- Cloudflare Worker: a separate, tighter pre-auth rate limit for **read** keys
+  (`READ_LIMIT_PER_WINDOW = 120`/min) versus write keys (600/min) — a read key
+  is one dashboard or script, a write key is a whole fleet, so one number was
+  never right for both. The advisory (per-isolate, non-global) nature of these
+  in-Worker limits is now documented explicitly in `ratelimit.ts` and the
+  backend README.
+- `backends/cloudflare/ADOPTION.md`: a new document covering self-hosting
+  decisions, including the global-rate-limiting options not implemented here.
+- Tests: `Tests/StatsTests/QueueFileTests.swift` and
+  `Tests/StatsTests/RecordTests.swift` (`EventStore` compaction/memory-only
+  behavior and `record()`/`drainRecorded()` respectively);
+  `Tests/StatsCloudflareTests/StatsTransportTests.swift`
+  (`URLSessionTransport.defaultConfiguration()`); new Cloudflare Worker tests
+  for `ctx.waitUntil`-deferred logging, size- vs. shape-shaped D1 failures,
+  the largest legal batch, `HEAD`/method routing, and the read-vs-write rate
+  limit split.
+
+### Changed
+- **`EventStore`** removal is now a marker update, not a file rewrite. A new
+  sidecar file, `queue.head`, records how many leading **bytes** of
+  `queue.jsonl` are already consumed, tagged with the file's size at the moment
+  it was written; removing a batch updates that ~16-byte marker instead of
+  rewriting the whole queue file, and a full rewrite ("compaction") only runs
+  once the dead prefix has grown to at least the size of the live remainder.
+  This bounds the bytes rewritten to O(1) per removed record, amortized,
+  instead of the previous O(n²) cost when draining a large backlog in small
+  batches. A byte offset (rather than a line count) is what lets **appending
+  skip the marker entirely**: an append only grows the file and never moves a
+  byte before the offset, so the marker stays true and `track()` pays one
+  `write(2)` with no `stat`, atomic write, rename or `chmod` beside it. A
+  marker that cannot be parsed, points past the end of the file, does not land
+  on a line boundary, or is tagged with a size the file never reached
+  (interrupted write, a recreated file, tampering) is ignored and the queue is
+  read from byte zero — safe, never lossy in the direction of skipping unsent
+  events; any path that resets or replaces the file deletes the marker rather
+  than leaving a stale offset beside it. Live entries are now
+  held in an `ArraySlice` rather than an `Array`, so dropping the head no
+  longer shifts the remaining elements.
+- **`EventStore`** now falls back to memory-only queueing after 3 consecutive
+  disk write failures (full volume, read-only container, deleted directory),
+  instead of logging and retrying a failing write on every `track()`/
+  `record()`. Re-probes the disk every 100 appends (or on an explicit
+  `compact()`) and resumes disk-backed queueing automatically once a write
+  succeeds again.
+- **`EventStore`** now refuses to load a queue file larger than 64 MiB
+  (`EventStore.defaultMaxLoadBytes`), discarding it and starting empty rather
+  than paying that much RSS on a launch path — such a file is corruption or
+  an unbounded-growth bug, not a plausible backlog.
+- **`EventStore`** cap-drop warnings are now rate-limited (first drop, then
+  every 1,000 after) instead of logging once per dropped event.
+- **`EventStore`**'s queue directory is now excluded from backups
+  (`isExcludedFromBackup`), set once per process. Everything in the queue is
+  disposable analytics, including a hashed `userId` for an install that has
+  not yet flushed.
+- **`StatsClient`**'s `seq` counter is now cached in the actor and persisted
+  once per drain, immediately before the records are handed to the
+  dispatcher — instead of being read from and written to `UserDefaults` on
+  every single `track()`/`record()` call (an XPC round-trip to `cfprefsd`
+  each time). A crash between the in-memory increment and the hand-off can
+  only lose a `seq` number, never repeat one (§2.2).
+- **`StatsClient`** closes a race where a `setConsent()` revocation or
+  `setEnabled(false)` landing while a drain was already suspended handing
+  records to the dispatcher could leave those records enqueued under a
+  revoked identity; the drain now detects the race (`discardGeneration`) and
+  discards again.
+- **`StatsClient`**'s identity-store fallback no longer calls
+  `preconditionFailure` on an (unreachable in practice) missing store; it
+  logs an error and reopens the store instead — a library should not be able
+  to crash the host app.
+- Cloudflare Worker: a D1 failure that is about the **size** of what was
+  asked to be stored (e.g. `string or blob too big`) is now mapped to **413**
+  (re-split, per schema §7) rather than folded into the **400** used for
+  data-shaped failures (wrong type, `NOT NULL`, `CHECK` constraint) — a 400 is
+  a permanent drop, and a batch D1 refused only for being large would
+  previously be thrown away when re-splitting it would have worked.
+- Cloudflare Worker: post-response work (the success/duplicate log lines, the
+  `props`-adjustment log, and the request-body cancel on an early rejection)
+  now runs under `ctx.waitUntil` instead of being awaited on the request's
+  critical path — the `202` is returned as soon as `db.batch()` commits.
+- `backends/cloudflare/README.md` and the ingest conformance checklist updated
+  to describe the above: `HEAD` routing, the 413-vs-400 split, the
+  `ctx.waitUntil` deferral, and the read/write rate-limit split.
+
+### Fixed
+- A client crash in the window between a batch being accepted (202) and its
+  local queue marker being written could replay that batch under a *fresh*
+  `batchId`, which `batchId` dedupe cannot catch; with the Worker's per-event
+  idempotency above, such a replay is now stored once.
+- (see the `EventStore` and Cloudflare Worker items above — the O(n²) queue
+  drain, the per-event disk-failure log spam, the 400-instead-of-413
+  mis-mapping, and the missing `HEAD` route were all bugs, not just
+  performance or documentation changes)
+
 ## [0.1.0] — 2026-08-17
 
 First tagged release: wire schema `v1`, the `Stats` core emitter, the
@@ -235,5 +413,6 @@ A pre-release audit pass, all of it behavior-preserving on the wire — `v1` in
   app id (an app plus an extension, say) would interleave `seq` and overwrite
   each other's queue file — there is no file locking in v1.
 
-[Unreleased]: https://github.com/awizemann/swift-stats/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/awizemann/swift-stats/compare/0.2.0...HEAD
+[0.2.0]: https://github.com/awizemann/swift-stats/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/awizemann/swift-stats/releases/tag/0.1.0

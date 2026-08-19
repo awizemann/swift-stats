@@ -21,6 +21,7 @@ import {
 } from './helpers.js';
 import {
   PRE_AUTH_LIMIT_PER_WINDOW,
+  READ_LIMIT_PER_WINDOW,
   RATE_WINDOW_MS,
   checkPreAuthRate,
   countAgainst,
@@ -194,12 +195,177 @@ describe('idempotency (§6)', () => {
     expect(await eventCount()).toBe(2);
   });
 
-  it('does not dedupe by (installId, seq)', async () => {
-    // §6: a legitimate reinstall restarts `seq` at 0, so two different batches
-    // with the same (installId, seq) are two real events.
+  it('dedupes per install, so a reinstall\'s restarted seq is still two events', async () => {
+    // §2.2's reinstall caveat, which is why the identity key carries
+    // `install_id`: a reinstall restarts `seq` at 0 but under a NEW install
+    // UUID, so (project_id, install_id, seq) does not collide and both events
+    // are stored.
     await post(makeBatch({ batchId: batchId(9003), events: [makeEvent({ seq: 0 })] }));
-    await post(makeBatch({ batchId: batchId(9004), events: [makeEvent({ seq: 0 })] }));
+    await post(
+      makeBatch({ batchId: batchId(9004), events: [makeEvent({ seq: 0, installId: INSTALLS.b })] }),
+    );
     expect(await eventCount()).toBe(2);
+  });
+
+  it('dedupes per project, so two tenants cannot collide on (installId, seq)', async () => {
+    await post(makeBatch({ batchId: batchId(9006), events: [makeEvent({ seq: 7 })] }));
+    const other = await post(
+      makeBatch({ batchId: batchId(9007), events: [makeEvent({ seq: 7, projectId: null })] }),
+      { key: OTHER_WRITE_KEY },
+    );
+    expect(other.status).toBe(202);
+    expect(await eventCount()).toBe(2);
+  });
+});
+
+/**
+ * Per-event idempotency — migration 0003.
+ *
+ * The gap batch-level dedupe cannot close: the emitter is 202'd, crashes before
+ * its local queue marker is written, and replays the SAME events under a FRESH
+ * `batchId` (§6 requires a reconstructed batch get a new id). Two `batchId`s,
+ * one set of events, and rollups that are kept indefinitely double-counting
+ * them. The UNIQUE index on (project_id, install_id, seq) is what catches it.
+ */
+describe('per-event idempotency (migration 0003)', () => {
+  const eventsFor = (seqs: number[], installId?: string) =>
+    seqs.map((seq) => makeEvent({ seq, installId }));
+
+  async function storedSeqs(installId?: string): Promise<number[]> {
+    const { results } = await DB.prepare(
+      `SELECT seq FROM events WHERE install_id = ?1 ORDER BY seq`,
+    )
+      .bind(installId ?? INSTALLS.a)
+      .all<{ seq: number }>();
+    return results.map((r) => r.seq);
+  }
+
+  it('202s a replay under a fresh batchId and stores each event exactly once', async () => {
+    const events = eventsFor([0, 1, 2]);
+    expect((await post(makeBatch({ batchId: batchId(9101), events }))).status).toBe(202);
+
+    const replay = await post(makeBatch({ batchId: batchId(9102), events }));
+    // Not the §6 `duplicate` path — this is a genuinely new batch row whose
+    // events happen to all be already-stored. 202 either way, and `accepted`
+    // still names the events in the batch so the emitter drops them.
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toMatchObject({ accepted: 3 });
+
+    expect(await eventCount()).toBe(3);
+    expect(await storedSeqs()).toEqual([0, 1, 2]);
+    // The batch row for the replay still committed: the batches table is the
+    // §6 ledger of deliveries, not of events.
+    const batches = await DB.prepare(`SELECT COUNT(*) AS n FROM batches`).first<{ n: number }>();
+    expect(batches?.n).toBe(2);
+  });
+
+  it('stores only the new seqs of a partially overlapping replay', async () => {
+    await post(makeBatch({ batchId: batchId(9103), events: eventsFor([10, 11, 12]) }));
+    const overlap = await post(
+      makeBatch({ batchId: batchId(9104), events: eventsFor([11, 12, 13, 14]) }),
+    );
+    expect(overlap.status).toBe(202);
+    expect(await overlap.json()).toMatchObject({ accepted: 4 });
+    expect(await storedSeqs()).toEqual([10, 11, 12, 13, 14]);
+  });
+
+  it('keeps the FIRST delivery of a (installId, seq), not the replay', async () => {
+    await post(
+      makeBatch({
+        batchId: batchId(9105),
+        events: [makeEvent({ seq: 5, name: 'project_opened' })],
+      }),
+    );
+    await post(
+      makeBatch({ batchId: batchId(9106), events: [makeEvent({ seq: 5, name: 'token_verified' })] }),
+    );
+    const row = await DB.prepare(`SELECT name FROM events WHERE seq = 5`).first<{ name: string }>();
+    expect(row?.name).toBe('project_opened');
+    expect(await eventCount()).toBe(1);
+  });
+
+  it('does not dedupe under denied `identity` consent (§11 ephemeral install ids)', async () => {
+    // §11: with `identity` denied the emitter uses a fresh random install id
+    // PER SESSION, and `seq` is monotonic within each. Two sessions therefore
+    // both start near 0 with identical event shapes — and must both be stored,
+    // because the `install_id` differs. This is the case that would silently
+    // lose the most data if the key omitted `install_id`.
+    const sessionA = 'c'.repeat(64);
+    const sessionB = 'd'.repeat(64);
+    await post(makeBatch({ batchId: batchId(9107), events: eventsFor([0, 1], sessionA) }));
+    const second = await post(
+      makeBatch({ batchId: batchId(9108), events: eventsFor([0, 1], sessionB) }),
+    );
+    expect(second.status).toBe(202);
+    expect(await eventCount()).toBe(4);
+    expect(await storedSeqs(sessionA)).toEqual([0, 1]);
+    expect(await storedSeqs(sessionB)).toEqual([0, 1]);
+  });
+
+  it('logs events_deduped after the response, with counts and nothing person-scale', async () => {
+    await post(makeBatch({ batchId: batchId(9109), events: eventsFor([20, 21]) }));
+
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    };
+    try {
+      const request = ingestRequest(
+        makeBatch({ batchId: batchId(9110), events: eventsFor([20, 21, 22]) }),
+      );
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env as never, ctx);
+      expect(response.status).toBe(202);
+      await waitOnExecutionContext(ctx);
+    } finally {
+      console.log = realLog;
+    }
+
+    const deduped = lines.filter((l) => l.includes('events_deduped'));
+    expect(deduped.length).toBe(1);
+    expect(JSON.parse(deduped[0] as string)).toMatchObject({
+      level: 'info',
+      event: 'events_deduped',
+      projectId: PROJECT,
+      events: 3,
+      deduped: 2,
+    });
+    // §13 / src/log.ts: no installId, no seq, no name, no body.
+    expect(deduped[0]).not.toContain(INSTALLS.a);
+    expect(deduped[0]).not.toContain('project_opened');
+  });
+
+  it('does not log events_deduped when nothing was deduped', async () => {
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    };
+    try {
+      const request = ingestRequest(makeBatch({ batchId: batchId(9111), events: eventsFor([30]) }));
+      const ctx = createExecutionContext();
+      await worker.fetch(request, env as never, ctx);
+      await waitOnExecutionContext(ctx);
+    } finally {
+      console.log = realLog;
+    }
+    expect(lines.filter((l) => l.includes('events_deduped'))).toEqual([]);
+    expect(lines.filter((l) => l.includes('batch_accepted')).length).toBe(1);
+  });
+
+  it('still rejects a data-shaped failure rather than silently ignoring the row', async () => {
+    // `ON CONFLICT … DO NOTHING` is deliberately narrower than `INSERT OR
+    // IGNORE`, which would also swallow a NOT NULL / STRICT datatype failure —
+    // the failures the handler answers 400 for. A duplicate `batchId` is the
+    // only conflict that may abort the batch.
+    const id = batchId(9112);
+    await post(makeBatch({ batchId: id, events: eventsFor([40]) }));
+    const dupe = await post(makeBatch({ batchId: id, events: eventsFor([41]) }));
+    expect(dupe.status).toBe(202);
+    expect(await dupe.json()).toMatchObject({ duplicate: true });
+    // The whole batch aborted on the batches PK, so seq 41 was NOT written.
+    expect(await storedSeqs()).toEqual([40]);
   });
 });
 
@@ -494,8 +660,13 @@ describe('things a backend MUST NOT reject', () => {
   it('accepts reserved auto-event names', async () => {
     // §12 reserves them against the APP, not the backend: the emitter's
     // auto-events legitimately carry them and must be stored.
-    for (const name of ['app_open', 'app_background', 'session_start', 'session_end']) {
-      const response = await post(makeBatch({ batchId: batchId(), events: [makeEvent({ name })] }));
+    // Distinct `seq` per event: they are four different events of one install,
+    // and (project_id, install_id, seq) is UNIQUE since migration 0003.
+    const names = ['app_open', 'app_background', 'session_start', 'session_end'];
+    for (const [i, name] of names.entries()) {
+      const response = await post(
+        makeBatch({ batchId: batchId(), events: [makeEvent({ name, seq: i })] }),
+      );
       expect(response.status).toBe(202);
     }
     expect(await eventCount()).toBe(4);
@@ -792,6 +963,263 @@ describe('rate limiting (§7 429, §8.3 429)', () => {
       expect(response.headers.get('retry-after'), path).not.toBeNull();
       expect(await response.json()).toMatchObject({ error: 'rate_limited' });
     }
+
+    resetRateLimiter();
+  });
+});
+
+describe('post-response side effects run under ctx.waitUntil', () => {
+  /**
+   * §7 makes the 202 a durability signal, so nothing that is not durability may
+   * sit between the D1 commit and the response. The success log is therefore
+   * scheduled with `ctx.waitUntil` (see `deferLog` in src/log.ts) — which also
+   * means it must still RUN, rather than being dropped when the response is
+   * returned. `waitOnExecutionContext` is exactly the assertion that it did.
+   */
+  it('logs batch_accepted after the response, and the line carries nothing person-scale', async () => {
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    };
+    try {
+      const request = ingestRequest(makeBatch({ events: [makeEvent({ userId: 'u-1' })] }));
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(request, env as never, ctx);
+      expect(response.status).toBe(202);
+      // The deferred work is only guaranteed to have run once the context drains.
+      await waitOnExecutionContext(ctx);
+    } finally {
+      console.log = realLog;
+    }
+
+    const accepted = lines.filter((l) => l.includes('batch_accepted'));
+    expect(accepted.length).toBe(1);
+    const line = JSON.parse(accepted[0] as string) as Record<string, unknown>;
+    expect(line).toMatchObject({ level: 'info', event: 'batch_accepted', projectId: PROJECT, events: 1 });
+    // §13 / src/log.ts: no installId, sessionId, userId, prop or key ever.
+    expect(accepted[0]).not.toContain(INSTALLS.a);
+    expect(accepted[0]).not.toContain('u-1');
+    expect(accepted[0]).not.toContain(WRITE_KEY);
+  });
+});
+
+describe('storage failures map to the status §7 defines for them', () => {
+  /**
+   * The three outcomes must stay distinct, because §7 makes each of them mean
+   * something different to the emitter:
+   *
+   *   too big      -> 413, RE-SPLIT with new batchIds (data survives)
+   *   wrong shape  -> 400, DROP (it will never become valid)
+   *   anything else-> 5xx, RETAIN and retry (the database, not the data)
+   *
+   * Folding "too big" into the 400 — which is what the code used to do — turns a
+   * batch that a smaller split would have stored into a permanent drop.
+   */
+  function envWhoseBatchThrows(message: string): { DB: D1Database } {
+    // Everything except `batch()` is the real D1, so `resolveKey` and the
+    // duplicate-check SELECT still behave exactly as in production.
+    const db = new Proxy(DB, {
+      get(target, prop, receiver) {
+        if (prop === 'batch') {
+          return async () => {
+            throw new Error(message);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    return { DB: db as D1Database };
+  }
+
+  async function postTo(env2: { DB: D1Database }): Promise<Response> {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(ingestRequest(makeBatch()), env2 as never, ctx);
+    await waitOnExecutionContext(ctx);
+    return response;
+  }
+
+  it('413s a size failure so the emitter re-splits instead of dropping', async () => {
+    const response = await postTo(envWhoseBatchThrows('D1_ERROR: string or blob too big'));
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ error: 'payload_too_large' });
+    expect(await eventCount()).toBe(0);
+  });
+
+  it('413s SQLITE_TOOBIG the same way', async () => {
+    const response = await postTo(envWhoseBatchThrows('D1_ERROR: SQLITE_TOOBIG: string or blob too big'));
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ error: 'payload_too_large' });
+    expect(await eventCount()).toBe(0);
+  });
+
+  it('503s a platform "too large" message that is not about storage, so a single event is retried rather than dropped', async () => {
+    // A Workers response-size or subrequest-limit fault can say "too large" or
+    // "exceeds the limit" without D1 having refused to STORE anything. §7 makes
+    // 413 mean "re-split with new batchIds", and for a single event there is
+    // nowhere smaller to split to — the emitter drops it permanently. That is
+    // the wrong side to err on for a fault that a plain retry could recover
+    // from, so this must land on 503 (retain), not 413 (permanently drop).
+    const response = await postTo(
+      envWhoseBatchThrows('Error: Response exceeds the limit for a single Worker invocation'),
+    );
+    expect(response.status).toBe(503);
+    expect(response.headers.get('retry-after')).not.toBeNull();
+    expect(await response.json()).toMatchObject({ error: 'internal_error' });
+  });
+
+  it('400s a data-shaped failure, which no retry can fix', async () => {
+    const response = await postTo(envWhoseBatchThrows('D1_ERROR: datatype mismatch'));
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: 'invalid_event' });
+  });
+
+  it('503s an unrecognized failure, so a transient fault RETAINS the batch', async () => {
+    // The critical direction: a database that is merely unwell must never look
+    // like a permanent 4xx, or a healthy batch is dropped for good.
+    const response = await postTo(envWhoseBatchThrows('Network connection lost'));
+    expect(response.status).toBe(503);
+    expect(response.headers.get('retry-after')).not.toBeNull();
+    expect(await response.json()).toMatchObject({ error: 'internal_error' });
+  });
+
+  it('never echoes the request body in an error response (§7)', async () => {
+    const response = await postTo(envWhoseBatchThrows('Network connection lost'));
+    const text = await response.text();
+    expect(text).not.toContain(INSTALLS.a);
+    expect(text).not.toContain('com.wizemann.Overwatch');
+  });
+
+  it('503s when the duplicate-check SELECT itself throws, instead of escaping as a bare 500', async () => {
+    // `batch()` fails, and the handler's own duplicate-detection SELECT — asking
+    // "did this batchId already commit?" — is itself a D1 call made against a
+    // database we already know just failed. If D1 is actually down rather than
+    // merely rejecting this one batch, that SELECT throws too. Unguarded, that
+    // throw would escape the whole catch block as a generic uncaught error
+    // with no status mapping and no `retry-after`, instead of the 503 §7 wants
+    // for "the database, not the data".
+    const db = new Proxy(DB, {
+      get(target, prop, receiver) {
+        if (prop === 'batch') {
+          return async () => {
+            throw new Error('Network connection lost');
+          };
+        }
+        if (prop === 'prepare') {
+          return (sql: string) => {
+            if (sql.includes('FROM batches WHERE')) {
+              return {
+                bind: () => ({
+                  first: async () => {
+                    throw new Error('Network connection lost');
+                  },
+                }),
+              };
+            }
+            return (Reflect.get(target, prop, receiver) as typeof target.prepare).call(target, sql);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const response = await postTo({ DB: db as D1Database });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('retry-after')).not.toBeNull();
+    expect(await response.json()).toMatchObject({ error: 'internal_error' });
+  });
+});
+
+describe('the largest batch §5 permits (100 events x 32 props)', () => {
+  it('ingests in one D1 batch — 102 statements, 19 bound params at most', async () => {
+    // D1 caps BOUND PARAMETERS PER STATEMENT (100), not statements per batch;
+    // the widest statement here is the context row at 19, and each event insert
+    // binds 12. This is the shape that would find a platform limit if one moved,
+    // and it is also the largest body §5 allows through, so it pins both.
+    const props: Record<string, string> = {};
+    for (let i = 0; i < 32; i += 1) props[`prop_${i.toString().padStart(2, '0')}`] = 'v'.repeat(60);
+    const events = Array.from({ length: 100 }, (_, i) => makeEvent({ seq: i, props }));
+    const body = makeBatch({ events });
+
+    // The fixture must stay a LEGAL batch, or the assertion below proves nothing.
+    expect(new TextEncoder().encode(JSON.stringify(body)).byteLength).toBeLessThan(262_144);
+
+    const response = await post(body);
+    expect(response.status).toBe(202);
+    expect(await eventCount()).toBe(100);
+
+    const row = await DB.prepare(`SELECT props FROM events LIMIT 1`).first<{ props: string }>();
+    expect(Object.keys(JSON.parse(row?.props ?? '{}') as object).length).toBe(32);
+  });
+});
+
+describe('HEAD and method routing', () => {
+  async function fetchMethod(path: string, method: string, headers: Record<string, string> = {}) {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request(`https://stats.example.com${path}`, { method, headers }),
+      env as never,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    return response;
+  }
+
+  it('answers HEAD on /health, which an uptime check uses', async () => {
+    // workerd does NOT synthesize HEAD from GET — it arrives as `method: HEAD`
+    // — so this used to be a 405 for every uptime checker that defaults to HEAD.
+    expect((await fetchMethod('/health', 'HEAD')).status).toBe(200);
+    expect((await fetchMethod('/health', 'GET')).status).toBe(200);
+  });
+
+  it('answers HEAD on the read endpoints, which are safe and idempotent (§8)', async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const response = await fetchMethod(
+      `/v1/summary?projectId=${PROJECT}&from=${day}&to=${day}`,
+      'HEAD',
+      { 'x-stats-read-key': READ_KEY },
+    );
+    expect(response.status).toBe(200);
+  });
+
+  it('405s a write method on a read path, and on /health', async () => {
+    expect((await fetchMethod('/v1/summary', 'POST')).status).toBe(405);
+    expect((await fetchMethod('/health', 'POST')).status).toBe(405);
+    expect((await fetchMethod('/v1/events', 'HEAD')).status).toBe(405);
+  });
+});
+
+describe('the read limiter is tighter than the ingest limiter', () => {
+  it('429s a read key past READ_LIMIT_PER_WINDOW, well below the ingest ceiling', async () => {
+    // A read key is one dashboard (§8 forbids embedding it in an app); a write
+    // key is a whole fleet. One number cannot be right for both, and the tighter
+    // one must be the read one.
+    expect(READ_LIMIT_PER_WINDOW).toBeLessThan(PRE_AUTH_LIMIT_PER_WINDOW);
+    resetRateLimiter();
+    const nowMs = Date.now();
+    for (let i = 0; i < READ_LIMIT_PER_WINDOW; i += 1) {
+      await checkPreAuthRate(READ_KEY, nowMs, READ_LIMIT_PER_WINDOW);
+    }
+
+    const day = new Date().toISOString().slice(0, 10);
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      readRequest('/v1/summary', { projectId: PROJECT, from: day, to: day }, READ_KEY),
+      env as never,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(429);
+
+    // The same count on a WRITE key is nowhere near its ceiling: ingest keeps the
+    // generous number, so a popular app's fleet is not 429'd for being popular.
+    resetRateLimiter();
+    for (let i = 0; i < READ_LIMIT_PER_WINDOW; i += 1) {
+      await checkPreAuthRate(WRITE_KEY, nowMs);
+    }
+    expect((await post(makeBatch())).status).toBe(202);
 
     resetRateLimiter();
   });

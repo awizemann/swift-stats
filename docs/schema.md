@@ -132,8 +132,9 @@ reset only by `reset()`, §9). Its purpose is ordering and gap detection:
 - `seq` MUST be strictly increasing in the order events were tracked. Within a
   batch, `events` SHOULD be ordered by ascending `seq`; a backend MUST NOT rely
   on that ordering and MUST NOT reject an out-of-order batch.
-- A backend MUST NOT treat `seq` as an idempotency key (a reinstall restarts at
-  0). Idempotency is `batchId`, §6.
+- A backend MUST NOT treat `seq` alone as an idempotency key (a reinstall
+  restarts at 0); it is one only in combination with `installId`, which a
+  reinstall changes. Idempotency is `batchId`, §6.
 
 ### 2.3 `props`
 
@@ -345,9 +346,16 @@ delivery — a duplicate is a success, not an error. Dedupe MAY be probabilistic
 If an emitter re-splits a batch (e.g. after a 413), the resulting batches are
 new batches and MUST get new `batchId`s.
 
-Deduplication is per `batchId` only. A backend MUST NOT attempt to dedupe
-individual events by `(installId, seq)`, because a legitimate reinstall
-restarts `seq` at 0.
+Deduplication above is per `batchId`. In addition, a backend SHOULD treat
+`(projectId, installId, seq)` as a per-event idempotency key and store at most
+one event per triple, keeping the first delivery. `batchId` dedupe alone cannot
+catch an emitter that is acknowledged, crashes before its queue marker is
+durable, and re-sends the same events in a batch with a new `batchId`; §2.2
+makes `seq` strictly increasing per `installId`, so the triple names one event.
+A reinstall restarting `seq` at 0 does not collide, because it also starts a new
+`installId` — and per §11 a per-session ephemeral `installId` gives each session
+its own `seq` space. A backend MUST NOT dedupe on `seq` without `installId`, and
+MUST NOT dedupe across `projectId`s.
 
 ## 7. Ingest contract — `POST /v1/events`
 

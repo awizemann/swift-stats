@@ -15,6 +15,9 @@ GET  /health           (none)
 cron 10 2 * * *        roll up closed days, then delete raw events past 90 days
 ```
 
+`HEAD` is accepted wherever `GET` is (workerd does not synthesize it, so it is
+routed explicitly); every other method on a path is **405** with `Allow`.
+
 ---
 
 ## 1. What it stores and where
@@ -279,11 +282,27 @@ per-isolate `Map` and throws a 429 with `Retry-After` past the limit:
 
 | Bucket | Limit | Where |
 |---|---|---|
-| SHA-256 of the presented key | 600/min | **pre-auth**, on `/v1/events`, `/v1/summary`, `/v1/events/top` |
+| SHA-256 of the presented **write** key | 600/min | **pre-auth**, on `/v1/events` |
+| SHA-256 of the presented **read** key | 120/min | **pre-auth**, on `/v1/summary`, `/v1/events/top` |
 | `projectId` | 600/min | post-auth, on `/v1/events` |
-| `anonymous` (no key, or one of impossible length) | 600/min | pre-auth, all three |
+| `anonymous` (no key, or one of impossible length) | 600/min | pre-auth, all four paths |
 
-Two properties, both load-bearing:
+The read number is six times tighter than the ingest number on purpose: a read
+key is **one dashboard or one script** (§8 forbids embedding it in a shipped
+app), while a write key is a whole **fleet** — every install of an app presents
+the same one. A number chosen as though the ingest bucket were per-device would
+429 a popular app's honest traffic, and since §7 makes a 429 RETAIN, that turns
+steady traffic into a retry backlog that never drains. Erring high on ingest
+costs only that an abusive caller gets more cheap 401s out of one isolate.
+
+Three properties, all load-bearing:
+
+- **The numbers are advisory, not a global ceiling.** The counters are a
+  module-scope `Map` in *one isolate*. Cloudflare runs many isolates per colo and
+  many colos, and recycles them at will, so the effective global limit is this
+  number times an unknown, time-varying number of isolates, and an eviction
+  resets a window to zero. Nothing may be built on this being exact — see
+  `ADOPTION.md` for the global options and why none of them is implemented here.
 
 - **The bucket key is never the IP.** §13 forbids storing or logging the client
   IP or anything derived from it, and a `Map` keyed on `CF-Connecting-IP` is
@@ -294,7 +313,8 @@ Two properties, both load-bearing:
   after it would hand a key-guessing loop one free storage read per attempt.
 
 It is deliberately *not* the real limit: an isolate is not a global counter, so a
-client spread across isolates sees a multiple of these numbers.
+client spread across isolates sees a multiple of these numbers. Treat it as a
+cheap backstop that costs no storage read, and the rule below as the limit.
 
 **In front of the Worker (the durable limit).** A Cloudflare Rate Limiting rule,
 global and counted at the edge. Create it once per zone —
@@ -502,6 +522,9 @@ Verified at the commit that introduced this file, by `npm test`
 - [x] Rejects with **400** a batch mixing `appId` or `installId` or supplying more
       than one `projectId`, and any field violating its documented format.
 - [x] Rejects a body over 256 KiB with **413**; caps the wire body at 2 MiB.
+- [x] Answers **413** (re-split), not 400, when storage refuses a batch for its
+      SIZE; **400** only for a shape storage will never accept; **5xx** for
+      everything else, so a transient fault always RETAINS the batch.
 - [x] **Ignores unknown envelope/event/context keys**; does not extend that into `props`.
 - [x] Accepts the consent-reduced context fallbacks of §3.
 - [x] Accepts a lowercase `batchId`, uppercasing before keying the dedupe.
@@ -515,6 +538,9 @@ Verified at the commit that introduced this file, by `npm test`
 - [x] Emits `Retry-After` on **429**.
 - [x] Never echoes the request body in an error response.
 - [x] Sets no cookies and issues no redirects on the ingest path.
+- [x] Does no post-response work on the request's critical path: the 202 is
+      returned as soon as `db.batch()` commits, and logging runs under
+      `ctx.waitUntil`.
 - [x] Stores **no client IP**, no derived geography, and no identifier of its own
       invention.
 

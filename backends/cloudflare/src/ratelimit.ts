@@ -1,13 +1,26 @@
 // Per-isolate best-effort rate limiting.
 //
-// WHAT THIS IS NOT: the durable limit. A Worker isolate is one of many, it is
-// recycled at will, and its `Map` is not shared with anything — so a client that
-// spreads its requests across isolates sees a multiple of the numbers below. The
-// durable, global limit is a **Cloudflare Rate Limiting rule** in front of the
-// Worker, shipped as documented config in backends/cloudflare/README.md
-// ("Rate limiting"). This module is the cheap in-Worker backstop that costs no
-// storage read, and — importantly — the thing that lets §8.3's 429 be emitted at
-// all on the read endpoints, which previously had no limiter of any kind.
+// ADVISORY, NOT GLOBAL. Read this before you quote any number below as a limit.
+//
+// The counters live in a module-scope `Map` inside ONE Worker isolate. Cloudflare
+// runs many isolates per colo and many colos, and recycles an isolate whenever it
+// likes, so:
+//
+//   * the effective global ceiling is (this number) x (however many isolates
+//     happen to be serving that client right now) — an unknown, time-varying
+//     multiple, never the number written here;
+//   * an isolate eviction resets the window to zero;
+//   * two requests one second apart may be counted by different isolates and so
+//     not counted together at all.
+//
+// Nothing may depend on this being exact. It is a backstop that makes a runaway
+// client cheap to refuse without a storage read; the DURABLE limit is the
+// Cloudflare Rate Limiting rule in front of the Worker (README, "Rate limiting"),
+// and ADOPTION.md discusses making it global inside the Worker instead.
+//
+// What it IS: the cheap in-Worker backstop that costs no storage read, and the
+// thing that lets §8.3's 429 be emitted at all on the read endpoints, which
+// previously had no limiter of any kind.
 //
 // THE BUCKET KEY IS NEVER THE IP. §13 forbids storing or logging the client IP or
 // anything derived from it, and a `Map` keyed on `CF-Connecting-IP` is exactly
@@ -30,18 +43,42 @@ import { hashKey } from './keys.js';
 export const RATE_WINDOW_MS = 60_000;
 
 /**
- * Pre-auth ceiling per presented key per minute.
+ * Pre-auth ceiling per presented key per minute, on the INGEST path.
  *
- * Set well above what a conforming client can produce: §7 allows an emitter at
- * most one ingest request in flight, and a reader polls a dashboard. It is high
- * enough that no honest client trips it and low enough to blunt a loop.
+ * Deliberately NOT lowered, and the reason is worth writing down: on ingest the
+ * key bucket is a whole FLEET, not one client. Every install of an app presents
+ * the same write key (§7 — it ships in the binary), so this bucket counts every
+ * device of every user of that app that this isolate happens to serve. A number
+ * chosen as if it were per-device would 429 a popular app's honest traffic.
+ *
+ * The failure mode of being too low is bounded but real: §7 makes a 429 RETAIN,
+ * so no data is lost — but every 429 becomes a retry, and a limit a healthy fleet
+ * trips continuously converts steady traffic into a backlog that never drains.
+ * Being too high costs only that an abusive caller gets more cheap 401s per
+ * minute out of one isolate, which is the side to err on.
  */
 export const PRE_AUTH_LIMIT_PER_WINDOW = 600;
 
 /**
+ * Pre-auth ceiling per presented READ key per minute.
+ *
+ * Much tighter than the ingest number, because the population is different: a
+ * read key is one dashboard or one script (§8 forbids embedding it in a shipped
+ * app), not a fleet. 120/min is two requests a second sustained — far above any
+ * dashboard's polling and far below anything worth calling a scrape. It matches
+ * the read rule the README's WAF config uses, so the in-Worker backstop and the
+ * durable limit do not disagree about what "too many" means.
+ *
+ * A read 429 is only a delay for a human at a dashboard; unlike ingest there is
+ * no queue behind it that a false positive can back up.
+ */
+export const READ_LIMIT_PER_WINDOW = 120;
+
+/**
  * Post-auth ceiling per project per minute on ingest. Distinct from the above so
  * that many keys minted for one project cannot together exceed the project's
- * share by minting more keys.
+ * share by minting more keys. Equal to, not below, the per-key number for the
+ * same reason that one is what it is: the population is a fleet.
  */
 export const INGEST_LIMIT_PER_WINDOW = 600;
 
@@ -86,16 +123,27 @@ export function countAgainst(bucketKey: string, now: number, limit: number): voi
  * read per attempt, which is the expensive half of the request and the half an
  * attacker cares about making us do.
  */
-export async function checkPreAuthRate(presentedKey: string | null, now: number): Promise<void> {
+export async function checkPreAuthRate(
+  presentedKey: string | null,
+  now: number,
+  /** Per-endpoint ceiling; the read endpoints pass `READ_LIMIT_PER_WINDOW`. */
+  limit: number = PRE_AUTH_LIMIT_PER_WINDOW,
+): Promise<void> {
   // A key shape that cannot be valid does not deserve a SHA-256 either; it goes
   // in the anonymous bucket with the missing-key requests. Mirrors the length
   // gate in `resolveKey`, so the two cannot disagree about what is worth hashing.
+  //
+  // The anonymous bucket keeps the INGEST ceiling even on a read endpoint: it is
+  // shared by every keyless request to every path, so charging it the tighter
+  // read number would let keyless noise on `/v1/summary` starve keyless requests
+  // elsewhere. It is a DoS backstop, not a per-client quota — nothing legitimate
+  // lands in it, since every request without a usable key is a 401.
   if (presentedKey === null || presentedKey.length < 8 || presentedKey.length > 256) {
     countAgainst('anonymous', now, PRE_AUTH_LIMIT_PER_WINDOW);
     return;
   }
   const hash = await hashKey(presentedKey);
-  countAgainst(`key:${hash}`, now, PRE_AUTH_LIMIT_PER_WINDOW);
+  countAgainst(`key:${hash}`, now, limit);
 }
 
 /** The post-auth ingest limiter, keyed on the project the write key resolved to. */

@@ -4,7 +4,7 @@ Privacy-first usage analytics for native Apple apps. A small Swift package, zero
 dependencies, Swift 6 language mode, and a documented wire schema so the backend
 is yours to choose.
 
-> **Status: core client + schema (v0.1.0).**
+> **Status: core client + schema (v0.2.0).**
 > The wire contract in [`docs/schema.md`](docs/schema.md) is complete and stable
 > for `v1`, and the emitter (`StatsClient`, the file-backed queue, the
 > dispatcher, identity, sessions, consent) is implemented and tested. A shipping
@@ -67,7 +67,7 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
 ## Installation
 
 ```swift
-.package(url: "https://github.com/awizemann/swift-stats.git", from: "0.1.0")
+.package(url: "https://github.com/awizemann/swift-stats.git", from: "0.2.0")
 ```
 
 ```swift
@@ -114,8 +114,14 @@ let stats = try makeStats(writeKey: writeKey)
 //    to pass .none if your policy wants collect-nothing-until-asked.
 await stats.setConsent([.usage, .diagnostics])   // .identity withheld → per-session id
 
-// 3. Track. Names are snake_case; props are flat and never carry user text.
-await stats.track("project_opened", props: ["section": "analytics", "cached": true])
+// 3. Record. Names are snake_case; props are flat and never carry user text.
+//    `record()` is not async: it never suspends the caller, so it is safe in a
+//    button action or a view body with no Task wrapper at all.
+stats.record("project_opened", props: ["section": "analytics", "cached": true])
+
+//    Use `await track()` when you need the event to be ON DISK before you
+//    continue — the same call, minus the fire-and-forget.
+await stats.track("checkout_completed")
 
 // 4. Drive sessions and the background flush from your scene phase — the SDK
 //    installs no AppKit/UIKit observers of its own (see "Consumer checklist").
@@ -128,8 +134,26 @@ await stats.setEnabled(false)    // no capture, queue cleared, remembered
 await stats.reset()              // new install id, seq back to 0, new session
 ```
 
-`track()` returns once the event is **on disk**, not once it is sent — a queued
-event survives a kill. `identify(userID:)` is opt-in, hashed with your salt
+### `record()` or `track()`?
+
+Both validate the name, sanitize the props, respect consent and the opt-out, and
+preserve call order — including relative to each other, from the same caller.
+They differ in one thing, durability:
+
+- **`record(_:props:)`** is `nonisolated` and non-`async`. It hands the event to
+  the actor through a lock-protected buffer and returns immediately: no
+  suspension, no actor hop, no `Task { }` at the call site, and the timestamp is
+  taken at the call rather than whenever the actor gets to it. The buffer is
+  capped at 10 000 in-flight entries; past that the newest are dropped and a
+  rate-limited error is logged. **Use this by default.**
+- **`await track(_:props:)`** returns once the event is **on disk**, not once it
+  is sent — a queued event survives a kill. Use it when you specifically need
+  that guarantee, most often right before a deliberate teardown or an operation
+  that may end the process.
+
+`flush()`, `waitForFlushes()` and `shutdown()` drain whatever `record()` has
+accepted before they do their own work, so nothing recorded is left behind; a
+test that wants only the drain can `await stats.drainRecorded()`. `identify(userID:)` is opt-in, hashed with your salt
 before it leaves the device, and most apps should never call it.
 
 ### Writing a sink
@@ -157,6 +181,7 @@ sending at all inside a backoff window, a re-split with fresh batch ids on
 
 ```swift
 nonisolated protocol UsageTracking: Sendable {          // an actor can conform
+    func record(_ name: String, props: [String: StatsValue])
     func track(_ name: String, props: [String: StatsValue]) async
 }
 
@@ -224,6 +249,72 @@ func printLastMonth(readKey: String) async throws {
 `CloudflareSink` is the `StatsSink` for it — HTTPS-only, no cookies, redirects
 refused, uncompressed, and mapping every §7 status onto the right `SinkOutcome`.
 See the quick start above for how it is wired into a `StatsConfiguration`.
+
+## Storage & networking
+
+**Queue location.** The durable queue lives at
+`Application Support/<bundleId>/swift-stats/queue.jsonl`, with a small sidecar
+marker (`queue.head`) beside it. `Caches` is deliberately not used — the system
+may evict a cache at any moment, and a dropped queue is data loss.
+
+**The `queue.head` marker.** It holds one number: how many leading *bytes* of
+`queue.jsonl` are already consumed (plus the file's size when the marker was
+written, as a staleness tag). Removing a batch moves that offset instead of
+rewriting the queue file, and the file is only rewritten once the dead prefix
+has grown to the size of the live remainder. Because an append only ever grows
+the file and never moves a byte before the offset, **appending writes no marker
+at all** — `track()` costs one `write(2)` and nothing else. A marker that
+cannot be parsed, points past the end of the file, does not land on a line
+boundary, or is tagged with a size the file never reached is ignored and the
+queue is read from byte zero: the worst case is re-sending a batch that was
+already accepted, never skipping events that were not.
+
+**Excluded from backups.** The `swift-stats` directory is marked
+`isExcludedFromBackup` (via `URLResourceValues`) the first time it is created
+or confirmed each process launch. Everything in the queue is disposable
+analytics — including a hashed `userId` for an install that has not yet
+flushed — and Apple's own guidance is that regenerable or purely transient
+data should not ride along in an iCloud/iTunes backup. Best-effort: a
+filesystem that cannot express the flag logs an error and the write proceeds
+unaffected. This applies only to a directory the SDK created for itself (the
+default path above, or its temporary-directory fallback). If you pass your own
+`storageDirectory`, it is created if missing and otherwise left exactly as your
+app set it — no mode change, no backup exclusion.
+
+**Permissions.** A `swift-stats` directory the SDK creates for itself is
+created `0700`, and every file this package writes (`queue.jsonl`,
+`queue.head`) is restricted to `0600` after each write — in your own
+`storageDirectory` too — atomic writes replace the file and would otherwise
+pick up the process umask. The queue holds event names, `props`, and a hashed
+`userId`, not a secret, but on macOS another user's process can read a `0644`
+file under `~/Library/Application Support`.
+
+**Networking (`URLSessionTransport`).** The default session, built by
+`URLSessionTransport.defaultConfiguration()`, is ephemeral (no on-disk cache,
+no cookies — schema §7) with:
+
+- `timeoutIntervalForRequest = 20` — the dispatcher holds one flush slot at a
+  time (schema §5); a stalled connection must give it back before it starves
+  every later batch.
+- `timeoutIntervalForResource = 60` — bounds the whole exchange even when the
+  connection keeps making slow forward progress.
+- `networkServiceType = .background` — analytics never competes with the host
+  app's own traffic for bandwidth or a radio wake-up.
+- `allowsConstrainedNetworkAccess = false` — a batch is not sent at all under
+  Low Data Mode; `URLSession` surfaces that as a `URLError`, which the
+  transport already treats as a transport failure and `IngestDisposition`
+  already maps to "retain and retry later," so the batch stays queued rather
+  than silently never leaving.
+
+Both `allowsConstrainedNetworkAccess` and `allowsExpensiveNetworkAccess` are
+now parameters on `URLSessionTransport.defaultConfiguration(...)` and on
+`URLSessionTransport.init(...)`'s default-session path, so you can opt in to
+sending under Low Data Mode (or opt out of an expensive/cellular link too)
+without hand-building a `URLSessionConfiguration`.
+
+A consumer supplying a custom `URLSession` can start from the same baseline
+via `URLSessionTransport.defaultConfiguration()` rather than duplicating these
+values.
 
 ## Consumer checklist
 
@@ -306,7 +397,7 @@ backends/
                              conformance suite (npm test)
 Sources/
   Stats/                   Core emitter: value types, client, queue, dispatcher
-    StatsClient.swift        The actor: track / identify / consent / flush / reset / lifecycle
+    StatsClient.swift        The actor: record / track / identify / consent / flush / reset / lifecycle
     Dispatcher.swift         Flush triggers, batching, backoff, drop-vs-retain
     EventStore.swift         JSON-lines durable queue in Application Support
     StatsIdentityStore.swift Own UserDefaults suite: install UUID, seq, consent

@@ -5,7 +5,7 @@ import { bucketDay } from './dates.js';
 import { resolveKey } from './keys.js';
 import { checkPreAuthRate, checkProjectRate } from './ratelimit.js';
 import { MAX_BODY_BYTES, parseJsonBody, validateBatch } from './validate.js';
-import { logger } from './log.js';
+import { deferLog, logger } from './log.js';
 import type { Env } from './env.js';
 
 /**
@@ -46,7 +46,7 @@ function checkContentEncoding(header: string | null): void {
   );
 }
 
-async function readBody(request: Request): Promise<string> {
+async function readBody(request: Request, ctx: ExecutionContext): Promise<string> {
   // Trust `Content-Length` only to REJECT early, never to accept — a client can
   // understate it, or omit it entirely on a chunked request.
   const declared = request.headers.get('content-length');
@@ -84,7 +84,11 @@ async function readBody(request: Request): Promise<string> {
         // Stop pulling immediately, and tell the peer we are done with its body.
         // Without the cancel, the runtime keeps draining a stream nobody will
         // read, which is the thing the cap exists to prevent.
-        await reader.cancel().catch(() => {});
+        //
+        // `waitUntil` rather than `await`: the cancel drains what the peer is
+        // still sending, and awaiting it delays the 413 by exactly that long —
+        // while §7 wants the emitter told to re-split as soon as we know.
+        ctx.waitUntil(reader.cancel().catch(() => {}));
         throw payloadTooLarge('Body exceeds the wire limit.');
       }
       chunks.push(value);
@@ -129,17 +133,54 @@ async function readBody(request: Request): Promise<string> {
  * never data.
  *
  * The patterns are the constraint classes a STRICT schema raises for bad values:
- * an out-of-range integer, a NULL in a NOT NULL column, a failed CHECK, a bad
- * type for a STRICT column, and a string longer than SQLite will store.
+ * an out-of-range integer, a NULL in a NOT NULL column, a failed CHECK, and a
+ * bad type for a STRICT column.
  */
 function isDataShapedFailure(cause: unknown): boolean {
   const message = cause instanceof Error ? cause.message : '';
-  return /datatype mismatch|cannot store .* value|NOT NULL constraint failed|CHECK constraint failed|string or blob too big|too large|out of range/i.test(
+  return /datatype mismatch|cannot store .* value|NOT NULL constraint failed|CHECK constraint failed|out of range/i.test(
     message,
   );
 }
 
-export async function handleIngest(request: Request, env: Env, now: Date): Promise<Response> {
+/**
+ * Is this D1 failure about the SIZE of what we asked it to store?
+ *
+ * Split out of `isDataShapedFailure`, which used to fold "too big" in with
+ * "wrong type" and answer 400 for both. That was wrong in the expensive
+ * direction: §7 makes a 400 a PERMANENT DROP, so a batch that D1 refused merely
+ * for being large — the largest legal batch is 100 events × 32 props, and the
+ * statement payload for it is several times the 256 KiB body — was thrown away
+ * by the emitter when re-splitting it would have worked.
+ *
+ * 413 is the honest answer and the one §7 defines for exactly this: the emitter
+ * re-splits into smaller batches with NEW `batchId`s and retries those, and if a
+ * single event still cannot be stored it drops that one event rather than the
+ * whole batch. Neither outcome is an infinite retry loop, which is why this is
+ * not a 5xx either.
+ *
+ * The patterns are deliberately narrow — SQLite's own storage-limit messages,
+ * not a generic "too large" — because a broader match (e.g. `/too large|too
+ * big|exceeds the limit/i`) also catches platform faults that are NOT about
+ * what we asked D1 to store: a Workers response-size or subrequest-limit error
+ * can legitimately contain "exceeds the limit" or "too large" text. Classifying
+ * one of those as 413 tells the emitter to re-split and retry with a NEW
+ * `batchId`, and for a single event that has nowhere smaller to split to, §7
+ * has the emitter DROP it — permanently discarding data over a fault that a
+ * plain retry (the 503 path) would have recovered from. An unmatched message
+ * still falls through to 503, which only costs us the improvement, never data.
+ */
+function isSizeShapedFailure(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : '';
+  return /string or blob too big|SQLITE_TOOBIG|too many SQL variables/i.test(message);
+}
+
+export async function handleIngest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  now: Date,
+): Promise<Response> {
   // Order is deliberate. Cheap header checks first, then auth, then the body:
   // an unauthenticated caller never gets us to read or parse a 256 KiB body.
   //
@@ -161,7 +202,7 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
   // its share.
   checkProjectRate(scope.projectId, now.getTime());
 
-  const batch = validateBatch(parseJsonBody(await readBody(request)));
+  const batch = validateBatch(parseJsonBody(await readBody(request, ctx)));
 
   // §2.4: projectId is authoritative from the WRITE KEY. A client-asserted value
   // that disagrees is 400 — a permanent drop, so a misconfigured app fails
@@ -178,11 +219,16 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
   if (batch.propsAdjustments > 0) {
     // §2.3 adjustments degrade a property; they never fail the batch. Logged so
     // an emitter bug is visible. No prop key, value, or id is logged.
-    logger.warn('props_adjusted', {
-      projectId,
-      adjustments: batch.propsAdjustments,
-      events: batch.events.length,
-    });
+    //
+    // Deferred: it describes a batch we are about to accept, so it has no
+    // business sitting between the client and its 202.
+    deferLog(ctx, () =>
+      logger.warn('props_adjusted', {
+        projectId,
+        adjustments: batch.propsAdjustments,
+        events: batch.events.length,
+      }),
+    );
   }
 
   const receivedAt = now.toISOString();
@@ -232,10 +278,27 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
     ),
   );
 
+  // PER-EVENT idempotency, on top of the batch-level dedupe above (migration
+  // 0003). `ON CONFLICT DO NOTHING` against the UNIQUE index on
+  // (project_id, install_id, seq): a replay of already-stored events under a
+  // FRESH `batchId` — what a crash between our 202 and the emitter's queue
+  // marker produces — silently stores nothing rather than double-counting into
+  // rollups that are kept indefinitely.
+  //
+  // `ON CONFLICT (…) DO NOTHING` and not `INSERT OR IGNORE`: `OR IGNORE`
+  // suppresses EVERY constraint class on the row, including a NOT NULL or a
+  // STRICT datatype failure, which are exactly the failures the catch block
+  // below turns into an honest 400. Naming the conflict target keeps this
+  // narrow to the identity index; anything else still throws.
+  //
+  // The batch row's INSERT stays a plain INSERT, and stays first: the duplicate
+  // -`batchId` path (§6, below) depends on that statement failing the whole D1
+  // batch atomically.
   const insertEvent = env.DB.prepare(
     `INSERT INTO events (
        project_id, batch_id, day, ts, name, session_id, install_id, app_id, seq, user_id, props, is_debug
-     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)`,
+     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+     ON CONFLICT (project_id, install_id, seq) DO NOTHING`,
   );
 
   for (const e of batch.events) {
@@ -260,8 +323,20 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
     );
   }
 
+  // Index of the first event statement: the batch row, then the context row.
+  const EVENT_STATEMENTS_FROM = 2;
+
+  let deduped = 0;
   try {
-    await env.DB.batch(statements);
+    const results = await env.DB.batch(statements);
+    // How many events the identity index swallowed. D1 reports `meta.changes`
+    // per statement, and a `DO NOTHING` conflict is 0 changed rows — so the
+    // count is derivable without a second query. Defensive `?? 1`: if a D1
+    // version stops reporting `changes`, assume the row landed, so an unknown
+    // becomes an under-report of dedupes rather than a phantom alert.
+    for (let i = EVENT_STATEMENTS_FROM; i < results.length; i += 1) {
+      if ((results[i]?.meta?.changes ?? 1) === 0) deduped += 1;
+    }
   } catch (cause) {
     // Distinguish "duplicate batch" from a real fault by ASKING THE DATABASE,
     // not by matching the driver's error string — a message change in D1 must
@@ -269,17 +344,49 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
     // forever) or faults into 202s (which would lose data).
     // Scoped to the project, matching the (project_id, batch_id) primary key —
     // another tenant's row must never be able to answer this question.
-    const existing = await env.DB.prepare(
-      `SELECT 1 AS ok FROM batches WHERE project_id = ?1 AND batch_id = ?2`,
-    )
-      .bind(projectId, batch.batchId)
-      .first<{ ok: number }>();
+    //
+    // This SELECT is itself a D1 call, made while we already know D1 just
+    // failed us once. If D1 is down rather than merely rejecting this batch,
+    // the SELECT throws too — and an unguarded throw here would escape this
+    // catch block entirely, past every status check below, as a generic
+    // uncaught 500 with no `retry-after`. That is strictly worse than the 503
+    // path below: a bare 500 tells the emitter nothing about whether to retry,
+    // where 503 (§7) is the honest "retain and retry" signal. So this lookup
+    // gets its own try/catch: on failure we give up on distinguishing
+    // "duplicate" from "fault" and fall through to the 503 path, which is safe
+    // either way — a duplicate retried as 503 just gets retried again and
+    // caught by the primary key next time, not lost.
+    let existing: { ok: number } | null = null;
+    try {
+      existing = await env.DB.prepare(
+        `SELECT 1 AS ok FROM batches WHERE project_id = ?1 AND batch_id = ?2`,
+      )
+        .bind(projectId, batch.batchId)
+        .first<{ ok: number }>();
+    } catch {
+      // No `cause` here (deliberately): `logger.warn` takes no `cause` param —
+      // only `logger.error` does, via `classifyError` — and classifying two
+      // stacked D1 failures onto the same log line would be misleading anyway.
+      // The fields already say what happened; the message text stays unlogged.
+      logger.warn('duplicate_check_failed', { projectId });
+    }
 
     if (existing !== null) {
       // §6: a duplicate is a SUCCESS. 202, exactly as for a first delivery, so
       // the emitter deletes it from its queue instead of retrying forever.
-      logger.info('batch_duplicate', { projectId, events: batch.events.length });
+      deferLog(ctx, () =>
+        logger.info('batch_duplicate', { projectId, events: batch.events.length, duplicate: true }),
+      );
       return json({ accepted: batch.events.length, duplicate: true }, 202);
+    }
+
+    // Size first: §7 gives a size failure its own status (413 → re-split), and
+    // folding it into the 400 below would drop data that a smaller batch stores.
+    if (isSizeShapedFailure(cause)) {
+      logger.error('ingest_too_large_for_storage', { projectId, events: batch.events.length }, cause);
+      throw payloadTooLarge(
+        'This batch is too large for the backend to store. Re-split it into smaller batches.',
+      );
     }
 
     // A DATA-SHAPED failure is not a fault, and must not be signalled as one.
@@ -308,6 +415,21 @@ export async function handleIngest(request: Request, env: Env, now: Date): Promi
   }
 
   // 202 only now: `db.batch()` has committed, so the batch would survive the
-  // process dying (§7).
+  // process dying (§7). Nothing between that commit and this `return` may block
+  // — the success log runs after the response, under `waitUntil`.
+  deferLog(ctx, () => logger.info('batch_accepted', { projectId, events: batch.events.length }));
+  if (deduped > 0) {
+    // A replay under a fresh `batchId` (see the insert above). Counts only —
+    // no event name, no `installId`, no `seq`, no body (§7, §13). Deferred,
+    // like every other log describing an already-decided outcome.
+    deferLog(ctx, () =>
+      logger.info('events_deduped', { projectId, events: batch.events.length, deduped }),
+    );
+  }
+  // Still 202, and still `accepted: <events in the batch>`. §7's contract is
+  // about durability, not novelty: every event in this batch is stored exactly
+  // once, which is what the emitter needs in order to drop it from its queue.
+  // Reporting the de-duplicated count instead would read as partial acceptance
+  // and invite a retry of events we already hold.
   return json({ accepted: batch.events.length }, 202);
 }

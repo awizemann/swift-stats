@@ -8,7 +8,7 @@ import os
 /// `schemaVersion` names the wire format that build speaks.
 public enum Stats: Sendable {
     /// Version of this Swift package. Semver; `0.x` means the API may still move.
-    public static let sdkVersion = "0.1.0"
+    public static let sdkVersion = "0.2.0"
 
     /// Version of the wire schema in `docs/schema.md` that this SDK speaks.
     ///

@@ -44,19 +44,88 @@ public struct StatsHTTPResponse: Sendable {
 public struct URLSessionTransport: StatsTransport {
     private let session: URLSession
 
-    /// - Parameter session: defaults to an ephemeral session so nothing is
-    ///   cached to disk and no cookie store is created — `docs/schema.md` §7
-    ///   requires the endpoint set no cookies and the emitter store none.
-    public init(session: URLSession? = nil) {
+    /// A request must not pin the dispatcher's single flush slot (schema §5:
+    /// batches are sent one at a time) waiting on a connection that has
+    /// stalled — 20s is generous for a small JSON envelope over a live
+    /// connection and short enough that a stuck request gives the slot back
+    /// well before the caller's own retry/backoff would have moved on anyway.
+    public static let timeoutIntervalForRequest: TimeInterval = 20
+    /// Bounds the whole exchange, including any body upload/download, in case
+    /// a connection keeps making slow forward progress without ever going
+    /// fully idle (which is what `timeoutIntervalForRequest` catches). One
+    /// minute is still short relative to how infrequently a batch is sent.
+    public static let timeoutIntervalForResource: TimeInterval = 60
+    /// Marks analytics traffic as background-priority so it never competes
+    /// with the host app's own network requests for bandwidth or radio
+    /// wake-ups — the batch getting to the backend a little later costs
+    /// nothing, but a delayed screen load because analytics claimed the link
+    /// first would be a regression the SDK caused.
+    public static let networkServiceType: URLRequest.NetworkServiceType = .background
+    /// Declines to send analytics at all under the user's Low Data Mode /
+    /// constrained-network setting. `URLSession` surfaces a blocked request as
+    /// a `URLError` (`.notConnectedToInternet` on most platforms), which the
+    /// transport already treats as a transport failure and `IngestDisposition`
+    /// already maps to "retain and retry later" — so this setting fails
+    /// closed into the queue rather than the batch quietly never leaving.
+    public static let allowsConstrainedNetworkAccess = false
+    /// Analytics may still use an expensive link (cellular, a metered hotspot)
+    /// by default — only Low Data Mode / constrained-network settings hold it
+    /// back (see `allowsConstrainedNetworkAccess`). Pass `false` to also defer
+    /// to "expensive" network warnings if your app wants analytics to be the
+    /// first thing that backs off.
+    public static let allowsExpensiveNetworkAccess = true
+
+    /// Builds the configuration `URLSessionTransport` uses by default, so a
+    /// consumer supplying their own `URLSession` can start from the same
+    /// baseline (and a test can assert these values without duplicating them).
+    ///
+    /// Ephemeral rather than the shared/default configuration: nothing is
+    /// cached to disk and no cookie store is created — `docs/schema.md` §7
+    /// requires the endpoint set no cookies and the emitter store none.
+    ///
+    /// - Parameters:
+    ///   - allowsConstrainedNetworkAccess: under the user's Low Data Mode /
+    ///     constrained-network setting, the default (`false`) sends nothing at
+    ///     all — the batch stays in the local queue, subject to its own caps
+    ///     (oldest dropped past the cap). Pass `true` to send anyway.
+    ///   - allowsExpensiveNetworkAccess: defaults to `true` (analytics may use
+    ///     an expensive link, e.g. cellular). Pass `false` to hold back there
+    ///     too.
+    public static func defaultConfiguration(
+        allowsConstrainedNetworkAccess: Bool = Self.allowsConstrainedNetworkAccess,
+        allowsExpensiveNetworkAccess: Bool = Self.allowsExpensiveNetworkAccess
+    ) -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = timeoutIntervalForRequest
+        configuration.timeoutIntervalForResource = timeoutIntervalForResource
+        configuration.networkServiceType = networkServiceType
+        configuration.allowsConstrainedNetworkAccess = allowsConstrainedNetworkAccess
+        configuration.allowsExpensiveNetworkAccess = allowsExpensiveNetworkAccess
+        return configuration
+    }
+
+    /// - Parameters:
+    ///   - session: defaults to a session built from ``defaultConfiguration()``.
+    ///   - allowsConstrainedNetworkAccess: only consulted when `session` is
+    ///     `nil` — it feeds the default session's configuration. See
+    ///     ``defaultConfiguration(allowsConstrainedNetworkAccess:allowsExpensiveNetworkAccess:)``.
+    ///   - allowsExpensiveNetworkAccess: same caveat as above.
+    public init(
+        session: URLSession? = nil,
+        allowsConstrainedNetworkAccess: Bool = Self.allowsConstrainedNetworkAccess,
+        allowsExpensiveNetworkAccess: Bool = Self.allowsExpensiveNetworkAccess
+    ) {
         if let session {
             self.session = session
         } else {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.httpCookieAcceptPolicy = .never
-            configuration.httpShouldSetCookies = false
-            configuration.urlCache = nil
-            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(configuration: Self.defaultConfiguration(
+                allowsConstrainedNetworkAccess: allowsConstrainedNetworkAccess,
+                allowsExpensiveNetworkAccess: allowsExpensiveNetworkAccess
+            ))
         }
     }
 

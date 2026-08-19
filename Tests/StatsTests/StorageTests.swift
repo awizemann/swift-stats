@@ -180,12 +180,12 @@ struct StorageTests {
         #expect(await harness.sink.batchCount == 1)
         #expect(try mode() == 0o600, "still owner-only after the atomic rewrite")
 
-        // And the directory the SDK created for itself is owner-only too.
-        let directoryAttributes = try FileManager.default.attributesOfItem(
-            atPath: harness.directory.path
-        )
-        let directoryMode = try #require(directoryAttributes[.posixPermissions] as? NSNumber)
-        #expect(directoryMode.intValue & 0o777 == 0o700)
+        // The *directory* is deliberately not asserted here: this harness passes
+        // a `storageDirectory`, and a consumer-supplied directory is created
+        // with default attributes and otherwise left exactly as the app set it.
+        // The 0700-and-backup-excluded treatment applies only to the directory
+        // the SDK creates for itself — see `QueueFileTests`, which covers both
+        // sides of that split.
 
         await harness.tearDown()
     }

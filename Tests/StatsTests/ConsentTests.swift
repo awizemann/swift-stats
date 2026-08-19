@@ -110,7 +110,7 @@ struct ConsentTests {
         #expect(context?.screenScale == 1.0)
         #expect(context?.colorScheme == nil)
         // Always sent, whatever consent says.
-        #expect(context?.sdkVersion == "0.1.0")
+        #expect(context?.sdkVersion == "0.2.0")
         #expect(context?.appVersion == "1.4.2")
         #expect(context?.appBuild == "318")
         #expect(context?.bundleId == harness.appId)

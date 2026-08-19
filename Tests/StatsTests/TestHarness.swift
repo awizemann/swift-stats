@@ -22,7 +22,7 @@ final class Harness: Sendable {
     /// A context with fixed values, so encoding assertions do not depend on the
     /// machine running the tests. Matches the schema §4 example.
     static let exampleContext = StatsContext(
-        sdkVersion: "0.1.0",
+        sdkVersion: "0.2.0",
         appVersion: "1.4.2",
         appBuild: "318",
         bundleId: "com.wizemann.Overwatch",

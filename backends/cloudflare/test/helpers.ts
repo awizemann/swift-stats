@@ -85,6 +85,7 @@ export async function resetDatabase(): Promise<void> {
 }
 
 let uuidCounter = 0;
+let nextSeedSeq = 0;
 
 /** Deterministic, distinct, uppercase RFC 4122 UUIDs. */
 export function batchId(n?: number): string {
@@ -203,12 +204,18 @@ export async function seedEvents(
   }>,
 ): Promise<void> {
   const bid = batchId();
+  const seedSeq = nextSeedSeq;
+  nextSeedSeq += rows.length;
   await DB.prepare(
     `INSERT OR IGNORE INTO batches (batch_id, project_id, received_at, event_count) VALUES (?1, ?2, ?3, ?4)`,
   )
     .bind(bid, PROJECT, '2026-08-17T00:00:00.000Z', rows.length)
     .run();
 
+  // `seq` is drawn from a suite-global counter, never from the row index.
+  // Migration 0003 makes (project_id, install_id, seq) UNIQUE, and two
+  // `seedEvents` calls in one test both starting at 0 for the same install
+  // would collide — a fixture artefact, not the behaviour under test.
   const stmt = DB.prepare(
     `INSERT INTO events
        (project_id, batch_id, day, ts, name, session_id, install_id, app_id, seq, user_id, props, is_debug)
@@ -225,7 +232,7 @@ export async function seedEvents(
         r.name,
         r.sessionId,
         r.installId,
-        i,
+        seedSeq + i,
         r.props === undefined || r.props === null ? null : JSON.stringify(r.props),
         r.isDebug === true ? 1 : 0,
       ),
