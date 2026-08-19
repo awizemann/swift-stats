@@ -6,8 +6,8 @@ but the pages are plain Markdown you can edit with any tool.
 
 ## Page conventions
 
-- **Filenames** use dashes for spaces (`Architecture-Overview.md`).
-- **Internal links** use Markdown with the dashed name: `[Architecture Overview](Architecture-Overview)`.
+- **Filenames** use dashes for spaces (`Getting-Started.md`).
+- **Internal links** use Markdown with the dashed name: `[Getting Started](Getting-Started)`.
 - Every page **ends with** a line like `_Last updated: YYYY-MM-DD — <note>_`. Stubs use `— stub`.
 - `Home.md` is the landing page, `_Sidebar.md` is the grouped nav, `_Footer.md` is the footer.
 
