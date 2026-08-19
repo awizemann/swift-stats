@@ -40,20 +40,40 @@ You do not edit the client, but these change what your backend will see.
 
 ## 2a. SDK version drift (observability)
 
-Every batch carries `context.sdkVersion` (schema §3) and the Worker stores it
-in `batches.sdk_version`; both Swift clients also send a constant
-`User-Agent: swift-stats/<version>` (fleet-level, never per-install). The
-`batch_accepted` log line now includes `sdkVersion`, so drift is visible from
+Every batch carries `context.sdkVersion` (schema §3) and the Worker stores it in
+**`batch_context.sdk_version`** — the per-batch context row, not `batches`, which
+holds only `batch_id`, `project_id`, `received_at` and `event_count`
+(`backends/cloudflare/migrations/0001_init.sql`). Both Swift clients also send a
+constant `User-Agent: swift-stats/<version>` (fleet-level, never per-install).
+The `batch_accepted` log line now includes `sdkVersion`, so drift is visible from
 log analytics alone. For a dashboard, the durable source is D1:
 
 ```sql
 -- installs per SDK version over the last 7 days, per project
-SELECT b.project_id, b.sdk_version, COUNT(DISTINCT e.install_id) AS installs
-FROM batches b JOIN events e ON e.batch_id = b.batch_id AND e.project_id = b.project_id
-WHERE b.sent_at >= datetime('now', '-7 days')
-GROUP BY b.project_id, b.sdk_version
-ORDER BY b.project_id, installs DESC;
+SELECT c.project_id, c.sdk_version, COUNT(DISTINCT e.install_id) AS installs
+FROM batch_context c
+JOIN events e ON e.project_id = c.project_id AND e.batch_id = c.batch_id
+WHERE e.day >= date('now', '-7 days')
+GROUP BY c.project_id, c.sdk_version
+ORDER BY c.project_id, installs DESC;
 ```
+
+Three details that are easy to get wrong here:
+
+- **Join on both columns.** `batch_context` and `batches` are keyed
+  `(project_id, batch_id)`, not on `batch_id` alone — deliberately, so a
+  `batchId` colliding across two tenants cannot make one tenant's row answer for
+  the other. Joining on `batch_id` by itself would silently mix projects.
+- **Filter on `e.day`, not `c.sent_at`.** `sent_at` is a §0 ISO 8601 string
+  (`2026-08-19T12:00:00.000Z`), while `datetime('now', '-7 days')` renders as
+  `2026-08-12 12:00:00` — a different separator and no `Z`, so comparing the two
+  as strings does not mean what it looks like. `events.day` is a plain
+  `YYYY-MM-DD` that sorts correctly against `date('now', …)` and is served by the
+  `events_scope` index. Use `c.sent_at >= '<explicit ISO 8601 UTC string>'` if you
+  want the batch's own clock instead.
+- **This counts installs whose events landed in the window**, which is the
+  question worth asking (how much of the live fleet is on which SDK), not how
+  many batches carried each version.
 
 Use it to flag customers still on `< 0.2.0` (no `record()`, no byte-offset
 marker) and to gate any future schema `v2` rollout.

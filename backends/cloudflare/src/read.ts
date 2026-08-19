@@ -8,10 +8,15 @@
 // deployment) can import the same functions and cannot report a different
 // number than this endpoint does. See README §11.
 //
-// Both endpoints are safe and idempotent: nothing in this file writes.
+// Both endpoints are safe and idempotent in the §8 sense: no answer depends on
+// them and nothing client-visible changes. They are not, since migration 0004,
+// literally free of writes — each one records a coalesced `keys.last_used_at`
+// touch, scheduled with `ctx.waitUntil` so it runs after the response and cannot
+// slow a read down. That touch is the ONLY write on this path; every number
+// still comes from `./lib/queries.js`.
 
 import { json, unauthorized } from './errors.js';
-import { requireScope, resolveKey, type KeyScope } from './keys.js';
+import { requireScope, resolveKey, touchKey, type KeyScope } from './keys.js';
 import { checkPreAuthRate, READ_LIMIT_PER_WINDOW } from './ratelimit.js';
 import { SCHEMA_VERSION } from './validate.js';
 import { logger } from './log.js';
@@ -81,7 +86,12 @@ function envelope(range: ResolvedRange) {
 // GET /v1/summary
 // -----------------------------------------------------------------------------
 
-export async function handleSummary(request: Request, env: Env, now: Date): Promise<Response> {
+export async function handleSummary(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  now: Date,
+): Promise<Response> {
   const url = new URL(request.url);
   const presentedKey = request.headers.get('x-stats-read-key');
   // Pre-auth, keyed on SHA-256 of the presented key, never the IP (§13). §8.3
@@ -93,6 +103,15 @@ export async function handleSummary(request: Request, env: Env, now: Date): Prom
   // `ratelimit.ts` — and note that the limiter is per-isolate and advisory.
   await checkPreAuthRate(presentedKey, now.getTime(), READ_LIMIT_PER_WINDOW);
   const scope = await resolveKey(env.DB, presentedKey, 'read');
+  // The one write on a read path (0004): a coalesced `keys.last_used_at` touch,
+  // at most once per minute per key. It is invisible in the response and changes
+  // no answer, so both endpoints stay safe and idempotent in the §8 sense — what
+  // it costs is the flat claim "no writes", which the README now states as it is.
+  //
+  // `waitUntil`, not `await`: a diagnostic timestamp has no business adding a D1
+  // round-trip to the latency of a dashboard query. `touchKey` never throws, so
+  // nothing scheduled here can fail a read that already succeeded.
+  ctx.waitUntil(touchKey(env.DB, scope, now));
   const range = await readRange(url, env, scope, now);
 
   const rows = await summaryRows(env.DB, range);
@@ -110,11 +129,18 @@ export async function handleSummary(request: Request, env: Env, now: Date): Prom
 // GET /v1/events/top
 // -----------------------------------------------------------------------------
 
-export async function handleTopEvents(request: Request, env: Env, now: Date): Promise<Response> {
+export async function handleTopEvents(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  now: Date,
+): Promise<Response> {
   const url = new URL(request.url);
   const presentedKey = request.headers.get('x-stats-read-key');
   await checkPreAuthRate(presentedKey, now.getTime(), READ_LIMIT_PER_WINDOW);
   const scope = await resolveKey(env.DB, presentedKey, 'read');
+  // See `handleSummary`: deferred so it never sits in front of the response.
+  ctx.waitUntil(touchKey(env.DB, scope, now));
   const range = await readRange(url, env, scope, now);
   const limit = parseLimit(url.searchParams.get('limit'));
 

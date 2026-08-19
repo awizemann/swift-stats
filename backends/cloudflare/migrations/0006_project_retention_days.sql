@@ -1,0 +1,51 @@
+-- swift-stats Cloudflare/D1 backend — migration 0006.
+--
+-- `projects.retention_days`: how long THIS project keeps raw event rows.
+--
+-- Until now the retention window was one constant compiled into the Worker
+-- (`RAW_RETENTION_DAYS = 90` in src/dates.ts), which made the sweep a single
+-- global `DELETE FROM events WHERE day < cutoff`. That is the right default and a
+-- deliberately conservative one, but it is not a policy a per-project deployment
+-- can hold: two projects in one database cannot want different windows, and the
+-- only way to give one of them a longer one was to redeploy the Worker and
+-- silently give it to everybody — including projects whose §14 disclosure said 90
+-- days.
+--
+-- So the window becomes a per-project column and the sweep becomes per-project.
+-- The bounds are not arbitrary:
+--
+--   * DEFAULT and MINIMUM 90. 90 is what §13/README §4 document, what every
+--     existing project has been running under, and what the SDK's own disclosure
+--     guidance assumes. It is a minimum rather than a floor-by-convention because
+--     a shorter window would break a promise the read layer makes in the other
+--     direction: `bucketDay` clamps an implausibly old `ts` onto the oldest
+--     surviving day, and reads route days at the same boundary, so shrinking the
+--     window is not a storage tweak — it deletes history that reads would still
+--     have served.
+--   * MAXIMUM 400, which is `MAX_RANGE_DAYS`. A read request may span at most 400
+--     days (§8.1), so raw rows kept beyond that could never be reached by a read
+--     as raw rows anyway — they would only be a bill. Keeping the two numbers
+--     equal means "raw retention" and "the longest answerable range" cannot drift
+--     into a combination where one silently makes the other meaningless.
+--
+-- The bounds are enforced in code (`clampRetentionDays` in src/dates.ts, applied
+-- on every read of this column, and the admin CLI refuses to write outside them)
+-- rather than as a CHECK constraint: SQLite cannot add a CHECK to an existing
+-- table without rebuilding it, and rebuilding `projects` means dropping and
+-- recreating a table that three other tables have foreign keys into. A clamp on
+-- read is also the safer failure mode — a hand-edited 5 in this column becomes a
+-- 90-day window rather than an immediate mass delete.
+--
+-- What DOES NOT change: the rollups are still kept indefinitely, the roll-then-
+-- delete order is still not negotiable, and the read layer still routes each day
+-- to exactly one source. What changes is that the boundary those three agree on
+-- is now resolved per project (`rawBoundaryDay`, and the sweep's cutoff), so a
+-- project with 180 days serves day-100 from raw rows while a default project
+-- serves it from rollups — and neither can read a day whose rows the other's
+-- sweep removed, because no sweep crosses a project boundary any more.
+--
+-- Additive: `ADD COLUMN` with a NOT NULL constant default, which SQLite applies
+-- to existing rows without a table rewrite. Every existing project therefore
+-- keeps exactly the 90 days it already had.
+
+ALTER TABLE projects ADD COLUMN retention_days INTEGER NOT NULL DEFAULT 90;

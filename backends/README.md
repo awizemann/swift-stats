@@ -23,7 +23,10 @@ Each backend folder MUST contain its own `README.md` covering:
 1. What it stores and where (engine, table/dataset shape, index/partition keys).
 2. How to deploy it, from zero, with the exact commands.
 3. How to run it locally for development.
-4. Its **retention** period for raw events, and its aggregation beyond that.
+4. Its **retention** period for raw events, and its aggregation beyond that —
+   including anything it keeps *past* that window (§13 permits a first-seen day
+   per `installId`, and nothing else), and whether the window is fixed or set per
+   project.
 5. Its **`batchId` dedupe window** and mechanism (§6 of the schema).
 6. Whether `activeInstalls` / `sessions` / `installs` are **exact or
    approximate**, and if approximate, the error characteristics. Readers surface

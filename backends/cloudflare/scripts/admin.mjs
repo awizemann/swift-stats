@@ -17,6 +17,7 @@
 //   node scripts/admin.mjs mint-key overwatch write --label "macOS 1.4" --local
 //   node scripts/admin.mjs mint-key overwatch read  --label "Overwatch app" --local
 //   node scripts/admin.mjs list-keys overwatch --local
+//   node scripts/admin.mjs set-retention overwatch 180 --local
 //   node scripts/admin.mjs revoke-key <key-hash> --local
 //   node scripts/admin.mjs delete-install <installId> --local
 //
@@ -30,6 +31,11 @@ const DB_NAME = 'stats';
 const PROJECT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const INSTALL_ID_RE = /^[0-9a-f]{64}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
+// Mirrors MIN_RETENTION_DAYS / MAX_RETENTION_DAYS in src/dates.ts. Duplicated
+// rather than imported: this script is dependency-free Node and deliberately
+// does not load the Worker's TypeScript.
+const MIN_RETENTION_DAYS = 90;
+const MAX_RETENTION_DAYS = 400;
 
 // Human-readable free text: a project's display name and a key's label.
 //
@@ -225,10 +231,34 @@ switch (command) {
   case 'list-keys': {
     const [projectId] = rest;
     if (!projectId || !PROJECT_ID_RE.test(projectId)) die('project id must match [A-Za-z0-9._-]{1,64}');
+    // `last_used_at` (migration 0004) is the column rotation actually needs: it
+    // answers "is the key I am about to revoke still carrying traffic?", which
+    // neither `created_at` nor `revoked_at` can. NULL means never seen since that
+    // migration ran, and the Worker coalesces the write to at most once a minute,
+    // so a value up to 60 seconds stale is expected and does not mean idle.
     execute(
-      `SELECT key_hash, kind, label, created_at, revoked_at FROM keys ` +
+      `SELECT key_hash, kind, label, created_at, last_used_at, revoked_at FROM keys ` +
         `WHERE project_id = ${q(projectId)} ORDER BY created_at;`,
     );
+    break;
+  }
+
+  case 'set-retention': {
+    const [projectId, days] = rest;
+    if (!projectId || !PROJECT_ID_RE.test(projectId)) die('project id must match [A-Za-z0-9._-]{1,64}');
+    // Bounds refused here rather than clamped silently: an operator typing 30 is
+    // asking for something this backend will not do (the read layer would still
+    // serve those days), and quietly storing 90 instead would look like it worked.
+    // The Worker clamps on read as a backstop against a hand-edited row.
+    if (!/^\d+$/.test(days ?? '')) die('usage: set-retention <projectId> <days>');
+    const n = Number(days);
+    if (n < MIN_RETENTION_DAYS || n > MAX_RETENTION_DAYS) {
+      die(`retention must be between ${MIN_RETENTION_DAYS} and ${MAX_RETENTION_DAYS} days`);
+    }
+    requireProjectExists(projectId);
+    execute(`UPDATE projects SET retention_days = ${n} WHERE id = ${q(projectId)};`);
+    console.log('\nRaw events beyond this window are deleted by the nightly job.');
+    console.log('Rollups are unaffected — they are kept indefinitely either way.');
     break;
   }
 
@@ -239,7 +269,14 @@ switch (command) {
     // rollups still include this install's contribution until the affected days
     // are re-rolled, which the nightly job does for the last few days only. For
     // an older day, re-run the rollup for that day explicitly (see the README).
-    execute(`DELETE FROM events WHERE install_id = ${q(installId)};`);
+    // BOTH tables. `installs` (migration 0005) is exempt from the raw retention
+    // sweep by design, so an erasure that only cleared `events` would leave this
+    // install's id and first-seen day behind indefinitely — which is exactly the
+    // §13 obligation this command exists to discharge.
+    execute(
+      `DELETE FROM events WHERE install_id = ${q(installId)}; ` +
+        `DELETE FROM installs WHERE install_id = ${q(installId)};`,
+    );
     console.log('\nNote: rollups for days outside the nightly re-roll window still');
     console.log('include this install. See README "Deleting one install".');
     break;
@@ -250,6 +287,7 @@ switch (command) {
 
   create-project <id> <name>
   mint-key <projectId> write|read [--label "text"]
+  set-retention <projectId> <days>          # raw-event window, 90-400
   list-keys <projectId>
   revoke-key <key-hash>
   delete-install <installId>

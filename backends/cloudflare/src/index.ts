@@ -43,11 +43,11 @@ async function route(
       // §8: both read endpoints MUST be safe and idempotent, which is why only
       // GET/HEAD reach them — a POST to a read path is a 405, not a lenient alias.
       if (!isRead) throw methodNotAllowed('GET');
-      return await handleSummary(request, env, now);
+      return await handleSummary(request, env, ctx, now);
 
     case '/v1/events/top':
       if (!isRead) throw methodNotAllowed('GET');
-      return await handleTopEvents(request, env, now);
+      return await handleTopEvents(request, env, ctx, now);
 
     case '/health':
       // No auth and no D1 read: this is for a uptime check, so it must not be

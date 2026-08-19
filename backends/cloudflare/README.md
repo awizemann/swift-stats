@@ -12,7 +12,7 @@ POST /v1/events        X-Stats-Key       (write key)  -> 202
 GET  /v1/summary       X-Stats-Read-Key  (read key)
 GET  /v1/events/top    X-Stats-Read-Key  (read key)
 GET  /health           (none)
-cron 10 2 * * *        roll up closed days, then delete raw events past 90 days
+cron 10 2 * * *        roll up closed days, then delete raw events past retention
 ```
 
 `HEAD` is accepted wherever `GET` is (workerd does not synthesize it, so it is
@@ -23,21 +23,26 @@ routed explicitly); every other method on a path is **405** with `Allow`.
 ## 1. What it stores and where
 
 **D1** (SQLite), one database named `stats`, schema in
-[`migrations/0001_init.sql`](migrations/0001_init.sql).
+[`migrations/0001_init.sql`](migrations/0001_init.sql) plus the additive
+migrations `0002`–`0006`.
 
 | Table | Holds | Key / index |
 |---|---|---|
 | `projects` | tenants | `id` (the wire `projectId`) |
-| `keys` | **SHA-256 hashes** of write and read keys | `key_hash`; `(project_id, kind)` |
+| `keys` | **SHA-256 hashes** of write and read keys, and `last_used_at` (0004) | `key_hash`; `(project_id, kind)` |
 | `batches` | the `batchId` dedupe ledger (§6) | `(project_id, batch_id)` PK — the dedupe *is* the PK |
 | `batch_context` | the §3 context, once per batch | `batch_id` |
 | `events` | one row per event | `(project_id, day)`, `(project_id, day, name)`, `(install_id)`, `(day)` |
+| `installs` | first sighting per install (0005) — **outlives the raw purge** | `(project_id, install_id)`; `(project_id, first_seen_day)` |
 | `daily_rollups` | per-day `opens` / `sessions` / `activeInstalls` / `events` | `(project_id, day, include_debug)` |
 | `daily_event_rollups` | per-day per-event-name `count` / `installs` | `… , name` |
 | `daily_prop_rollups` | per-day per-prop-value `count` / `installs` | `… , name, prop, value_type, value_key, is_null` |
 | `rollup_state` | what the nightly job rolled, when | `day` |
+| `backend_markers` | one-row-per-fact deployment history (`installs_backfill_day`, 0005) — see §4 | `key` |
 
-Three decisions worth knowing before you change anything:
+`projects.retention_days` (0006) carries each project's raw-event window; see §4.
+
+Four decisions worth knowing before you change anything:
 
 - **`events.day` is a derived, clamped bucket — not `substr(ts, 1, 10)`.** `ts` is
   stored verbatim, but §10 requires tolerating a future-dated or implausibly old
@@ -52,6 +57,13 @@ Three decisions worth knowing before you change anything:
 - **`include_debug` is stored as two rollup rows per day, not one subtractable
   pair.** Distinct counts do not subtract: all-installs minus non-debug-installs
   is not the count of debug-only installs.
+- **`installs` is the one table exempt from the retention sweep.** It holds an
+  install id and a day, nothing else. First sighting is the only fact no
+  aggregate can recover — a per-day distinct count cannot say whether an install
+  was *new* that day — so without it, retention cohorts and "new vs returning"
+  stop being answerable the moment raw rows age out. What it costs is stated
+  plainly in §4 rather than left to be discovered, and `delete-install` clears it
+  along with the events.
 
 Reads pick exactly one source per day — raw rows inside retention, rollups
 outside — so a day is never double-counted and a late-arriving offline batch is
@@ -107,10 +119,59 @@ loopback only, and `CloudflareEndpoint` enforces exactly that.
 
 ## 4. Retention
 
-- **Raw events: 90 days.** Enforced, not asserted: the nightly job deletes
-  `events` rows whose bucket day is older than the cutoff. The read layer uses
-  the same `rawCutoffDay()` definition, so the delete boundary and the read
-  boundary cannot drift apart.
+- **Raw events: 90 days by default, per project.** Enforced, not asserted: the
+  nightly job deletes `events` rows whose bucket day is older than that project's
+  cutoff. The read layer derives its boundary from the same
+  `projects.retention_days` column (`rawBoundaryDay`), so the delete boundary and
+  the read boundary cannot drift apart — per project, not just globally.
+- **The window is 90–400 days.** 90 is the default and the minimum: it is what
+  §13 documents and what a shorter setting would quietly break, since reads route
+  days at the same boundary, so shrinking the window deletes history reads would
+  still have served. 400 is the cap, equal to `MAX_RANGE_DAYS` — raw rows kept
+  beyond the longest answerable range could never be reached as raw rows anyway.
+  Out-of-range stored values are clamped on read rather than rejected by a CHECK,
+  so a hand-edited row degrades to 90 instead of triggering a mass delete.
+
+  ```sh
+  node scripts/admin.mjs set-retention <projectId> 180 --remote
+  ```
+- **One exception to the sweep: `installs`.** One row per install — project, id,
+  first-seen day — kept indefinitely, because first sighting cannot be recovered
+  from any aggregate (§1). So the honest statement of the retention promise is:
+  raw events and everything attached to them go at the cutoff; a bare install id
+  and a day survive. `delete-install` removes it, so the §13 erasure obligation
+  still resolves completely, and no read path returns an install id — the query
+  layer exposes counts per day only (`firstSeenRows`).
+- **Backfilled first-seen days are marked, so a reader can label them.** When
+  `0005` was applied to a database that already had events, it backfilled
+  `first_seen_day` as `MIN(day)` over the raw rows that were still there. For an
+  install whose first event had already aged out that is the oldest *surviving*
+  day — the install reads as having arrived on the retention boundary. `0005`
+  therefore also writes one row into a tiny `backend_markers (key, value)` table,
+  `installs_backfill_day` = the UTC day it ran, and the query layer exports:
+
+  ```ts
+  firstSeenFloorDay(db, projectId): Promise<string | null>
+  ```
+
+  It returns that project's `rawCutoffDay(markerDay, retention_days)` — the oldest
+  day whose `first_seen_day` can be trusted. **Installs with `first_seen_day` ≤
+  that floor may have been first seen earlier;** everything above it is exact.
+  `null` means there is no marker (a fresh deployment, nothing backfilled) and
+  should be rendered as "all exact", never "unknown". It is per project, derived
+  from the same `retention_days` the sweep uses, so a longer window does not get
+  90 days of exact rows mislabelled. Annotate cohort charts that reach back past
+  the floor rather than serving the boundary spike as if it were real.
+- **`installs` has no expiry, and that is a decision.** It grows with installs,
+  not traffic — three short columns, one row per install ever — and a first-seen
+  day that expired at the retention cutoff would answer nothing the rollups do
+  not already answer. The honest cost is that for a long-lived popular app this
+  is unbounded storage and an unbounded privacy tail, and it belongs in your
+  disclosure. If you want a far horizon, the option written down for you is to
+  expire rows by the project's own `retention_days` rather than inventing a
+  second policy number; `ADOPTION.md` §8.3 has the sketch and the three questions
+  to settle before implementing it (chiefly: `installs` has no `last_seen_day`, so
+  a correct "not seen in N years" needs one).
 - **Daily rollups: kept indefinitely.** `/v1/summary` keeps answering ranges far
   older than 90 days while nothing person-scale survives.
 - **Order is not negotiable:** roll up first, delete second, and the delete is
@@ -181,6 +242,14 @@ node scripts/admin.mjs mint-key <projectId> write|read [--label "…"] --remote
 node scripts/admin.mjs list-keys <projectId> --remote     # shows hashes, never keys
 node scripts/admin.mjs revoke-key <key-hash> --remote
 ```
+
+`list-keys` includes **`last_used_at`** (migration 0004): when that key last
+authenticated a request. It is what makes the rotation below checkable — "has the
+old key stopped being used, or am I about to 401 a shipped app?" — and it is the
+only thing a request records about itself. The Worker coalesces the write to at
+most once per minute per key (D1 bills rows written), so a value up to 60 seconds
+stale is expected and does not mean idle; `NULL` means not seen since that
+migration ran. A revoked key never updates it, so it freezes at the last live use.
 
 **Rotation** is mint-then-revoke, with both live in between: mint the new key,
 ship it, then revoke the old one. Revocation is an `UPDATE` setting `revoked_at`,
@@ -267,7 +336,10 @@ The §13 per-person erasure obligation:
 node scripts/admin.mjs delete-install <64-hex installId> --remote
 ```
 
-Raw rows go immediately. Rollups for days inside the nightly re-roll window
+Raw rows go immediately, and so does that install's `installs` row — which
+matters because that table is otherwise exempt from the retention sweep, so
+clearing only `events` would leave the id and its first-seen day behind
+indefinitely. Rollups for days inside the nightly re-roll window
 self-correct on the next pass, because the job is delete-then-insert rather than
 an upsert. For an **older** day the rollup still includes that install's
 contribution as a number; re-roll that specific day if it matters, and note that
@@ -380,9 +452,13 @@ backoff) never comes close to any of these.
 
 D1 bills rows read and rows written. The shapes that matter:
 
-- **Ingest**: 2 + *n* rows written per batch (the batch row, the context row, one
-  per event). Context is stored per batch, not per event, which is the difference
-  between 2+*n* and 3*n* for a typical batch.
+- **Ingest**: 2 + *n* + 1 rows written per batch (the batch row, the context row,
+  one per event, and one `INSERT OR IGNORE` covering every distinct install in
+  the batch — which is a no-op write after that install's first batch), plus at
+  most one `keys.last_used_at` update per key per minute (deferred under
+  `ctx.waitUntil`, so it is off the request's critical path). Context is stored
+  per batch, not per event, which is the difference between 2+*n* and 3*n* for a
+  typical batch.
 - **Summary**: an index range scan on `(project_id, day)` — rows read is
   proportional to the events in the range, not to the table. This is the query to
   watch: a busy project asking for 400 days reads 400 days of events. If that ever
@@ -460,10 +536,14 @@ What is exported, and what each thing is for:
 | `propBreakdown(db, {…, name, limit?})` | the §8.2 prop breakdown for one event name |
 | `resolveRange(db, {…}, now)` | validate + clamp + resolve the raw/rollup boundary once, to reuse across several queries |
 | `summaryRows` / `topEventRows` / `propBreakdownRows` | the same three computations over an already-resolved range |
-| `rawBoundaryDay(db, projectId, now)` | the observed raw/rollup boundary |
+| `rawBoundaryDay(db, projectId, now)` | the observed raw/rollup boundary, resolved against that project's `retention_days` |
+| `firstSeenRows(db, projectId, fromDay, toDay)` | installs first seen per day — retention cohorts and "new installs"; **counts only, never an install id** |
+| `firstSeenFloorDay(db, projectId)` | oldest day whose `first_seen_day` is trustworthy, or `null` for none — label cohorts at or below it (§4) |
+| `totalInstalls(db, projectId, throughDay?)` | installs ever seen, cumulative (a sum over `firstSeenRows` is not the total) |
 | `resolveDayRange` / `clampAndValidateDays` | the pure date rules, database-free |
 | `parseLimit` / `parseIncludeDebug` / `parseEventName` / `requireBothDays` | the same query-string parsing, so a consumer rejects exactly what the public API rejects |
-| `MAX_BREAKDOWN_PROPS`, `DEFAULT_LIMIT`, `MAX_LIMIT`, `MAX_RANGE_DAYS`, `RAW_RETENTION_DAYS` | the documented caps, as values rather than numbers to copy |
+| `MAX_BREAKDOWN_PROPS`, `DEFAULT_LIMIT`, `MAX_LIMIT`, `MAX_RANGE_DAYS`, `RAW_RETENTION_DAYS`, `MIN_RETENTION_DAYS`, `MAX_RETENTION_DAYS` | the documented caps, as values rather than numbers to copy |
+| `clampRetentionDays(raw)` | fold a stored `projects.retention_days` into the supported range — use it rather than trusting the column |
 | `addDays`, `eachDay`, `today`, `daysInclusive`, `isValidDate`, `rawCutoffDay` | UTC day arithmetic; a range built any other way is a bug (§8.1 buckets by UTC day) |
 
 The convenience functions take an optional `now: Date`. Pass it in tests; leave it
@@ -560,11 +640,18 @@ Verified at the commit that introduced this file, by `npm test`
       `rows` for an unknown `name`, omits numeric props, and folds absent-prop
       into the `null` row.
 - [x] Errors use `{"error": "<stable_snake_case>", "message": "..."}`.
-- [x] Read endpoints are safe and idempotent — no writes, no side effects.
+- [x] Read endpoints are safe and idempotent: no answer depends on a previous
+      request and nothing client-visible changes. The one write on the path is a
+      coalesced `keys.last_used_at` touch (§7), at most once per minute per key,
+      invisible in the response and scheduled with `ctx.waitUntil` so it runs
+      after the response rather than in front of it.
 
 ### Operational
 
-- [x] Documented retention (90 days raw), and it is actually enforced by the cron.
+- [x] Documented retention (90 days raw by default, 90-400 per project), and it
+      is actually enforced by the cron, per project.
+- [x] The one table exempt from the sweep (`installs`) is documented, returns no
+      ids to any reader, and is cleared by `delete-install`.
 - [x] A documented way to delete all events for one `installId`.
 - [x] Rate limiting a well-behaved emitter never trips.
 - [x] A conformance suite runnable against a local instance: `npm test`.

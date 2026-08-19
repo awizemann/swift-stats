@@ -2,7 +2,7 @@
 
 import { badRequest, HttpError, json, payloadTooLarge } from './errors.js';
 import { bucketDay } from './dates.js';
-import { resolveKey } from './keys.js';
+import { resolveKey, touchKey } from './keys.js';
 import { checkPreAuthRate, checkProjectRate } from './ratelimit.js';
 import { MAX_BODY_BYTES, parseJsonBody, validateBatch } from './validate.js';
 import { deferLog, logger } from './log.js';
@@ -201,6 +201,17 @@ export async function handleIngest(
   // And again per project, so minting more keys for one project does not multiply
   // its share.
   checkProjectRate(scope.projectId, now.getTime());
+  // Record the key as live (0004), coalesced to at most one write per minute per
+  // key. Registered here rather than after the commit, so it means "this key
+  // authenticated a request" — which is the question rotation asks — and so
+  // every outcome (accepted, duplicate, rejected body) counts the same: the
+  // promise is handed to `waitUntil` before any of the code below can throw.
+  //
+  // `waitUntil` and not `await`: `last_used_at` is a diagnostic, and §7 makes the
+  // 202 a durability signal about the BATCH. Nothing about this write belongs
+  // between the emitter and its acknowledgement. It never throws (`touchKey`
+  // swallows and logs its own failures), so nothing here can fail the request.
+  ctx.waitUntil(touchKey(env.DB, scope, now));
 
   const batch = validateBatch(parseJsonBody(await readBody(request, ctx)));
 
@@ -301,15 +312,26 @@ export async function handleIngest(
      ON CONFLICT (project_id, install_id, seq) DO NOTHING`,
   );
 
+  // First-seen day per distinct install in this batch, folded as we go (0005).
+  // The MINIMUM bucket day, not the first event's: a batch is not ordered, and an
+  // install seen for the first time in a batch that also carries a queued
+  // yesterday event was first seen yesterday.
+  const firstSeen = new Map<string, string>();
+
   for (const e of batch.events) {
+    // §10: a future-dated or implausibly old `ts` is tolerated and clamped into
+    // the retention window for AGGREGATION — the PROJECT's window (0006), which
+    // is why `scope.retentionDays` is threaded through here. `ts` itself is
+    // stored verbatim alongside it.
+    const day = bucketDay(e.ts, now, scope.retentionDays);
+    const seen = firstSeen.get(e.installId);
+    if (seen === undefined || day < seen) firstSeen.set(e.installId, day);
+
     statements.push(
       insertEvent.bind(
         projectId,
         batch.batchId,
-        // §10: a future-dated or implausibly old `ts` is tolerated and clamped
-        // into the retention window for AGGREGATION. `ts` itself is stored
-        // verbatim on the next line.
-        bucketDay(e.ts, now),
+        day,
         e.ts,
         e.name,
         e.sessionId,
@@ -325,8 +347,43 @@ export async function handleIngest(
 
   // Index of the first event statement: the batch row, then the context row.
   const EVENT_STATEMENTS_FROM = 2;
+  // …and one past the last. The `installs` statement below is appended AFTER the
+  // events, and an `INSERT OR IGNORE` that hits a known install reports zero
+  // changed rows exactly like a deduped event does — so the dedupe tally has to
+  // stop at the end of the event range or every repeat visitor would be counted
+  // as a replayed event.
+  const EVENT_STATEMENTS_TO = EVENT_STATEMENTS_FROM + batch.events.length;
 
   let deduped = 0;
+
+  // ONE statement for every distinct install in the batch, not one per event and
+  // not one per install (0005). A 100-event batch from one install is a single
+  // `INSERT OR IGNORE` with one row; the §1 batching rules already guarantee a
+  // batch never mixes install ids, so in practice this is always one row — the
+  // multi-row form exists so the statement stays correct if that ever changes,
+  // without reintroducing a per-event write.
+  //
+  // In the SAME `db.batch()` as the events, so it commits with them or not at
+  // all: a duplicate `batchId` (§6) aborts the whole batch and cannot leave an
+  // `installs` row behind for events that were never written. It also composes
+  // cleanly with the per-event identity index (0003): a batch replayed under a
+  // fresh `batchId` has its events swallowed by `ON CONFLICT DO NOTHING` and its
+  // `installs` row swallowed by `OR IGNORE`, so neither table double-counts.
+  //
+  // `OR IGNORE` is what keeps `first_seen_day` immutable — a later batch from a
+  // known install is a no-op, so the column is the FIRST sighting, never the
+  // latest.
+  if (firstSeen.size > 0) {
+    const installs = [...firstSeen.entries()];
+    const values = installs.map((_, i) => `(?1, ?${i * 2 + 2}, ?${i * 2 + 3})`).join(', ');
+    statements.push(
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO installs (project_id, install_id, first_seen_day)
+         VALUES ${values}`,
+      ).bind(projectId, ...installs.flatMap(([installId, day]) => [installId, day])),
+    );
+  }
+
   try {
     const results = await env.DB.batch(statements);
     // How many events the identity index swallowed. D1 reports `meta.changes`
@@ -334,7 +391,7 @@ export async function handleIngest(
     // count is derivable without a second query. Defensive `?? 1`: if a D1
     // version stops reporting `changes`, assume the row landed, so an unknown
     // becomes an under-report of dedupes rather than a phantom alert.
-    for (let i = EVENT_STATEMENTS_FROM; i < results.length; i += 1) {
+    for (let i = EVENT_STATEMENTS_FROM; i < EVENT_STATEMENTS_TO; i += 1) {
       if ((results[i]?.meta?.changes ?? 1) === 0) deduped += 1;
     }
   } catch (cause) {

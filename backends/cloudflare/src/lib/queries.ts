@@ -45,10 +45,12 @@
 import { badRequest } from '../errors.js';
 import {
   addDays,
+  clampRetentionDays,
   daysInclusive,
   eachDay,
   isValidDate,
   MAX_RANGE_DAYS,
+  RAW_RETENTION_DAYS,
   rawCutoffDay,
   today,
 } from '../dates.js';
@@ -213,12 +215,24 @@ export async function rawBoundaryDay(
   projectId: string,
   now: Date,
 ): Promise<string> {
-  const cutoff = rawCutoffDay(now);
+  // Both halves of the boundary in ONE round trip: the project's retention window
+  // (0006) and its oldest surviving raw day. The window has to be per project or
+  // the routing is wrong in the expensive direction — a project keeping 180 days
+  // would have every day older than 90 answered from rollups while its raw rows
+  // sat right there, which is not a false zero but is a different, coarser answer
+  // than the same request gets for a day one older, for no reason a reader can
+  // see.
   const row = await db
-    .prepare(`SELECT MIN(day) AS oldest FROM events WHERE project_id = ?1`)
+    .prepare(
+      `SELECT (SELECT retention_days FROM projects WHERE id = ?1) AS retentionDays,
+              (SELECT MIN(day) FROM events WHERE project_id = ?1) AS oldest`,
+    )
     .bind(projectId)
-    .first<{ oldest: string | null }>();
+    .first<{ retentionDays: number | null; oldest: string | null }>();
 
+  // A project row that is absent (deleted mid-request) falls back to the default
+  // window rather than throwing: this function routes days, it does not authorize.
+  const cutoff = rawCutoffDay(now, clampRetentionDays(row?.retentionDays ?? RAW_RETENTION_DAYS));
   const oldest = row?.oldest ?? null;
   if (oldest === null) return cutoff;
   // Never move the boundary UP past the clock's cutoff: a project whose oldest
@@ -724,4 +738,169 @@ export async function propBreakdown(
     range,
     rows: await propBreakdownRows(db, range, request.name, request.limit ?? DEFAULT_LIMIT),
   };
+}
+
+// -----------------------------------------------------------------------------
+// first-seen cohorts
+// -----------------------------------------------------------------------------
+
+export interface FirstSeenRow {
+  /** UTC day, `YYYY-MM-DD`. */
+  readonly date: string;
+  /** How many installs were seen for the FIRST time on that day. */
+  readonly installs: number;
+}
+
+/**
+ * Per-day counts of installs first seen in `[fromDay, toDay]` (table `installs`,
+ * migration 0005).
+ *
+ * This is the whole of the read contract for that table, and it is deliberately
+ * the only one: it returns COUNTS PER DAY, never an `install_id`. A consumer
+ * building retention cohorts or a "new installs" chart gets what it needs, and
+ * there is no function here it can call to get the ids — which is what keeps the
+ * §13 story about this table true no matter which Worker imports the lib.
+ *
+ * Unlike `summaryRows` this needs no raw/rollup routing and no `now`: `installs`
+ * is EXEMPT from the raw purge, so one row per install survives indefinitely and
+ * there is exactly one source. It reaches back further than `/v1/summary` can
+ * report activity for, which is the point of the table.
+ *
+ * Zero-filled over every day in the range, ascending, matching §8.1's rule for
+ * `/v1/summary` — a consumer chart can trust the row count and never has to tell
+ * "no data" from "missing row".
+ *
+ * Note what a count here is NOT: it is not "installs still active", and cohort
+ * retention is this joined against `summary`-style activity, not derivable from
+ * this alone.
+ *
+ * Throws `HttpError` (400) with the same `invalid_range` / `range_too_large`
+ * codes and messages the public read endpoints use, so a consumer mapping this
+ * onto its own transport reports failures identically. `projectId` must already
+ * be authorized against the caller's key — as everywhere in this module, this
+ * function does not authorize.
+ */
+export async function firstSeenRows(
+  db: D1Database,
+  projectId: string,
+  fromDay: string,
+  toDay: string,
+): Promise<FirstSeenRow[]> {
+  if (!isValidDate(fromDay) || !isValidDate(toDay)) {
+    throw badRequest('invalid_range', '`from` and `to` must be real calendar days as YYYY-MM-DD.');
+  }
+  if (toDay < fromDay) {
+    throw badRequest('invalid_range', '`to` must not be before `from`.');
+  }
+  // The same 400-day ceiling the read endpoints enforce (§8.1). There is no
+  // clamp-to-today here: unlike an activity series, a future `to` on a cohort
+  // query is harmless — no install can be first seen on a day that has not
+  // happened, so those days zero-fill honestly rather than inventing a row.
+  if (daysInclusive(fromDay, toDay) > MAX_RANGE_DAYS) {
+    throw badRequest('range_too_large', `A range may span at most ${MAX_RANGE_DAYS} days.`);
+  }
+
+  const { results } = await db
+    .prepare(
+      // COUNT(*), not COUNT(DISTINCT install_id): (project_id, install_id) is the
+      // primary key, so a row IS a distinct install and the distinct is free.
+      // Served entirely by the `installs_first_seen` index.
+      `SELECT first_seen_day AS day, COUNT(*) AS installs
+         FROM installs
+        WHERE project_id = ?1 AND first_seen_day >= ?2 AND first_seen_day <= ?3
+        GROUP BY first_seen_day`,
+    )
+    .bind(projectId, fromDay, toDay)
+    .all<{ day: string; installs: number }>();
+
+  const byDay = new Map(results.map((r) => [r.day, r.installs]));
+  return eachDay(fromDay, toDay).map((day) => ({ date: day, installs: byDay.get(day) ?? 0 }));
+}
+
+/**
+ * How many installs this project has EVER been seen to have, first seen on or
+ * before `throughDay` (default: all of them).
+ *
+ * The cumulative companion to `firstSeenRows`, kept here rather than left to a
+ * consumer summing rows: a sum over a 400-day window is not the total, and a
+ * consumer that computed it that way would silently report "total installs" as
+ * "installs first seen in the last 400 days".
+ */
+export async function totalInstalls(
+  db: D1Database,
+  projectId: string,
+  throughDay?: string,
+): Promise<number> {
+  if (throughDay !== undefined && !isValidDate(throughDay)) {
+    throw badRequest('invalid_range', '`through` must be a real calendar day as YYYY-MM-DD.');
+  }
+  const row = await db
+    .prepare(
+      throughDay === undefined
+        ? `SELECT COUNT(*) AS n FROM installs WHERE project_id = ?1`
+        : `SELECT COUNT(*) AS n FROM installs WHERE project_id = ?1 AND first_seen_day <= ?2`,
+    )
+    .bind(...(throughDay === undefined ? [projectId] : [projectId, throughDay]))
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/**
+ * The oldest day this project's `first_seen_day` values can be trusted — or
+ * `null` when every one of them is exact.
+ *
+ * Migration 0005 backfilled `installs` from whatever raw `events` rows were still
+ * present, as `MIN(day)` per install. For an install whose first event was still
+ * inside the raw window that is exactly right. For an older one it is the oldest
+ * SURVIVING day, which reads as "arrived on the retention boundary" — an install
+ * that may have been first seen months or years earlier. The migration says so;
+ * the DATA cannot, which is what this function is for: a cohort chart drawn
+ * across the backfill would otherwise show a spike at that boundary that a
+ * consumer has no way to tell from a real one.
+ *
+ * The floor is `rawCutoffDay(backfillDay, project.retention_days)` — the oldest
+ * day that had raw rows on the day the migration ran, and therefore the oldest
+ * day the backfill's `MIN(day)` could possibly have returned. Every install
+ * stored with `first_seen_day` at or below it may have been first seen EARLIER;
+ * everything strictly above it is exact.
+ *
+ * Per project, not global: the boundary is derived from the same
+ * `retention_days` (0006) the sweep uses, so a project keeping 180 days has a
+ * floor 90 days further back than a default one, and using the global default for
+ * it would mark good rows as suspect.
+ *
+ * `null` means "no floor" and is the answer for a FRESH deployment: no marker row
+ * means 0005 has not run against a populated `events` table under a schema that
+ * records it, so there is no backfilled cohort to distrust and every
+ * `first_seen_day` was written by ingest at the moment it happened. A consumer
+ * should read `null` as "all exact", never as "unknown".
+ *
+ * Cheap: two indexed point lookups, or one round trip if a consumer caches it —
+ * the value only changes when a project's retention does, and it is a label on a
+ * chart, not part of any count.
+ */
+export async function firstSeenFloorDay(
+  db: D1Database,
+  projectId: string,
+): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT (SELECT value FROM backend_markers WHERE key = 'installs_backfill_day') AS markerDay,
+              (SELECT retention_days FROM projects WHERE id = ?1) AS retentionDays`,
+    )
+    .bind(projectId)
+    .first<{ markerDay: string | null; retentionDays: number | null }>();
+
+  const markerDay = row?.markerDay ?? null;
+  // No marker: a deployment whose `installs` table was never backfilled over
+  // existing events. Nothing to distrust.
+  if (markerDay === null || !isValidDate(markerDay)) return null;
+
+  // Same clamp every other reader of this column applies (0006): a NULL from an
+  // older row, or a hand-edited absurdity, degrades to the 90-day default rather
+  // than moving the floor somewhere it would mislabel real rows.
+  const retentionDays = clampRetentionDays(row?.retentionDays ?? RAW_RETENTION_DAYS);
+  // `rawCutoffDay` takes the clock as a `Date`; the marker is a UTC day, so
+  // midnight UTC on that day is the instant the migration's `date('now')` named.
+  return rawCutoffDay(new Date(`${markerDay}T00:00:00.000Z`), retentionDays);
 }
