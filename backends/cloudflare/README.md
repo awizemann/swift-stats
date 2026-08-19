@@ -38,6 +38,7 @@ migrations `0002`–`0006`.
 | `daily_event_rollups` | per-day per-event-name `count` / `installs` | `… , name` |
 | `daily_prop_rollups` | per-day per-prop-value `count` / `installs` | `… , name, prop, value_type, value_key, is_null` |
 | `rollup_state` | what the nightly job rolled, when | `day` |
+| `backend_markers` | one-row-per-fact deployment history (`installs_backfill_day`, 0005) — see §4 | `key` |
 
 `projects.retention_days` (0006) carries each project's raw-event window; see §4.
 
@@ -141,6 +142,36 @@ loopback only, and `CloudflareEndpoint` enforces exactly that.
   and a day survive. `delete-install` removes it, so the §13 erasure obligation
   still resolves completely, and no read path returns an install id — the query
   layer exposes counts per day only (`firstSeenRows`).
+- **Backfilled first-seen days are marked, so a reader can label them.** When
+  `0005` was applied to a database that already had events, it backfilled
+  `first_seen_day` as `MIN(day)` over the raw rows that were still there. For an
+  install whose first event had already aged out that is the oldest *surviving*
+  day — the install reads as having arrived on the retention boundary. `0005`
+  therefore also writes one row into a tiny `backend_markers (key, value)` table,
+  `installs_backfill_day` = the UTC day it ran, and the query layer exports:
+
+  ```ts
+  firstSeenFloorDay(db, projectId): Promise<string | null>
+  ```
+
+  It returns that project's `rawCutoffDay(markerDay, retention_days)` — the oldest
+  day whose `first_seen_day` can be trusted. **Installs with `first_seen_day` ≤
+  that floor may have been first seen earlier;** everything above it is exact.
+  `null` means there is no marker (a fresh deployment, nothing backfilled) and
+  should be rendered as "all exact", never "unknown". It is per project, derived
+  from the same `retention_days` the sweep uses, so a longer window does not get
+  90 days of exact rows mislabelled. Annotate cohort charts that reach back past
+  the floor rather than serving the boundary spike as if it were real.
+- **`installs` has no expiry, and that is a decision.** It grows with installs,
+  not traffic — three short columns, one row per install ever — and a first-seen
+  day that expired at the retention cutoff would answer nothing the rollups do
+  not already answer. The honest cost is that for a long-lived popular app this
+  is unbounded storage and an unbounded privacy tail, and it belongs in your
+  disclosure. If you want a far horizon, the option written down for you is to
+  expire rows by the project's own `retention_days` rather than inventing a
+  second policy number; `ADOPTION.md` §8.3 has the sketch and the three questions
+  to settle before implementing it (chiefly: `installs` has no `last_seen_day`, so
+  a correct "not seen in N years" needs one).
 - **Daily rollups: kept indefinitely.** `/v1/summary` keeps answering ranges far
   older than 90 days while nothing person-scale survives.
 - **Order is not negotiable:** roll up first, delete second, and the delete is
@@ -507,6 +538,7 @@ What is exported, and what each thing is for:
 | `summaryRows` / `topEventRows` / `propBreakdownRows` | the same three computations over an already-resolved range |
 | `rawBoundaryDay(db, projectId, now)` | the observed raw/rollup boundary, resolved against that project's `retention_days` |
 | `firstSeenRows(db, projectId, fromDay, toDay)` | installs first seen per day — retention cohorts and "new installs"; **counts only, never an install id** |
+| `firstSeenFloorDay(db, projectId)` | oldest day whose `first_seen_day` is trustworthy, or `null` for none — label cohorts at or below it (§4) |
 | `totalInstalls(db, projectId, throughDay?)` | installs ever seen, cumulative (a sum over `firstSeenRows` is not the total) |
 | `resolveDayRange` / `clampAndValidateDays` | the pure date rules, database-free |
 | `parseLimit` / `parseIncludeDebug` / `parseEventName` / `requireBothDays` | the same query-string parsing, so a consumer rejects exactly what the public API rejects |

@@ -431,6 +431,366 @@ run it concurrently with the cron.
 
 ---
 
+# 0.3.0 — backend additions (migrations `0004`–`0006`)
+
+Everything above is the **0.2.0 hardening pass**: it changed behaviour that was
+already wrong. This section is different in kind — three *additive* features,
+one migration each, none of which changes the wire schema, the `/v1` shapes, the
+error envelope, or any number an existing read already returns. Wire schema
+stays `v1`; the Swift package is untouched.
+
+They are numbered `0004`–`0006` because 0.2.0 shipped its own
+`0003_event_idempotency.sql` (§6). Apply them in filename order — `0005` in
+particular is materially cheaper once `0003`'s index exists, and the numbering
+enforces it.
+
+## 7. `keys.last_used_at` — key liveness
+
+**What.** `migrations/0004_keys_last_used_at.sql` adds a nullable
+`last_used_at` column to `keys`. `touchKey` (`src/keys.ts`) writes it on every
+authenticated request — ingest and both reads — coalesced to **at most one write
+per key per minute** (`KEY_TOUCH_INTERVAL_MS = 60_000`, `src/keys.ts:48`). The
+CLI shows it: `node scripts/admin.mjs list-keys <projectId>`.
+
+**Why (the risk).** Key rotation is mint-new → deploy → revoke-old, and the
+middle step is a guess: there is no way to ask "has anything actually used the
+new key yet?" or "is anything *still* using the old one?". An operator either
+revokes early and breaks a client that had not shipped, or never revokes at all
+and the old key stays live forever. One nullable column turns both questions
+into a lookup.
+
+**Why it is a timestamp and not a counter.** A counter is per-request telemetry
+about someone else's app; a last-seen timestamp answers the rotation question
+completely and answers nothing else. §13 rules out anything person-scale here —
+this is scoped to a KEY, which is the operator's own object, not an end user's.
+
+**Off the critical path.** `touchKey` is registered with
+`ctx.waitUntil(...)`, not awaited (`src/ingest.ts`, `src/read.ts`) — exactly the
+extension §1 anticipates. It is registered *before* body validation, so
+"this key authenticated a request" counts every outcome, including a rejected
+body. It never throws: it swallows and logs its own failures as
+`key_touch_failed`, without the hash. A read-only D1 binding therefore logs and
+serves the read, rather than 500ing.
+
+**Note for §8 readers.** `GET /v1/summary` and `/v1/events/top` are no longer
+literally write-free. No *answer* depends on it and nothing client-visible
+changes, but if you audit the read path against a read-only replica, this is the
+one write.
+
+**Files.** `migrations/0004_keys_last_used_at.sql` (new), `src/keys.ts`
+(`touchKey`, `KEY_TOUCH_INTERVAL_MS`), `src/ingest.ts`, `src/read.ts`,
+`src/index.ts` (threads `ExecutionContext` into both read handlers),
+`scripts/admin.mjs` (`list-keys`), `test/helpers.ts`, `test/additions.test.ts`.
+
+**Migration step.**
+
+```
+npm run migrate:local      # or: npm run migrate:remote
+```
+
+**Verify.**
+
+```
+npm run typecheck && npm test
+```
+
+Then make one authenticated read and confirm the column moved. Allow a moment —
+the write is deferred under `waitUntil`, so it lands just after the response.
+
+```sql
+-- key liveness for one project. NULL = never used since 0004 was applied.
+SELECT kind, label, created_at, revoked_at, last_used_at
+  FROM keys
+ WHERE project_id = 'PROJECT_ID'
+ ORDER BY last_used_at IS NULL, last_used_at DESC;
+```
+
+A key you are about to revoke should show a `last_used_at` that has stopped
+advancing. Revocation freezes the value rather than clearing it, so it remains
+readable as "last live use" afterwards.
+
+## 8. `installs` — first-seen day, surviving the raw purge
+
+**What.** `migrations/0005_installs.sql` adds
+`installs (project_id, install_id, first_seen_day)`, PK `(project_id,
+install_id)`, `ON DELETE CASCADE` to `projects`, plus the
+`installs_first_seen (project_id, first_seen_day)` index, and backfills it from
+surviving raw events. Ingest writes **one `INSERT OR IGNORE` per batch** covering
+every distinct install in it, in the *same* `db.batch()` as the events. The read
+side is two functions in `src/lib/queries.ts`: `firstSeenRows` (per-day counts)
+and `totalInstalls` (cumulative).
+
+**Why (what is otherwise unrecoverable).** Raw events are deleted at the
+retention cutoff, and the rollups that outlive them store per-day **distinct
+counts**. A distinct count cannot answer "was this install new that day?". So
+first sighting is the one fact that cannot survive retention in any aggregate
+form — and it is what retention cohorts, "new vs returning", and every honest
+growth number are built out of. Without it a project that has run for a year can
+say how many installs were active 200 days ago and can never say how many were
+new.
+
+**Why `OR IGNORE` here when §6 argues against it for events.** §6 rejects
+`INSERT OR IGNORE` on `events` because it would also swallow the `NOT NULL` /
+STRICT-datatype failures that §2 maps to an honest `400`. That argument does not
+carry here: the row is three columns the Worker constructs itself, its only
+realistic conflict is the primary key, and suppressing it is the entire point —
+`OR IGNORE` is what makes `first_seen_day` **immutable**, so the stored day is
+the first sighting and never the most recent.
+
+**§13.** This keeps an `install_id` — the SDK's own salted-hash identifier (§9),
+not one of this backend's invention — past the raw retention window. That has to
+be stated, not discovered: **raw events go at the cutoff; a bare install id and a
+day survive.** The erasure obligation still resolves completely
+(`delete-install` deletes from `installs` as well as `events`), a project delete
+cascades, and **no exported read function returns an install id** — `firstSeenRows`
+returns counts per day, and there is no code path in the read contract that
+returns one. Both READMEs disclose the exemption; a self-hoster's own privacy
+policy may need the same sentence.
+
+### 8.1 The backfill is index-assisted — apply `0003` first
+
+The backfill is `SELECT project_id, install_id, MIN(day) FROM events GROUP BY
+project_id, install_id`, which touches every surviving raw row. §6's
+`events_identity` UNIQUE index on `(project_id, install_id, seq)` has exactly
+that grouping key as its **prefix**, so SQLite walks the index in grouping order
+instead of scanning `events` and building a temporary b-tree. The filename
+ordering already guarantees `0003` is applied first; do not reorder them.
+
+Get the row count before you apply, and watch this statement:
+
+```sql
+SELECT COUNT(*) AS raw_rows FROM events;
+```
+
+### 8.2 Backfilled `first_seen` is marked, so a reader can label it
+
+The backfill is honest but was, initially, **unmarked** — and that is a real
+defect rather than a nicety. For an install whose first event has already aged
+out, `MIN(day)` is the oldest *surviving* day, so the install reads as having
+arrived on the retention boundary. Nothing in the data said which rows those
+were, so a cohort chart drawn across the migration date shows a spike at the
+boundary that a consumer cannot tell from a real one. It would simply be wrong,
+confidently.
+
+`0005` therefore also creates a deliberately tiny
+
+```sql
+CREATE TABLE backend_markers (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+```
+
+and writes one row, `installs_backfill_day` = `date('now')`, in the same
+migration as the backfill so the marker and the rows it describes cannot
+disagree. Nothing in the request path reads it; every value in it is a fact about
+the deployment's *history*, not a setting.
+
+The reader-facing half is one exported helper:
+
+```ts
+firstSeenFloorDay(db: D1Database, projectId: string): Promise<string | null>
+```
+
+It returns, for that project, **the oldest day whose `first_seen_day` can be
+trusted** — `rawCutoffDay(markerDay, project.retention_days)`, the oldest day
+that still had raw rows when the migration ran and therefore the oldest day the
+backfill's `MIN(day)` could possibly have returned. Read it as:
+
+> installs with `first_seen_day` **≤** this floor may have been first seen
+> earlier; everything strictly above it is exact.
+
+Two properties worth stating:
+
+- **`null` means "no floor", i.e. all exact.** A fresh deployment has no marker
+  (or ran `0005` against an empty `events`), so there is no backfilled cohort to
+  distrust. A consumer must render `null` as "all exact", never as "unknown".
+- **It is per project.** The floor comes from the same `retention_days` the sweep
+  uses (§9), so a project keeping 180 days has a floor 90 days further back than
+  a default one. Deriving it from the global default would mark 90 days of exact
+  rows as suspect.
+
+Not a `first_seen_is_exact` column on `installs`: that would be a per-row flag
+carrying one repository-wide fact, and it would have to be written for every
+future row forever to stay true.
+
+### 8.3 `installs` is kept indefinitely — the decision, and the option
+
+**Decided: `installs` has no expiry today, and that is intentional.** It is the
+only table exempt from the retention sweep, and the exemption is the point — a
+first-seen day that expired at the retention cutoff would answer nothing the
+rollups do not already answer. The table grows with **installs, not traffic**: a
+busy install costs exactly what a silent one does, three short columns, one row
+per install ever. The removal paths that exist are the ones §13 requires:
+`delete-install` for a single erasure, and `ON DELETE CASCADE` for a project.
+
+**The honest cost:** for a long-lived popular app this is unbounded storage and
+an unbounded privacy tail, and "we keep a bare install id forever" is a sentence
+that has to appear in your disclosure.
+
+**The documented option, if you want a far horizon.** Expire rows by the
+project's own `retention_days` (§9) rather than inventing a second policy
+number. This is *not* implemented — it is written down so the shape is agreed
+before anyone needs it:
+
+```sql
+-- NOT IMPLEMENTED. A far-horizon trim, per project, run from the same nightly
+-- job as the raw sweep. `installs` has no `last_seen_day`, so this can only be
+-- expressed against observed activity — which is why it is an option and not a
+-- default.
+DELETE FROM installs
+ WHERE project_id = ?1
+   AND install_id NOT IN (SELECT install_id FROM events WHERE project_id = ?1);
+```
+
+Three things to settle before implementing it, and the reason it is deferred:
+
+1. That statement deletes any install with **no surviving raw events**, which on
+   a 90-day window is every install that went quiet three months ago — far too
+   aggressive to be a default, and it would delete exactly the historical
+   cohorts the table exists to preserve.
+2. A genuinely correct version needs a `last_seen_day` column on `installs`
+   (one more write per batch, or a nightly `MAX(day)` pass) so the horizon can be
+   "not seen in N years" rather than "not seen this quarter".
+3. Whatever you choose, the erased rows change past cohort numbers, so it must be
+   disclosed the same way the retention cutoff is.
+
+**Files.** `migrations/0005_installs.sql` (new: table, index, backfill,
+`backend_markers`), `src/ingest.ts`, `src/lib/queries.ts` (`firstSeenRows`,
+`totalInstalls`, `firstSeenFloorDay`), `scripts/admin.mjs` (`delete-install`),
+`test/helpers.ts` (`seedInstalls`, `installs` and `backend_markers` in the reset
+list), `test/additions.test.ts`.
+
+**Migration step.** As above — but read §8.1 first and get the `events` row
+count. This is the one statement in the whole pass that touches every surviving
+raw row.
+
+**Verify.**
+
+```sql
+-- rows exist after the backfill, and the marker was written
+SELECT COUNT(*) AS installs FROM installs;
+SELECT key, value FROM backend_markers;
+
+-- the backfill agrees with the events it was derived from
+SELECT COUNT(*) AS mismatched
+  FROM (SELECT project_id, install_id, MIN(day) AS d FROM events GROUP BY 1, 2) e
+  JOIN installs i USING (project_id, install_id)
+ WHERE i.first_seen_day <> e.d;
+
+-- no install may be first seen in the future, or before its own events
+SELECT COUNT(*) AS impossible FROM installs WHERE first_seen_day > date('now');
+```
+
+`mismatched` must be `0` immediately after the migration. It legitimately becomes
+non-zero later, in one direction only: once raw rows age out, `MIN(day)` rises
+while `first_seen_day` correctly stays put.
+
+## 9. `projects.retention_days` — per-project raw retention
+
+**What.** `migrations/0006_project_retention_days.sql` adds
+`retention_days INTEGER NOT NULL DEFAULT 90` to `projects`. The nightly sweep,
+`bucketDay`'s clamp and the read layer's raw/rollup boundary (`rawBoundaryDay`)
+all resolve it per project. Bounds are **90–400**, enforced by
+`clampRetentionDays` (`src/dates.ts`) on every read of the column and by the CLI
+on write: `node scripts/admin.mjs set-retention <projectId> <days>`.
+
+**Why (the risk).** The window was one constant compiled into the Worker, which
+is not a policy a multi-tenant deployment can hold: two projects in one database
+could not want different windows, and the only way to give one a longer one was
+to redeploy and silently give it to **everybody** — including projects whose §14
+disclosure said 90 days.
+
+**Why those bounds.** The minimum is 90 because a shorter window is not a storage
+tweak: `bucketDay` clamps an implausibly old `ts` onto the oldest surviving day
+and reads route at the same boundary, so shrinking it deletes history the read
+layer would still have served. The maximum is 400 = `MAX_RANGE_DAYS`: a read may
+span at most 400 days (§8.1), so raw rows kept beyond that could never be reached
+as raw rows — only billed.
+
+**Why clamp-on-read rather than a `CHECK`.** SQLite cannot add a `CHECK` to an
+existing table without rebuilding it, and rebuilding `projects` means dropping a
+table three others have foreign keys into. Clamping is also the safer failure
+mode: a hand-edited `5` becomes a 90-day window rather than an immediate mass
+delete.
+
+**What does not change.** Rollups are still kept indefinitely, the
+roll-**then**-delete order is still not negotiable, and each day is still served
+from exactly one source. What changed is that the boundary those three agree on
+is resolved per project — and no sweep crosses a project boundary any more.
+
+**Operational note.** The sweep is now two D1 statements *per project* per
+nightly run instead of two globally. Fine at today's scale; remember it at
+thousands of projects.
+
+**Files.** `migrations/0006_project_retention_days.sql` (new), `src/dates.ts`
+(`clampRetentionDays`, `MIN_RETENTION_DAYS`, `MAX_RETENTION_DAYS`,
+`rawCutoffDay`/`bucketDay` take the window), `src/rollup.ts` (per-project sweep),
+`src/lib/queries.ts` (`rawBoundaryDay`), `scripts/admin.mjs` (`set-retention`),
+`test/helpers.ts` (`setRetention`), `test/additions.test.ts`.
+
+**Migration step.** As above. `ADD COLUMN` with a `NOT NULL` constant default,
+which SQLite applies without a table rewrite, so **every existing project keeps
+exactly the 90 days it already had** and nothing changes until you run
+`set-retention`.
+
+**Verify.**
+
+```sql
+-- every project reads as 90 immediately after the migration
+SELECT id, retention_days FROM projects ORDER BY id;
+
+-- nothing outside the enforced bounds (the code clamps, but a hand-edited row
+-- should be found and fixed rather than silently folded on every read)
+SELECT id, retention_days FROM projects WHERE retention_days < 90 OR retention_days > 400;
+
+-- after `set-retention <id> 180`: that project should still hold raw rows older
+-- than the default cutoff, and a default project should not.
+SELECT project_id, MIN(day) AS oldest_raw_day FROM events GROUP BY project_id;
+```
+
+## 10. The dedupe tally excludes the `installs` statement
+
+**What.** A bug introduced by combining §6 with §8, found and fixed before
+release. §6 counts dedupes by walking the `db.batch()` results from
+`EVENT_STATEMENTS_FROM = 2` and counting statements reporting
+`meta.changes === 0`. §8's `INSERT OR IGNORE INTO installs` is appended **after**
+the events in the same batch, and when it hits a *known* install it reports zero
+changed rows in exactly the same way a deduped event does. The loop is now
+bounded at both ends:
+
+```ts
+const EVENT_STATEMENTS_FROM = 2;
+const EVENT_STATEMENTS_TO = EVENT_STATEMENTS_FROM + batch.events.length;
+```
+
+**Why it mattered.** Left alone, **every returning user** would have been counted
+as a replayed event. `events_deduped` — the one signal §6 tells operators to
+watch as evidence of an SDK bug — would have read as a sustained replay on
+perfectly healthy traffic, and the healthier the traffic (more repeat users) the
+worse the false signal. It is worth noting that this is the failure mode §6
+itself warns about, arriving from the opposite direction: an alert that is wrong
+in the direction of *always firing* is as useless as one that never does.
+
+**The test that would have caught it.** The existing "does not log
+`events_deduped` when nothing was deduped" case could not: it ingests a single
+batch into a freshly reset database, so its `installs` insert really does change
+a row. The new case ingests **two** batches from the **same** install and asserts
+the second reports no dedupes —
+
+> *`installs` is excluded from the dedupe tally: a returning install reports
+> `deduped=0`* (`test/additions.test.ts`)
+
+— which fails with `{"event":"events_deduped","events":1,"deduped":1}` if the
+loop bound is reverted to `results.length`.
+
+**Files.** `src/ingest.ts`, `test/additions.test.ts`.
+
+**Verify.** `npm test`, then in production watch `events_deduped` exactly as §6
+describes. The line should be absent on ordinary repeat traffic; low and
+occasional is the crash window working as designed; sustained, or
+`deduped === events` across many batches, is an emitter not advancing its queue
+marker.
+
+---
+
 ## Recommended, not implemented
 
 Each of these is a real improvement we deliberately left out of the code, with
@@ -500,6 +860,11 @@ ship the app update, revoke the old one only when the old build's traffic has
 decayed). Revoking before the fleet updates is a 401, and §7 makes a 401 a
 **permanent drop** — that is a data-loss incident caused by an admin action, so
 the UI must say so.
+
+**Partly answered since 0.3.0.** §7's `keys.last_used_at` supplies the fact that
+overlap window needs — "has the new key been used yet?" and "has the old key gone
+quiet?" — so the decay can be observed rather than guessed. The self-service flow
+and the warning copy are still yours to build.
 
 ### F. Things we checked and deliberately did **not** change
 

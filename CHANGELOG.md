@@ -44,6 +44,21 @@ every released tag rather than colliding with one.
   return **counts per day only** — no exported function returns an install id.
   `admin.mjs delete-install` now clears this table too, so the §13 erasure stays
   complete.
+- **`backend_markers`, and `firstSeenFloorDay()`** (also migration
+  `0005_installs.sql`) — the backfill above is honest but was indistinguishable
+  from exact data. For an install whose first event had already aged out,
+  `MIN(day)` is the oldest *surviving* day, so the install reads as having
+  arrived on the retention boundary and a cohort chart drawn across the migration
+  date shows a boundary spike a consumer cannot tell from a real one. `0005` now
+  also creates a one-purpose `backend_markers (key, value)` STRICT table and
+  writes `installs_backfill_day` = the UTC day the migration ran, in the same
+  migration as the backfill so the two cannot disagree. The reader-facing half is
+  one exported helper, `firstSeenFloorDay(db, projectId): Promise<string | null>`,
+  returning that project's `rawCutoffDay(markerDay, retention_days)` — installs
+  with `first_seen_day` **≤** the floor may have been first seen earlier;
+  everything above it is exact. `null` means there is no marker (a fresh
+  deployment) and must be read as "all exact", never "unknown". Per project, so a
+  project keeping 180 days is not told 90 days of exact rows are suspect.
 - **`projects.retention_days`** (migration `0006_project_retention_days.sql`,
   default `90`, bounds 90–400) — raw retention becomes per project. The nightly
   sweep deletes per project instead of globally, `bucketDay` clamps an
@@ -55,10 +70,46 @@ every released tag rather than colliding with one.
   never be read as raw rows). Bounds are clamped on read rather than enforced as
   a CHECK, so a hand-edited row degrades to 90 instead of deleting history. New
   `admin.mjs set-retention <projectId> <days>`.
-- 29 new conformance cases (`backends/cloudflare/test/additions.test.ts`) cover
+- 35 new conformance cases (`backends/cloudflare/test/additions.test.ts`) cover
   the coalescing window, the revoked-key case, ingest and purge behavior for
-  `installs`, the project-delete cascade, and per-project sweep and boundary
-  routing.
+  `installs`, the project-delete cascade, per-project sweep and boundary routing,
+  the dedupe-tally fix below, and `firstSeenFloorDay` (marker written by the real
+  migration; `null` without it; the cutoff with it; per-project retention
+  respected; an out-of-range window clamped).
+
+### Fixed
+
+- **The `events_deduped` tally no longer counts the `installs` write.** The
+  per-event dedupe count (0.2.0, migration `0003`) walks the `db.batch()` results
+  for statements reporting `meta.changes === 0`, which is how an
+  `ON CONFLICT DO NOTHING` event reports itself. The new `INSERT OR IGNORE INTO
+  installs` is appended after the events in the *same* batch and reports zero
+  changed rows in exactly the same way whenever it hits a **known** install — so
+  every returning user was being counted as a replayed event, and
+  `events_deduped`, the signal operators are told to watch as evidence of an SDK
+  bug, would have read as a sustained replay on healthy traffic. The loop is now
+  bounded at both ends (`EVENT_STATEMENTS_TO`), and a regression test ingests two
+  batches from the same install and asserts the second reports no dedupes.
+- **`docs/SAAS-HANDOFF.md` §2a's SDK-drift query referenced columns that do not
+  exist.** It selected `batches.sdk_version` and filtered on `batches.sent_at`;
+  both live on `batch_context` (`0001_init.sql`), while `batches` holds only
+  `batch_id`, `project_id`, `received_at` and `event_count`. The query now joins
+  `batch_context` to `events` on the full `(project_id, batch_id)` key — both
+  tables are keyed on the pair so a `batchId` colliding across tenants cannot mix
+  projects — and filters on `events.day`, because `sent_at` is a §0 ISO 8601
+  string with a `T` and a `Z` while `datetime('now', …)` renders neither, so
+  comparing them as strings did not mean what it looked like. The surrounding
+  prose is corrected too.
+
+### Documentation
+
+- **`backends/cloudflare/ADOPTION.md` gained a `0.3.0` section** (§§7–10), in the
+  same What / Why / Files / Migration / Verify shape as the 0.2.0 hardening pass,
+  covering each of `0004`–`0006`, the backfill marker, the dedupe-tally fix, and
+  — recorded as a decision rather than left implicit — that `installs` is kept
+  **indefinitely** today, with a documented (deliberately unimplemented) option to
+  expire rows by the project's own `retention_days` and the three questions to
+  settle first. §E "Key rotation ergonomics" now points at `keys.last_used_at`.
 
 ### Changed
 
