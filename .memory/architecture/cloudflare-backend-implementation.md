@@ -5,11 +5,11 @@ permalink: swift-stats/architecture/cloudflare-backend-implementation
 tags: [backend, cloudflare, worker, d1]
 source_paths: [backends/cloudflare/README.md]
 source_paths_inferred: false
-source_sha: 62260b92163bc6f967af77253722d4f7322299d6
+source_sha: 677619ffc8e8943526b3f00837f51334fc97bf9c
 created: 2026-08-19
 updated: 2026-08-19
 reviewed: 2026-08-19
-reviewed_by: audit:claude-haiku-4-5
+reviewed_by: audit:claude-code (background)
 ---
 
 ## Observations
