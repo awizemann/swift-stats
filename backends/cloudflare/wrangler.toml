@@ -29,6 +29,9 @@ crons = ["10 2 * * *"]
 enabled = true
 
 [observability.logs]
-# Ingest bodies are never logged (schema §7: never echo the body). Only
-# status/shape counters reach the log.
-invocation_logs = true
+# Invocation logs are OFF: they record each request's URL (read query strings)
+# and request metadata, which can include Cloudflare's IP-derived geography and
+# custom headers such as X-Stats-Read-Key — contradicting README §10/§13 (no
+# IP-derived data, no key in logs). The worker's own structured logger lines
+# (key-only, closed field list) still reach Workers Logs.
+invocation_logs = false
