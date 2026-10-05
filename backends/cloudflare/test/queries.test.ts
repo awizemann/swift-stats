@@ -31,7 +31,7 @@ import {
 } from '../src/lib/queries.js';
 import { HttpError } from '../src/errors.js';
 import type { Env } from '../src/env.js';
-import { INSTALLS, PROJECT, resetDatabase, seedEvents } from './helpers.js';
+import { INSTALLS, PROJECT, resetDatabase, seedEvents, snapshotDatabase } from './helpers.js';
 
 const DB = (env as unknown as Env).DB;
 
@@ -272,15 +272,15 @@ describe('direct calls return the endpoint numbers', () => {
   });
 
   it('is safe: a read writes nothing', async () => {
-    const count = async () =>
-      (await DB.prepare(`SELECT COUNT(*) AS n FROM events`).first<{ n: number }>())?.n;
-    const before = await count();
+    // Every table, by contents, with no exemption: the lib does not authorize, so
+    // unlike the HTTP layer it has no `keys.last_used_at` touch to excuse.
+    const before = await snapshotDatabase();
     await summary(DB, { projectId: PROJECT, from: D(4), to: D(2), now: NOW });
     await topEvents(DB, { projectId: PROJECT, from: D(4), to: D(2), now: NOW });
     await propBreakdown(DB, {
       projectId: PROJECT, from: D(4), to: D(2), name: 'project_opened', now: NOW,
     });
-    expect(await count()).toBe(before);
+    expect(await snapshotDatabase()).toEqual(before);
   });
 
   it('summaryRows() accepts a range resolved separately, for a caller that reuses one', async () => {

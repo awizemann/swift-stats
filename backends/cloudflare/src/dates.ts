@@ -122,6 +122,26 @@ export function rawCutoffDay(now: Date, retentionDays: number = RAW_RETENTION_DA
 }
 
 /**
+ * The oldest day whose raw rows are COMPLETE for a project: the clock cutoff for
+ * its window, or its `raw_complete_from` marker (0007) when that is newer.
+ *
+ * The two differ only after a retention increase. The cutoff moves back at once;
+ * the days it moves over were already swept under the old window, so their raw
+ * rows are gone and their rollups are the only copy. Below this floor, a raw row
+ * is never written (ingest clamps to it), never read as the answer for its day
+ * (`rawBoundaryDay`), and never rolled up over the day's rollup (the sweep). A
+ * NULL marker, or one the cutoff has passed, leaves the cutoff in charge.
+ */
+export function rawFloorDay(
+  now: Date,
+  retentionDays: number = RAW_RETENTION_DAYS,
+  rawCompleteFrom: string | null = null,
+): string {
+  const cutoff = rawCutoffDay(now, retentionDays);
+  return rawCompleteFrom !== null && rawCompleteFrom > cutoff ? rawCompleteFrom : cutoff;
+}
+
+/**
  * The UTC day an event is aggregated under.
  *
  * `ts` is stored verbatim, but §10 requires tolerating a future-dated or
@@ -134,6 +154,7 @@ export function bucketDay(
   ts: string,
   now: Date,
   retentionDays: number = RAW_RETENTION_DAYS,
+  rawCompleteFrom: string | null = null,
 ): string {
   const day = ts.slice(0, 10);
   const max = today(now);
@@ -142,7 +163,13 @@ export function bucketDay(
   // 90-day boundary for a project that keeps 180 would land it on a day that
   // project's sweep will not delete for another 90 days, and would report it as
   // activity on a day it did not happen.
-  const min = rawCutoffDay(now, retentionDays);
+  //
+  // …but never below `raw_complete_from` (0007). Right after a retention
+  // increase the new cutoff sits in days already swept under the old window; one
+  // row landing there would be read as that day's whole answer and, when the day
+  // expired again, rolled up over its real history. A late or wrong-clock event
+  // for such a day lands on the oldest raw-complete day instead.
+  const min = rawFloorDay(now, retentionDays, rawCompleteFrom);
   if (day < min) return min;
   return day;
 }

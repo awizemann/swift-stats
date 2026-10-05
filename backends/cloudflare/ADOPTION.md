@@ -231,7 +231,9 @@ status, never propagate as a bare 500.
 - A prominent header comment in `src/ratelimit.ts` stating that the counters are
   per-isolate and therefore **not a global ceiling**.
 - A new `READ_LIMIT_PER_WINDOW = 120` applied to `/v1/summary` and
-  `/v1/events/top`; `checkPreAuthRate` takes an optional `limit`.
+  `/v1/events/top`. (`checkPreAuthRate` first took an optional `limit`; it now
+  takes an endpoint, `'ingest' | 'read'`, which picks both the ceiling and a
+  separate bucket — see §11.)
 - Ingest limits deliberately left at 600/min, with the reasoning written down.
 - The README's rate-limiting table updated to match.
 
@@ -263,7 +265,7 @@ a 401 — so it is a DoS backstop, not a quota.
 
 **Files / functions.** `src/ratelimit.ts` (header comment,
 `READ_LIMIT_PER_WINDOW`, `checkPreAuthRate` signature), `src/read.ts` (both
-handlers pass `READ_LIMIT_PER_WINDOW`), `README.md` ("Rate limiting").
+handlers pass `'read'`), `README.md` ("Rate limiting").
 
 **Migration / config.** None in code. **Do** deploy the durable limit: the
 README carries a ready Cloudflare Rate Limiting ruleset (WAF → Rate limiting
@@ -515,7 +517,8 @@ readable as "last live use" afterwards.
 `installs (project_id, install_id, first_seen_day)`, PK `(project_id,
 install_id)`, `ON DELETE CASCADE` to `projects`, plus the
 `installs_first_seen (project_id, first_seen_day)` index, and backfills it from
-surviving raw events. Ingest writes **one `INSERT OR IGNORE` per batch** covering
+surviving raw events. Ingest writes **one upsert per batch** (originally
+`INSERT OR IGNORE`; see §11) covering
 every distinct install in it, in the *same* `db.batch()` as the events. The read
 side is two functions in `src/lib/queries.ts`: `firstSeenRows` (per-day counts)
 and `totalInstalls` (cumulative).
@@ -545,20 +548,26 @@ growth number are built out of. Without it a project that has run for a year can
 say how many installs were active 200 days ago and can never say how many were
 new.
 
-**Why `OR IGNORE` here when §6 argues against it for events.** §6 rejects
-`INSERT OR IGNORE` on `events` because it would also swallow the `NOT NULL` /
-STRICT-datatype failures that §2 maps to an honest `400`. That argument does not
-carry here: the row is three columns the Worker constructs itself, its only
-realistic conflict is the primary key, and suppressing it is the entire point —
-`OR IGNORE` is what makes `first_seen_day` **immutable**, so the stored day is
-the first sighting and never the most recent.
+**Why an upsert that only moves the day earlier.** This first shipped as
+`INSERT OR IGNORE`, on the reasoning that suppressing the primary-key conflict
+made `first_seen_day` immutable — the first sighting, never the latest. But
+"first to arrive" is not "first seen": §1's offline queue can deliver today's
+batch before the one queued three days ago, and the install then read as new
+today, forever. It is now
+`ON CONFLICT (project_id, install_id) DO UPDATE SET first_seen_day =
+excluded.first_seen_day WHERE excluded.first_seen_day < installs.first_seen_day`
+— the minimum over every sighting, independent of arrival order, and still a
+no-op for any later sighting. (The §6 argument against `OR IGNORE` on `events`
+— it swallows `NOT NULL`/STRICT failures — never applied to this three-column
+row the Worker builds itself; the change is about arrival order, not that.)
 
 **§13.** This keeps an `install_id` — the SDK's own salted-hash identifier (§9),
 not one of this backend's invention — past the raw retention window. That has to
 be stated, not discovered: **raw events go at the cutoff; a bare install id and a
 day survive.** The erasure obligation still resolves completely
 (`delete-install` deletes from `installs` as well as `events`), a project delete
-cascades, and **no exported read function returns an install id** — `firstSeenRows`
+cascades to `installs` (and, since `0008`, to the raw tables too — before it, a
+project delete left `events`, `batches` and `batch_context` behind), and **no exported read function returns an install id** — `firstSeenRows`
 returns counts per day, and there is no code path in the read contract that
 returns one. Both READMEs disclose the exemption; a self-hoster's own privacy
 policy may need the same sentence.
@@ -732,9 +741,16 @@ roll-**then**-delete order is still not negotiable, and each day is still served
 from exactly one source. What changed is that the boundary those three agree on
 is resolved per project — and no sweep crosses a project boundary any more.
 
-**Operational note.** The sweep is now two D1 statements *per project* per
-nightly run instead of two globally. Fine at today's scale; remember it at
-thousands of projects.
+**Operational note.** The sweep is per project — and, since §11, so is the
+rollup, with one delete statement per expiring project-day. Fine at today's
+scale; remember it at thousands of projects.
+
+**Read-boundary correction (§11).** "The boundary those three agree on is resolved
+per project" was true of the sweep and the clamp but wrong for reads:
+`rawBoundaryDay` used the project's *clock* cutoff, so raising a project from 90
+to 180 days routed the 90 days already swept under the old window to raw rows
+that no longer existed — zeros, with the rollups holding the real numbers. Reads
+now route on observed raw rows (see §11).
 
 **Files.** `migrations/0006_project_retention_days.sql` (new), `src/dates.ts`
 (`clampRetentionDays`, `MIN_RETENTION_DAYS`, `MAX_RETENTION_DAYS`,
@@ -757,6 +773,8 @@ SELECT id, retention_days FROM projects ORDER BY id;
 -- should be found and fixed rather than silently folded on every read)
 SELECT id, retention_days FROM projects WHERE retention_days < 90 OR retention_days > 400;
 
+-- Raise retention ONLY with `admin.mjs set-retention` or `setProjectRetention`
+-- (src/retention.ts): both move `raw_complete_from` (0007) in the same UPDATE.
 -- after `set-retention <id> 180`: that project should still hold raw rows older
 -- than the default cutoff, and a default project should not.
 SELECT project_id, MIN(day) AS oldest_raw_day FROM events GROUP BY project_id;
@@ -767,7 +785,8 @@ SELECT project_id, MIN(day) AS oldest_raw_day FROM events GROUP BY project_id;
 **What.** A bug introduced by combining §6 with §8, found and fixed before
 release. §6 counts dedupes by walking the `db.batch()` results from
 `EVENT_STATEMENTS_FROM = 2` and counting statements reporting
-`meta.changes === 0`. §8's `INSERT OR IGNORE INTO installs` is appended **after**
+`meta.changes === 0`. §8's `installs` write (then `INSERT OR IGNORE`, now an
+upsert with the same zero-changes behaviour on a known install) is appended **after**
 the events in the same batch, and when it hits a *known* install it reports zero
 changed rows in exactly the same way a deduped event does. The loop is now
 bounded at both ends:
@@ -804,6 +823,218 @@ describes. The line should be absent on ordinary repeat traffic; low and
 occasional is the crash window working as designed; sustained, or
 `deduped === events` across many batches, is an emitter not advancing its queue
 marker.
+
+---
+
+## 11. Cross-project integrity of the nightly job and the read boundary
+
+**What.** One audit and its follow-up review, ten fixes, each with a failing test first
+(`test/integrity.test.ts` unless noted).
+
+1. **Rollups are per project** (`rollupStatements(env, day, rolledAt,
+   projectId)`). The rollup was DELETE-then-INSERT for a whole *day* across every
+   project. Since `0006` windows differ per project, so the night a 180-day
+   project expired a day, the re-roll also deleted a 90-day neighbour's rollup
+   for that day and rebuilt it from raw rows swept 90 days earlier — nothing.
+   The same happened the night after one project's delete failed, and after a
+   `set-retention` change. Both halves are now scoped to `project_id`, and the
+   trailing re-roll and the expiring-day roll iterate `projects`.
+2. **`0008_raw_tables_cascade.sql`** rebuilds `events`, `batches` and
+   `batch_context` with `REFERENCES projects(id) ON DELETE CASCADE` (columns,
+   STRICT, the AUTOINCREMENT `id` and its counter, and all seven indexes
+   including `events_identity` preserved), copying only rows whose project
+   exists. Before it, a project delete left orphaned raw rows; the day-wide
+   rollup then failed its FK into the rollup tables for any day with one, which
+   failed the whole day's batch and skipped retention for **every** project,
+   every night. The job now also ages out orphans below the oldest live cutoff
+   (an index range that is empty in the steady state, not a nightly
+   `NOT IN` scan) for a Worker deployed ahead of the migration. `0005`'s
+   backfill gained `WHERE project_id IN (SELECT id FROM projects)`: `OR IGNORE`
+   does not cover a foreign-key failure, so one orphaned event aborted it.
+3. **`rawBoundaryDay`** is `min(oldest raw day, today - 89)` — the second term
+   being the newest day *any* sweep can ever have deleted — instead of the
+   project's clock cutoff. Raising retention no longer turns already-swept days
+   into zeros. Quiet projects keep the old behaviour (older days from rollups).
+   It is also capped from below by `raw_complete_from` (item 9).
+4. **The §8.2 prop cap ranks by presence.** It summed value rows **and** the null
+   row, which counts events *lacking* the prop, so every prop reported on the
+   same days tied and byte order dropped the frequent one. The raw branch's own
+   `LIMIT` is gone (the cap is applied once, over merged totals), and the raw null
+   row now uses the rollup's per-day rule, so a day gives the same null row from
+   either store.
+5. **Per-project isolation in the sweep.** Each project's sweep has its own
+   `try/catch`; a trailing-roll failure skips only that project's delete. Each
+   expiring project-day is rolled and deleted in **one `db.batch()`** — atomic,
+   so a day is rolled and gone or neither — not a `LIMIT`/rowid loop, because a
+   chunked delete interrupted mid-day leaves a partial day that the next night
+   would re-roll over a complete rollup. The delete re-checks the project's
+   *current* window in SQL, so a `set-retention` raise that lands mid-pass makes
+   it a no-op rather than deleting days the new window keeps; the moot-marker
+   clear is decided in SQL from the current row for the same reason.
+6. **`installs.first_seen_day`** is an upsert that only moves earlier (§8).
+   Test: out-of-order batches.
+7. **Rate-limit buckets are per endpoint** (`checkPreAuthRate(key, now,
+   'ingest' | 'read')`). The public write key presented to a read endpoint used
+   to spend its fleet's ingest bucket. The README now says plainly that the same
+   key can still exhaust its own ingest bucket via `/v1/events`, and that the WAF
+   rule is the control for that.
+8. **Tests.** The misnamed "still rejects a data-shaped failure" ingest case is
+   renamed for what it checks (a duplicate `batchId` still aborts the batch) and
+   a real data-shaped case added; the "a read writes nothing" cases compare the
+   full contents of every table (`snapshotDatabase` in `test/helpers.ts`) rather
+   than `COUNT(*) FROM events`.
+
+9. **`raw_complete_from` (`0007`): a retention increase no longer treats swept
+   days as raw.** Fix 3 alone left a hole the audit probed: after 90 → 180, one
+   legitimate late batch for a day D that the old window had already swept
+   (inside the new one) wrote a raw row into D; `rawBoundaryDay` dropped to D, so
+   every day between D and `today - 89` read raw — false zeros — and the night D
+   expired under the new window the sweep re-rolled D from that lone row, replacing
+   its real rollup. Wrong-clock events clamped onto the new cutoff did the same.
+   `0007` adds `projects.raw_complete_from`, set by **`setProjectRetention`**
+   (`src/retention.ts`, exported from `./lib`) and by `admin.mjs set-retention`
+   (identical SQL) on an increase, to the old clock cutoff — or the project's
+   oldest raw day if older, since an unswept day is complete. The effective raw
+   floor is `max(rawCutoffDay(now, retention_days), raw_complete_from)`
+   (`rawFloorDay`, `src/dates.ts`), used by ingest clamping (`bucketDay`), by
+   `rawBoundaryDay` (never routes below it to raw) and by the sweep (raw rows
+   below it are deleted **without** being rolled — the rollup is authoritative).
+   The sweep clears the marker once the clock cutoff passes it. **Do not raise
+   retention with a bare `UPDATE projects SET retention_days`** — that skips the
+   marker. The only other writer found: the hosted dashboard
+   (`swiftstats.co`) reads `retention_days` but does not write it (its tests
+   UPDATE it directly, which is fine for reads). If it ever offers a retention
+   setting, it must call `setProjectRetention`.
+10. **The nightly pass has a per-invocation query budget.** D1 caps queries per
+    Worker invocation (1,000 Cloudflare-service subrequests on Workers Free,
+    10,000 on Paid — see C below), and the pass used to issue roughly 8 per
+    project plus 8, every night, regardless of
+    whether a project had anything to do. Now: one query picks the projects with
+    work (raw rows or rollups in the trailing window, or raw rows below their
+    cutoff), ordered by `projects.rolled_at` (`0007`, last *visited* by a pass,
+    never-visited first). Idle projects cost nothing and are not written. A
+    project's whole trailing re-roll is one batch; each expiring day is one
+    roll-and-delete batch; a project's expiring days per night are capped at
+    `sweepDaysCap` (25% of the budget, at most `MAX_SWEEP_DAYS_PER_PROJECT` = 31,
+    which bounds one tenant's share of the night's wall time), after which it is
+    marked visited
+    and goes to the back, so a deep backlog (400 → 90 is 310 days) drains a slice
+    a night without starving anyone. The pass stops cleanly before
+    `DEFAULT_QUERY_BUDGET` (900, or the `ROLLUP_QUERY_BUDGET` var) and before 10
+    minutes of wall time (`PASS_WALL_BUDGET_MS`), always keeping
+    its fixed tail (bookkeeping, purges, lease release) in hand; a project the
+    budget did not reach stays unvisited and goes first the next night. Each
+    project's `rolled_at` is written inside its own last batch (its trailing
+    re-roll, or each expiring-day batch), not in the tail, so a pass killed
+    part-way still rotates the projects it worked on. The budget is clamped to at
+    least `MIN_QUERY_BUDGET` (16). Work left
+    over is logged as `rollup_work_left` (`rows` = projects not reached, `events`
+    = projects with backlog left) — alert on it being non-zero for several
+    nights. `rollup_state`'s cross-project `COUNT` is one statement per pass.
+    Tests: twelve projects on a small budget are all rolled and swept across
+    nights, each night within budget and making progress; fresh traffic every
+    night cannot starve later projects; a 300-day backlog drains while its
+    neighbour's yesterday is rolled every night; idle projects cost no queries;
+    a raise injected mid-pass neither loses raw rows nor loses its marker.
+
+**Migration step — `0007` with the deploy, `0008` scheduled.**
+
+`0007` is two `ADD COLUMN`s: instant, no rewrite. **The new Worker code needs
+it** (`resolveKey` and the nightly pass read its columns) — deploy without it and
+every request fails. The code does **not** need `0008`: it rolls and sweeps
+around orphans without it.
+
+The two were numbered this way so the cheap one can go first, but **wrangler
+cannot stop part-way**: `wrangler d1 migrations apply` (and so `npm run deploy`,
+which runs it) applies every pending migration, in order, with no option to stop
+after one. So either:
+
+- **Apply both together**, after rehearsing `0008` as below — `npm run deploy`
+  does exactly that; or
+- **Apply `0007` alone and record it, then deploy the Worker without `migrate`,
+  and schedule `0008`.** Rehearsed against a local database with wrangler 4:
+
+  ```sh
+  # 1. run 0007's statements
+  wrangler d1 execute stats --remote --file migrations/0007_raw_complete_from.sql
+  # 2. record it as applied, so `migrations apply` never runs it twice
+  wrangler d1 execute stats --remote \
+    --command "INSERT INTO d1_migrations (name) VALUES ('0007_raw_complete_from.sql')"
+  # 3. confirm only 0008 is pending
+  wrangler d1 migrations list stats --remote
+  # 4. ship the Worker WITHOUT `npm run deploy` (which would migrate everything)
+  wrangler deploy
+  # 5. later, in a quiet window, after the checks below
+  wrangler d1 migrations apply stats --remote
+  ```
+
+  `d1_migrations` is wrangler's own bookkeeping table (`id`, `name`,
+  `applied_at` defaulting to now); step 2 is exactly the row `migrations apply`
+  would have written. Add `--config wrangler.prod.toml` to each command if that
+  is how you address the real database.
+
+**Projects whose retention was raised BEFORE this release** have no
+`raw_complete_from`, and so none of its protection for the days their old window
+had already swept. Set it by hand to the old clock cutoff on the day of the
+raise — **raise day − (old window − 1) days** — for any project where that date
+is still later than today's cutoff for its current window (today − (new window −
+1) days); otherwise the old swept days have aged out already and there is
+nothing to protect:
+
+```sql
+-- raised from 90 to 180 days on 2026-09-20: the old cutoff that day was 2026-06-23
+UPDATE projects SET raw_complete_from = date('2026-09-20', '-89 days') WHERE id = '<projectId>';
+```
+
+Use that computed date even if the raise happened between 00:00 and the 02:10
+sweep, when a day or two below it still had raw rows: treating those days as
+swept only means they are read from, and kept as, their rollups — which exist,
+because every day is rolled while it is in the trailing re-roll window.
+
+Know what a hand-set marker does to LATE rows: from then on, ingest clamps a
+late or wrong-clock event for any day below it onto the marker day, and raw rows
+already sitting below it (written before you set it) are **deleted with the
+raw data when they expire and are NOT added to those days' rollups** — the
+rollups below the marker are taken as complete and never rebuilt from raw. That
+is the point (a stray row must not replace a day's history), but it means a
+genuine late batch that landed below the marker before you set it is dropped
+from the aggregates. A marker the clock cutoff has already passed is harmless;
+the next pass clears it.
+
+`0008` rebuilds the three raw tables. Before applying it to a real deployment:
+
+- **Storage peaks at roughly 2× `events` + its indexes** while the copy and the
+  old table coexist, until the `DROP`. Check headroom against your database
+  size limit (500 MB Free, 10 GB Paid).
+- **It is one atomic request.** D1 runs the migration file as one transaction,
+  and a request is limited to 30 seconds of query duration; a large `events`
+  table can exceed that (or the Worker CPU behind it) and fail — harmlessly,
+  since it rolls back, but it will not have run. On Workers Free it also spends
+  rows written against the daily limit (every raw row, plus every index entry,
+  once).
+- **Ingest stalls while it runs**: D1 is single-writer, so batches queue behind
+  it and retry (§7 retains on 5xx). Run it well away from the 02:10 UTC cron and
+  from your traffic peak.
+- **Take a Time Travel bookmark first**: `wrangler d1 time-travel info stats`
+  prints the current bookmark; note it, so `wrangler d1 time-travel restore
+  stats --bookmark=<it>` can undo the migration (retention: 7 days Free, 30
+  Paid).
+- **Rehearse on a copy**: `wrangler d1 export stats --remote --output dump.sql`,
+  load it into a local database (`wrangler d1 execute stats --local --file
+  dump.sql`), then `wrangler d1 migrations apply stats --local` and time it.
+
+It rewrites every surviving raw row once — count `events` first. Check orphans
+beforehand if you want to know what it will drop:
+
+```sql
+SELECT 'events' AS t, COUNT(*) FROM events WHERE project_id NOT IN (SELECT id FROM projects)
+UNION ALL SELECT 'batches', COUNT(*) FROM batches WHERE project_id NOT IN (SELECT id FROM projects)
+UNION ALL SELECT 'batch_context', COUNT(*) FROM batch_context WHERE project_id NOT IN (SELECT id FROM projects);
+```
+
+**Not recoverable by this change:** rollups already wiped by the old day-wide
+re-roll. Their raw rows were gone before the wipe, so there is nothing to
+re-roll from.
 
 ---
 
@@ -846,17 +1077,71 @@ aggregates it. A monthly rollup table written by the same cron, keyed
 surface, not hardening, and because §13's posture means you should decide
 deliberately what you retain.
 
-### C. A cap on the rollup's expiring-day sweep
+### C. A cap on the rollup's expiring-day sweep — and the pass's capacity
 
-`runRollupAndSweep` (`src/rollup.ts`) issues `SELECT DISTINCT day FROM events
-WHERE day < cutoff` and rolls **every** returned day before deleting. If the
-cron has not run for months this is an unbounded loop inside one invocation. It
-is *safe* — the delete is abandoned entirely if any day fails to roll, and the
-lease is released in a `finally` — but it can fail to make progress by running
-out of time. A cap (roll at most N expiring days per pass, delete only up to the
-oldest day actually rolled) would make progress monotonic. Left out because it
-changes the retention boundary logic, which is the one irreversible operation in
-this backend and deserves its own change with its own tests.
+**Done for the query count (§11 item 10); still open for CPU and wall time.**
+
+**The limits that bind the nightly pass**, from
+developers.cloudflare.com/workers/platform/limits (checked 2026-10-05):
+
+| Limit | Workers Free | Workers Paid |
+|---|---|---|
+| Subrequests to Cloudflare services (each D1 call) per invocation | 1,000 | 10,000 (configurable) |
+| Cron Trigger wall time | 15 min | 15 min |
+| Cron Trigger CPU time | 10 ms | 30 s (daily cron) |
+| One D1 query or `db.batch()` (developers.cloudflare.com/d1/platform/limits) | 30 s | 30 s |
+| Bound parameters per statement | 100 | 100 |
+
+Every D1 binding call is a subrequest to a Cloudflare service; a `db.batch()` is
+one binding call, so it counts once however many statements it carries. (The
+50-per-request subrequest figure on Free applies to external `fetch` only. The D1
+limits page still lists "50 / 1,000 queries per Worker invocation" while pointing
+at these same subrequest limits; the Workers page is the current statement.)
+
+**Capacity, in those units** (one per `run`/`all`/`first`, one per `db.batch()`):
+
+```
+fixed per night = 8      (lease, project select, 6-query tail)
+per project     = 1      if it has rows or rollups in the trailing 4 days
+                + 1 + d  if it has d days expiring tonight
+                         (d ≤ min(31, 25% of the budget): sweepDaysCap)
+```
+
+A daily-active project past its first window has one day expiring every night,
+so it costs **3**. At the default budget of **900** (headroom under Free's 1,000)
+that is **(900 − 8) / 3 = 297 daily-active projects** before work carries over to
+the next night; a project younger than its window costs 1. On Workers Paid,
+`ROLLUP_QUERY_BUDGET` can go higher — but the next ceiling is **wall time**, not
+queries: the pass stops starting new work after `PASS_WALL_BUDGET_MS` (10 min of
+the cron's 15), and a re-roll is a heavy batch (`json_each` over a project-day's
+props, six DELETE-then-INSERTs). At ~0.5–2 s per batch, 10 minutes is roughly
+300–1,200 batches, so on a busy deployment wall time binds before a 900 budget
+does. Either way, past the ceiling `rollup_work_left` shows `rows > 0` night
+after night and the backlog grows; that is the signal to shard the pass.
+
+**CPU on Workers Free is 10 ms per cron invocation — the most likely way a Free
+pass ends early.** D1 round trips are I/O and do not count, but building the
+statements does (about a dozen per project-day, plus JSON handling of each
+result). It is not measured here. When the limit is hit the invocation is
+terminated mid-pass with an `exceededCpu` outcome: the tail does not run and the
+lease is only freed when its 30-minute TTL lapses (well before the next night).
+Nothing is lost — every batch is atomic, a day is rolled-and-deleted or neither,
+and each project's rotation (`rolled_at`) is written inside its own batches
+rather than in the tail, so the projects that did get work move to the back and
+the next night starts with the rest. Watch Workers Logs / the dashboard's
+invocation status for `exceededCpu` on the scheduled handler (or
+`scheduled_done` going missing); if it shows up, lower `ROLLUP_QUERY_BUDGET` until
+it stops, or move to Workers Paid (30 s CPU for a daily cron). The budget cannot
+be set below `MIN_QUERY_BUDGET` (16): under that a night has no room for even one
+project's work after the fixed cost, so it would never rotate.
+
+The pass stops before its budget (or its wall-time budget) and resumes the next night in
+least-recently-visited order, and progress is monotonic: every finished day is
+rolled and deleted, every unfinished one whole. What it does not bound is CPU and
+wall time per query — each rollup batch runs `json_each` over one project-day's
+props, and one huge project-day can approach the 30-second ceiling on its own.
+Sharding a single project-day is the next step if that ever happens; it is not
+needed at the reference deployment's scale.
 
 ### D. Alerting on the scheduled job
 
@@ -910,9 +1195,12 @@ Recorded so you do not re-litigate them:
 - **`wrangler.prod.toml` holds no secrets** (there are none — keys live hashed
   in D1) and is git-ignored at the repo root. Keep it that way; the only reason
   it is ignored is the real D1 id and route, not credentials.
-- **Migrations are additive.** `0002` rebuilds three tables to add
-  `ON DELETE CASCADE`; it is written to run once and `0001` is never edited
-  because it is applied on the reference deployment. Follow the same rule.
+- **Migrations are additive.** `0002` and `0008` rebuild tables to add
+  `ON DELETE CASCADE`; each is written to run once, and `0001` is never edited
+  because it is applied on the reference deployment. Follow the same rule. The
+  one deliberate exception is a guard added to `0005`'s backfill (§11): D1
+  records applied migrations by name, so the edit is invisible where `0005` has
+  run and is what lets a deployment that has not run it get past it.
 
 ---
 

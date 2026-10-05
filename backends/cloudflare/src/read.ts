@@ -17,7 +17,7 @@
 
 import { json, unauthorized } from './errors.js';
 import { requireScope, resolveKey, touchKey, type KeyScope } from './keys.js';
-import { checkPreAuthRate, READ_LIMIT_PER_WINDOW } from './ratelimit.js';
+import { checkPreAuthRate } from './ratelimit.js';
 import { SCHEMA_VERSION } from './validate.js';
 import { logger } from './log.js';
 import type { Env } from './env.js';
@@ -98,10 +98,12 @@ export async function handleSummary(
   // documents a 429 with `Retry-After` on the read endpoints; without a limiter
   // here there was no code path that could ever emit one.
   //
-  // The READ ceiling, not the ingest one: a read key is one dashboard, while an
-  // ingest key is a whole fleet, so the two cannot share a number. See
-  // `ratelimit.ts` — and note that the limiter is per-isolate and advisory.
-  await checkPreAuthRate(presentedKey, now.getTime(), READ_LIMIT_PER_WINDOW);
+  // The READ ceiling and the READ bucket, not the ingest ones: a read key is one
+  // dashboard, while an ingest key is a whole fleet, so the two cannot share a
+  // number — and the public write key presented here must not spend its fleet's
+  // ingest bucket. See `ratelimit.ts` — and note that the limiter is per-isolate
+  // and advisory.
+  await checkPreAuthRate(presentedKey, now.getTime(), 'read');
   const scope = await resolveKey(env.DB, presentedKey, 'read');
   // The one write on a read path (0004): a coalesced `keys.last_used_at` touch,
   // at most once per minute per key. It is invisible in the response and changes
@@ -137,7 +139,7 @@ export async function handleTopEvents(
 ): Promise<Response> {
   const url = new URL(request.url);
   const presentedKey = request.headers.get('x-stats-read-key');
-  await checkPreAuthRate(presentedKey, now.getTime(), READ_LIMIT_PER_WINDOW);
+  await checkPreAuthRate(presentedKey, now.getTime(), 'read');
   const scope = await resolveKey(env.DB, presentedKey, 'read');
   // See `handleSummary`: deferred so it never sits in front of the response.
   ctx.waitUntil(touchKey(env.DB, scope, now));

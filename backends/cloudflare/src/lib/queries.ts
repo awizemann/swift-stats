@@ -25,11 +25,11 @@
 //
 // Every day in a requested range is answered from exactly one source:
 //
-//     day >= rawCutoff  ->  raw `events` rows      (exact distinct counts)
-//     day <  rawCutoff  ->  the daily rollup tables (see the caveat below)
+//     day >= boundary  ->  raw `events` rows      (exact distinct counts)
+//     day <  boundary  ->  the daily rollup tables (see the caveat below)
 //
-// The boundary is the retention sweep's, so the two sets are disjoint and
-// complete. Preferring raw inside the window is what makes a late-arriving
+// The boundary is where the retention sweep has actually left raw rows (see
+// `rawBoundaryDay`), so the two sets are disjoint and complete. Preferring raw inside the window is what makes a late-arriving
 // offline batch (§1: a queued batch can be hours or days old) visible
 // immediately, without waiting for the next rollup pass.
 //
@@ -45,11 +45,11 @@
 import { badRequest } from '../errors.js';
 import {
   addDays,
-  clampRetentionDays,
   daysInclusive,
   eachDay,
   isValidDate,
   MAX_RANGE_DAYS,
+  MIN_RETENTION_DAYS,
   RAW_RETENTION_DAYS,
   rawCutoffDay,
   today,
@@ -74,8 +74,9 @@ export const MAX_LIMIT = 100;
 /**
  * Cap on how many distinct `prop` keys one named breakdown will return. §8.2
  * permits a cap and requires it be documented; the README states this number.
- * The 20 kept are the most frequent props for that event name in the range,
- * `prop` ascending as a deterministic tiebreak.
+ * The 20 kept are the props most often PRESENT (non-null) on that event name in
+ * the range — not counting the null row — `prop` ascending as a deterministic
+ * tiebreak. See `propBreakdownRows`.
  */
 export const MAX_BREAKDOWN_PROPS = 20;
 
@@ -193,52 +194,75 @@ export function resolveDayRange(
  * day and no way to distinguish "no data" from "missing row", which makes a false
  * zero indistinguishable from the truth.
  *
- * So the boundary is derived from observed state instead: the oldest day for which
- * raw rows exist, when that is older than the clock's cutoff. A day never reads as
- * zero while its raw rows exist.
+ * So the boundary is derived from observed state instead. The rule:
+ *
+ *     boundary = min(oldest raw day of this project, rawCutoffDay(now, MIN_RETENTION_DAYS))
+ *
+ * and, with no raw rows at all, just the second term. Why each half:
+ *
+ *  * `rawCutoffDay(now, MIN_RETENTION_DAYS)` (`today - 89`) is the newest day any
+ *    sweep can EVER have deleted, under any retention setting past or present:
+ *    windows are clamped to at least 90 days and the clock only moves forward.
+ *    Every day at or above it has all the raw rows it ever had, so raw is the
+ *    authoritative answer there — including a confident zero for a day a §13
+ *    erasure emptied, where the day's stale rollup would be the wrong one. This
+ *    is what keeps a new or quiet project (oldest raw row yesterday) from having
+ *    its older days moved off the rollups.
+ *  * Below that line, a day is read from raw only if it is at or above the
+ *    project's oldest surviving raw row. Raw rows below `today - 89` are a
+ *    SUFFIX of what the sweep left behind — it deletes `day < cutoff` per
+ *    project, oldest first — so every day at or above the oldest row still has
+ *    all of its rows, and below it there are none to double-count against.
+ *
+ * Deliberately NOT the project's own `retention_days` cutoff. That is a statement
+ * about what the sweep WILL keep from now on, not about what it has already
+ * removed, and the two differ exactly when it matters: raise a project from 90 to
+ * 180 days and the clock-derived cutoff jumps back 90 days at once, while the raw
+ * rows for those days were swept under the old window long ago. Routing them to
+ * raw read every one of those 90 days as zero, with the rollups that hold their
+ * history sitting right there. Observed rows cannot be wrong that way: a project
+ * that really keeps 180 days has raw rows back to day 179, and its oldest row is
+ * where the boundary lands.
  *
  * Both directions of the resulting boundary stay safe:
  *
- *  * Surviving raw rows are always a contiguous SUFFIX `[minDay, today]` — the
- *    sweep deletes `day < cutoff` and `cutoff` only moves forward — so no day
- *    above the boundary can be missing raw rows that a rollup would have covered.
- *    (The one exception is a per-`installId` erasure emptying a day, and there
- *    reading zero from raw is the *correct* answer; the day's stale rollup is the
- *    wrong one.)
+ *  * No day above the boundary can be missing raw rows that a rollup would have
+ *    covered (the two bullets above).
  *  * Below the boundary there are no raw rows at all, so the rollups cannot
  *    double-count with them.
  *
- * One indexed `MIN(day)` on `events_scope`, scoped to the project.
+ * And never below `raw_complete_from` (0007). After a retention increase the
+ * days between the new cutoff and that marker were swept under the old window:
+ * a raw row there — a late batch written before ingest clamped to the marker, a
+ * stray from an older Worker — is not that day's answer, and taken as the oldest
+ * raw day it would also have dragged every day above it onto raw rows that do
+ * not exist. The marker caps the boundary from below, so those days read from
+ * their rollups whatever stray rows sit under them.
+ *
+ * One indexed `MIN(day)` on `events_scope` plus a primary-key lookup, in one
+ * round trip.
  */
 export async function rawBoundaryDay(
   db: D1Database,
   projectId: string,
   now: Date,
 ): Promise<string> {
-  // Both halves of the boundary in ONE round trip: the project's retention window
-  // (0006) and its oldest surviving raw day. The window has to be per project or
-  // the routing is wrong in the expensive direction — a project keeping 180 days
-  // would have every day older than 90 answered from rollups while its raw rows
-  // sat right there, which is not a false zero but is a different, coarser answer
-  // than the same request gets for a day one older, for no reason a reader can
-  // see.
   const row = await db
     .prepare(
-      `SELECT (SELECT retention_days FROM projects WHERE id = ?1) AS retentionDays,
-              (SELECT MIN(day) FROM events WHERE project_id = ?1) AS oldest`,
+      `SELECT (SELECT MIN(day) FROM events WHERE project_id = ?1) AS oldest,
+              (SELECT raw_complete_from FROM projects WHERE id = ?1) AS marker`,
     )
     .bind(projectId)
-    .first<{ retentionDays: number | null; oldest: string | null }>();
+    .first<{ oldest: string | null; marker: string | null }>();
 
-  // A project row that is absent (deleted mid-request) falls back to the default
-  // window rather than throwing: this function routes days, it does not authorize.
-  const cutoff = rawCutoffDay(now, clampRetentionDays(row?.retentionDays ?? RAW_RETENTION_DAYS));
+  // A project row that is absent (deleted mid-request) needs no special case:
+  // this function routes days, it does not authorize — a missing row is just a
+  // NULL marker.
+  const neverSwept = rawCutoffDay(now, MIN_RETENTION_DAYS);
   const oldest = row?.oldest ?? null;
-  if (oldest === null) return cutoff;
-  // Never move the boundary UP past the clock's cutoff: a project whose oldest
-  // raw row is recent (a new project, or one that went quiet) must still have its
-  // older days served from rollups rather than reported as zero.
-  return oldest < cutoff ? oldest : cutoff;
+  const observed = oldest !== null && oldest < neverSwept ? oldest : neverSwept;
+  const marker = row?.marker ?? null;
+  return marker !== null && marker > observed ? marker : observed;
 }
 
 /**
@@ -568,32 +592,33 @@ export async function propBreakdownRows(
     }
   };
 
-  const propKeys = new Set<string>();
+  // Every breakdown-eligible prop seen in the range, from either source — the
+  // CANDIDATES for the cap. Ranking happens once, below, over merged totals.
+  const candidates = new Set<string>();
 
   if (range.rawFrom !== null) {
-    // 1. Which props to break down. §8.2: only string, bool and null props;
-    //    numeric props are omitted entirely (bucketing is unspecified in v1 and
-    //    a raw breakdown of a continuous value is a cardinality hazard).
+    // 1. Which props exist. §8.2: only string, bool and null props; numeric
+    //    props are omitted entirely (bucketing is unspecified in v1 and a raw
+    //    breakdown of a continuous value is a cardinality hazard). No `LIMIT`
+    //    here: a per-source cap is how a mixed range used to drop a prop that
+    //    only ranks once the other source is added.
     const { results: keyRows } = await db
       .prepare(
-        `SELECT j.key AS prop, COUNT(*) AS n
+        `SELECT DISTINCT j.key AS prop
            FROM events e, json_each(e.props) j
           WHERE e.project_id = ?1 AND e.day >= ?2 AND e.day <= ?3 AND e.name = ?4
             AND j.type IN ('text', 'true', 'false', 'null')
-            ${range.includeDebug ? '' : 'AND e.is_debug = 0'}
-          GROUP BY j.key
-          ORDER BY n DESC, j.key ASC
-          LIMIT ${MAX_BREAKDOWN_PROPS}`,
+            ${range.includeDebug ? '' : 'AND e.is_debug = 0'}`,
       )
       .bind(range.projectId, range.rawFrom, range.to, name)
-      .all<{ prop: string; n: number }>();
+      .all<{ prop: string }>();
 
     for (const r of keyRows) {
       // Re-validate before this key is ever concatenated into a JSON path
       // below. Keys are already constrained at ingest, so this can only fire on
       // rows written by something other than the ingest path — which is exactly
       // when an unvalidated key would matter.
-      if (PROP_KEY_RE.test(r.prop)) propKeys.add(r.prop);
+      if (PROP_KEY_RE.test(r.prop)) candidates.add(r.prop);
     }
 
     // 2. Present, non-null values. `j.type` is selected and grouped so a bool
@@ -612,36 +637,10 @@ export async function propBreakdownRows(
       .all<{ prop: string; type: string; value: unknown; count: number; installs: number }>();
 
     for (const r of valueRows) {
-      if (!propKeys.has(r.prop)) continue; // outside the documented prop cap
+      if (!candidates.has(r.prop)) continue;
       const value: PropValue =
         r.type === 'true' ? true : r.type === 'false' ? false : String(r.value);
       add(r.prop, value, r.count, r.installs);
-    }
-
-    // 3. The null row, per prop. §8.2 folds "present with JSON null" and
-    //    "absent from the event entirely" into ONE row, because "the app did not
-    //    report a section" is one thing to a reader. That means this cannot be
-    //    derived by subtraction — `installs` is a distinct count, and distinct
-    //    counts do not subtract — so it is its own query.
-    const keys = [...propKeys];
-    if (keys.length > 0) {
-      const values = keys.map((_, i) => `(?${i + 5})`).join(', ');
-      const { results: nullRows } = await db
-        .prepare(
-          `WITH k(prop) AS (VALUES ${values})
-           SELECT k.prop AS prop, COUNT(*) AS count, COUNT(DISTINCT e.install_id) AS installs
-             FROM events e JOIN k
-            WHERE e.project_id = ?1 AND e.day >= ?2 AND e.day <= ?3 AND e.name = ?4
-              AND (e.props IS NULL
-                   OR json_type(e.props, '$.' || k.prop) IS NULL
-                   OR json_type(e.props, '$.' || k.prop) = 'null')
-              ${range.includeDebug ? '' : 'AND e.is_debug = 0'}
-            GROUP BY k.prop`,
-        )
-        .bind(range.projectId, range.rawFrom, range.to, name, ...keys)
-        .all<{ prop: string; count: number; installs: number }>();
-
-      for (const r of nullRows) add(r.prop, null, r.count, r.installs);
     }
   }
 
@@ -664,37 +663,84 @@ export async function propBreakdownRows(
 
     for (const r of results) {
       if (!PROP_KEY_RE.test(r.prop)) continue;
-      propKeys.add(r.prop);
+      candidates.add(r.prop);
       const value: PropValue =
         r.isNull === 1 ? null : r.type === 'true' ? true : r.type === 'false' ? false : String(r.value);
       add(r.prop, value, r.count, r.installs);
     }
   }
 
-  // THE PROP CAP, applied ONCE over the merged result rather than per source.
+  // THE PROP CAP, applied ONCE over the merged result rather than per source, so
+  // the answer is the 20 most frequent props across the whole requested range,
+  // `prop` ascending as the deterministic tiebreak §8.2 requires, whatever the
+  // range's sources are. (The rollup branch once had no cap at all, and the raw
+  // branch a SQL `LIMIT` of its own, so a mixed range's prop set depended on
+  // which side of the retention boundary the range happened to straddle.)
   //
-  // The raw branch has always had `LIMIT MAX_BREAKDOWN_PROPS` in SQL; the rollup
-  // branch had no cap at all, so a range served from rollups could return an
-  // unbounded number of props, and a MIXED range returned "raw's top 20, plus
-  // every prop the rollups knew about" — a prop set that depended on which side of
-  // the retention boundary the range happened to straddle, and that could exceed
-  // the documented cap without ever saying so.
-  //
-  // Ranking here, on merged totals, makes the answer one thing: the 20 most
-  // frequent props across the whole requested range, `prop` ascending as the
-  // deterministic tiebreak §8.2 requires, whatever the range's sources are. The
-  // SQL `LIMIT` stays as a cheap pre-filter on the raw side; it uses the same
-  // criterion, so it cannot promote a prop this ranking would not have kept.
-  const totalsByProp = new Map<string, number>();
+  // "Most frequent" means how often the prop was PRESENT with a value: the sum of
+  // its non-null rows. NOT including the null row. The null row counts events
+  // that LACKED the prop, so value-plus-null is just "events of this name on the
+  // days the prop appeared" — the same number for every prop reported on the
+  // same days. Ranked that way, a prop on 40 of 60 events and a prop on 1 of them
+  // tied, the tie fell to byte order, and the frequent prop could be the one
+  // dropped. A prop seen only as an explicit JSON null ranks at 0: §8.2 folds
+  // explicit null and absent into one row and the rollups store them folded, so
+  // "present as null" is not separable from "absent" in every source.
+  const presence = new Map<string, number>([...candidates].map((p) => [p, 0]));
   for (const row of merged.values()) {
-    totalsByProp.set(row.prop, (totalsByProp.get(row.prop) ?? 0) + row.count);
+    if (row.value !== null) presence.set(row.prop, (presence.get(row.prop) ?? 0) + row.count);
   }
   const keptProps = new Set(
-    [...totalsByProp.entries()]
+    [...presence.entries()]
       .sort((a, b) => b[1] - a[1] || byteCompare(a[0], b[0]))
       .slice(0, MAX_BREAKDOWN_PROPS)
       .map(([prop]) => prop),
   );
+
+  // 3. The raw null row, per KEPT prop — after the cap, so the statement binds at
+  //    most MAX_BREAKDOWN_PROPS keys however many props the range has. §8.2 folds
+  //    "present with JSON null" and "absent from the event entirely" into ONE
+  //    row, because "the app did not report a section" is one thing to a reader.
+  //    That means this cannot be derived by subtraction — `installs` is a
+  //    distinct count, and distinct counts do not subtract — so it is its own
+  //    query.
+  //
+  //    Counted only on days the prop was reported at least once (`dk`), which is
+  //    the rule the rollup applies: it stores a day's null rows for the props
+  //    seen THAT day. Deciding per range instead made one range answer two ways —
+  //    a prop added mid-range had every event before it counted as "did not
+  //    report" when the days were served raw, and none of them once the same days
+  //    were served from rollups. Per day, a range's null row is the sum of its
+  //    days' null rows from whichever store holds each day.
+  const nullKeys = [...keptProps];
+  if (range.rawFrom !== null && nullKeys.length > 0) {
+    const values = nullKeys.map((_, i) => `(?${i + 5})`).join(', ');
+    const debug = range.includeDebug ? '' : 'AND e.is_debug = 0';
+    const { results: nullRows } = await db
+      .prepare(
+        `WITH k(prop) AS (VALUES ${values}),
+         dk AS (
+           SELECT DISTINCT e.day AS day, j.key AS prop
+             FROM events e, json_each(e.props) j
+            WHERE e.project_id = ?1 AND e.day >= ?2 AND e.day <= ?3 AND e.name = ?4
+              AND j.type IN ('text', 'true', 'false', 'null')
+              AND j.key IN (SELECT prop FROM k)
+              ${debug}
+         )
+         SELECT dk.prop AS prop, COUNT(*) AS count, COUNT(DISTINCT e.install_id) AS installs
+           FROM events e JOIN dk ON dk.day = e.day
+          WHERE e.project_id = ?1 AND e.day >= ?2 AND e.day <= ?3 AND e.name = ?4
+            AND (e.props IS NULL
+                 OR json_type(e.props, '$.' || dk.prop) IS NULL
+                 OR json_type(e.props, '$.' || dk.prop) = 'null')
+            ${debug}
+          GROUP BY dk.prop`,
+      )
+      .bind(range.projectId, range.rawFrom, range.to, name, ...nullKeys)
+      .all<{ prop: string; count: number; installs: number }>();
+
+    for (const r of nullRows) add(r.prop, null, r.count, r.installs);
+  }
 
   // §8.2 ordering: grouped by `prop` (props ascending), and within each prop by
   // count descending, then value ascending, with the `null` row LAST regardless
@@ -858,16 +904,20 @@ export async function totalInstalls(
  * across the backfill would otherwise show a spike at that boundary that a
  * consumer has no way to tell from a real one.
  *
- * The floor is `rawCutoffDay(backfillDay, project.retention_days)` — the oldest
- * day that had raw rows on the day the migration ran, and therefore the oldest
- * day the backfill's `MIN(day)` could possibly have returned. Every install
- * stored with `first_seen_day` at or below it may have been first seen EARLIER;
- * everything strictly above it is exact.
+ * The floor is the raw boundary AS IT WAS on the day the backfill ran:
+ * `rawCutoffDay(backfillDay, 90)`. Every install stored with `first_seen_day` at
+ * or below it may have been first seen EARLIER; everything strictly above it is
+ * exact.
  *
- * Per project, not global: the boundary is derived from the same
- * `retention_days` (0006) the sweep uses, so a project keeping 180 days has a
- * floor 90 days further back than a default one, and using the global default for
- * it would mark good rows as suspect.
+ * Deliberately NOT the project's CURRENT `retention_days`. The window in force
+ * when 0005 ran is what decided how far back its `MIN(day)` could reach, and it
+ * was 90 for every project: `retention_days` did not exist yet (0006 adds it,
+ * with a default of 90, after 0005), so nothing could have kept raw rows longer.
+ * Reading today's value instead moved the floor whenever retention changed
+ * later — raise a project to 180 and the floor dropped 90 days below the
+ * boundary spike, labelling the spike's installs exact. Nor `raw_complete_from`
+ * (0007): it records later retention changes, which cannot have affected a
+ * backfill that had already run.
  *
  * `null` means "no floor" and is the answer for a FRESH deployment: no marker row
  * means 0005 has not run against a populated `events` table under a schema that
@@ -875,32 +925,25 @@ export async function totalInstalls(
  * `first_seen_day` was written by ingest at the moment it happened. A consumer
  * should read `null` as "all exact", never as "unknown".
  *
- * Cheap: two indexed point lookups, or one round trip if a consumer caches it —
- * the value only changes when a project's retention does, and it is a label on a
- * chart, not part of any count.
+ * Cheap: one indexed point lookup. `projectId` is accepted for API stability and
+ * so the floor can become per project again if a future migration ever makes the
+ * backfill window differ by project; today it is the same for every project.
  */
 export async function firstSeenFloorDay(
   db: D1Database,
   projectId: string,
 ): Promise<string | null> {
+  void projectId;
   const row = await db
-    .prepare(
-      `SELECT (SELECT value FROM backend_markers WHERE key = 'installs_backfill_day') AS markerDay,
-              (SELECT retention_days FROM projects WHERE id = ?1) AS retentionDays`,
-    )
-    .bind(projectId)
-    .first<{ markerDay: string | null; retentionDays: number | null }>();
+    .prepare(`SELECT value AS markerDay FROM backend_markers WHERE key = 'installs_backfill_day'`)
+    .first<{ markerDay: string | null }>();
 
   const markerDay = row?.markerDay ?? null;
   // No marker: a deployment whose `installs` table was never backfilled over
   // existing events. Nothing to distrust.
   if (markerDay === null || !isValidDate(markerDay)) return null;
 
-  // Same clamp every other reader of this column applies (0006): a NULL from an
-  // older row, or a hand-edited absurdity, degrades to the 90-day default rather
-  // than moving the floor somewhere it would mislabel real rows.
-  const retentionDays = clampRetentionDays(row?.retentionDays ?? RAW_RETENTION_DAYS);
   // `rawCutoffDay` takes the clock as a `Date`; the marker is a UTC day, so
   // midnight UTC on that day is the instant the migration's `date('now')` named.
-  return rawCutoffDay(new Date(`${markerDay}T00:00:00.000Z`), retentionDays);
+  return rawCutoffDay(new Date(`${markerDay}T00:00:00.000Z`), RAW_RETENTION_DAYS);
 }

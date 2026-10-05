@@ -24,6 +24,8 @@ export interface KeyScope {
   readonly kind: KeyKind;
   /** The project's raw-event window in days (0006), already clamped. */
   readonly retentionDays: number;
+  /** `projects.raw_complete_from` (0007): the ingest clamp never goes below it. */
+  readonly rawCompleteFrom: string | null;
   /**
    * SHA-256 of the presented key — the same value stored in `keys.key_hash`.
    *
@@ -91,7 +93,8 @@ export async function resolveKey(
     .prepare(
       `SELECT k.project_id AS projectId,
               k.last_used_at AS lastUsedAt,
-              p.retention_days AS retentionDays
+              p.retention_days AS retentionDays,
+              p.raw_complete_from AS rawCompleteFrom
          FROM keys k
          JOIN projects p ON p.id = k.project_id
         WHERE k.key_hash = ?1
@@ -99,7 +102,12 @@ export async function resolveKey(
           AND k.revoked_at IS NULL`,
     )
     .bind(hash, kind)
-    .first<{ projectId: string; lastUsedAt: string | null; retentionDays: number | null }>();
+    .first<{
+      projectId: string;
+      lastUsedAt: string | null;
+      retentionDays: number | null;
+      rawCompleteFrom: string | null;
+    }>();
 
   // The JOIN also means a key whose project has been deleted is a 401 rather than
   // a crash — which is what the `keys.project_id` cascade already made true in
@@ -109,6 +117,7 @@ export async function resolveKey(
     projectId: row.projectId,
     kind,
     retentionDays: clampRetentionDays(row.retentionDays),
+    rawCompleteFrom: row.rawCompleteFrom,
     keyHash: hash,
     lastUsedAt: row.lastUsedAt,
   };

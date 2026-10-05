@@ -121,9 +121,12 @@ loopback only, and `CloudflareEndpoint` enforces exactly that.
 
 - **Raw events: 90 days by default, per project.** Enforced, not asserted: the
   nightly job deletes `events` rows whose bucket day is older than that project's
-  cutoff. The read layer derives its boundary from the same
-  `projects.retention_days` column (`rawBoundaryDay`), so the delete boundary and
-  the read boundary cannot drift apart — per project, not just globally.
+  cutoff — per project, one day per statement, and only days it has just rolled
+  up for that same project. The read layer routes a day to raw rows only where the
+  sweep has actually left them (`rawBoundaryDay`: `today - 89`, or the project's
+  oldest surviving raw day when that is older), never by `retention_days` alone — so
+  raising a project's window does not turn the days already swept under the old
+  one into zeros; they keep reading from the rollups.
 - **The window is 90–400 days.** 90 is the default and the minimum: it is what
   §13 documents and what a shorter setting would quietly break, since reads route
   days at the same boundary, so shrinking the window deletes history reads would
@@ -135,6 +138,32 @@ loopback only, and `CloudflareEndpoint` enforces exactly that.
   ```sh
   node scripts/admin.mjs set-retention <projectId> 180 --remote
   ```
+
+  Change the window **only** this way (or with `setProjectRetention` from
+  `./lib`). On an increase it also records `projects.raw_complete_from` (0007):
+  the days between the new cutoff and the old one were already swept, so their
+  rollups are the whole record. Ingest never writes below that marker (a late or
+  wrong-clock event lands on it instead), reads never route below it to raw, and
+  the sweep never rolls a day below it from raw — it deletes any stray raw rows
+  there instead. The marker clears itself once the new window's cutoff passes it.
+  A bare `UPDATE projects SET retention_days = …` skips all of that.
+- **The nightly pass has a query budget, and so a capacity ceiling.** Every D1
+  call is a subrequest to a Cloudflare service, limited per invocation to 1,000
+  on Workers Free and 10,000 on Paid; a `db.batch()` counts once
+  (developers.cloudflare.com/workers/platform/limits/#subrequests). The pass works
+  only on projects that have something to do, least recently visited first, caps
+  any one project's backlog at 31 days a night, and stops cleanly before
+  `DEFAULT_QUERY_BUDGET` (900) or 10 minutes of wall time (the cron's limit is
+  15); the rest go first the next night. A night costs 8 queries plus, per
+  project, 1 if it had traffic in the last four days and 1 + *d* if *d* of its
+  days expire tonight — so a daily-active project costs 3, and the default budget
+  covers about **297 daily-active projects**, though on a busy deployment the
+  wall-time limit binds first (ADOPTION.md C). Beyond the ceiling the log line
+  `rollup_work_left` reports `rows > 0` every night and the backlog grows. The
+  budget can be changed with a `[vars]` entry, `ROLLUP_QUERY_BUDGET` (minimum
+  16). On Workers Free the cron's **10 ms CPU limit** may end a pass first: watch
+  for `exceededCpu` on the scheduled handler and lower the budget if it appears
+  (ADOPTION.md C).
 - **One exception to the sweep: `installs`.** One row per install — project, id,
   first-seen day — kept indefinitely, because first sighting cannot be recovered
   from any aggregate (§1). So the honest statement of the retention promise is:
@@ -298,7 +327,14 @@ value.
 **Breakdown caps** (§8.2 permits these and requires they be documented):
 
 - `/v1/events/top?name=` breaks down at most **20** props per event name — the
-  most frequent in the range, `prop` ascending as a tiebreak.
+  ones most often **present** (non-null) in the range, `prop` ascending as a
+  tiebreak. The null row does not count toward the ranking: it counts events
+  that *lacked* the prop, and ranking on it made every prop on the same days tie.
+- A prop's **null row** counts the events of that name that lacked the prop (or
+  sent JSON `null`) **on the days the prop was reported at least once**. The
+  rollup stores null rows per day for the props seen that day, and the raw path
+  applies the same per-day rule, so a range answers the same null row whether its
+  days are served raw or from rollups.
 - The rollup stores at most **200** distinct values per (project, event name,
   prop) per day. The null row is always kept regardless of the cap. Rollups live
   forever, so unbounded value cardinality would be an unbounded bill forever.
@@ -345,6 +381,32 @@ an upsert. For an **older** day the rollup still includes that install's
 contribution as a number; re-roll that specific day if it matters, and note that
 once the day's raw rows are past retention there is nothing left to re-roll from.
 
+**Edge on a project keeping more than 90 days.** Reads route a day older than
+`today - 89` to raw rows only if it is at or above the project's *oldest* raw day
+(`rawBoundaryDay`). If the erased install owned that project's oldest raw rows,
+erasing them moves the oldest raw day forward, and the days in between — which
+now have no raw rows at all — are answered from their rollups instead. Those
+rollups were written while the install's rows were still there (every day is
+rolled while it is in the nightly re-roll window), so they still show its
+activity, where before the erasure the same days read the post-erasure raw
+numbers. Re-roll those days after a `delete-install` on such a project: with no
+raw rows left, a re-roll replaces each day's rollup with an empty one.
+
+### Deleting a project
+
+```sql
+DELETE FROM projects WHERE id = '<projectId>';
+```
+
+Since `0008` this removes **everything** the project owns, by foreign-key cascade:
+keys, raw `events`, the `batches` dedupe ledger, `batch_context`, the three rollup
+tables and `installs`. (Before `0008` the three raw tables had no foreign key, so
+a project delete left its raw rows behind — unreachable, and never swept.) The
+cascade is one statement; for a project with a very large raw backlog it can be
+too big for one D1 statement, in which case delete its `events` a day at a time
+first (`DELETE FROM events WHERE project_id = ? AND day = ?`) and then the
+project row.
+
 ### Rate limiting
 
 Two layers, and only one of them is real.
@@ -358,6 +420,19 @@ per-isolate `Map` and throws a 429 with `Retry-After` past the limit:
 | SHA-256 of the presented **read** key | 120/min | **pre-auth**, on `/v1/summary`, `/v1/events/top` |
 | `projectId` | 600/min | post-auth, on `/v1/events` |
 | `anonymous` (no key, or one of impossible length) | 600/min | pre-auth, all four paths |
+
+Keyed buckets are **per endpoint family**: the same key presented to ingest and
+to a read endpoint is counted in two separate buckets. That matters because the
+write key is public — it ships in the app binary (§7) — so anyone can present it
+to `/v1/summary`; those requests are 401s, and they must not spend the fleet's
+ingest bucket.
+
+**What no in-Worker limiter can fix:** the same public write key can be used to
+exhaust the app's *own* ingest bucket, by POSTing to `/v1/events` with it. Those
+requests are indistinguishable from the app's fleet, so they share its bucket and
+its 429s (which the SDK retains and retries, so no data is lost — but delivery
+stalls while it lasts). The WAF rule below is the real control for that; the
+in-Worker numbers are not.
 
 The read number is six times tighter than the ingest number on purpose: a read
 key is **one dashboard or one script** (§8 forbids embedding it in a shipped
@@ -453,8 +528,8 @@ backoff) never comes close to any of these.
 D1 bills rows read and rows written. The shapes that matter:
 
 - **Ingest**: 2 + *n* + 1 rows written per batch (the batch row, the context row,
-  one per event, and one `INSERT OR IGNORE` covering every distinct install in
-  the batch — which is a no-op write after that install's first batch), plus at
+  one per event, and one upsert covering every distinct install in the batch —
+  which writes only when it moves that install's `first_seen_day` earlier), plus at
   most one `keys.last_used_at` update per key per minute (deferred under
   `ctx.waitUntil`, so it is off the request's critical path). Context is stored
   per batch, not per event, which is the difference between 2+*n* and 3*n* for a
@@ -536,7 +611,8 @@ What is exported, and what each thing is for:
 | `propBreakdown(db, {…, name, limit?})` | the §8.2 prop breakdown for one event name |
 | `resolveRange(db, {…}, now)` | validate + clamp + resolve the raw/rollup boundary once, to reuse across several queries |
 | `summaryRows` / `topEventRows` / `propBreakdownRows` | the same three computations over an already-resolved range |
-| `rawBoundaryDay(db, projectId, now)` | the observed raw/rollup boundary, resolved against that project's `retention_days` |
+| `rawBoundaryDay(db, projectId, now)` | the observed raw/rollup boundary: `today - 89`, or the project's oldest surviving raw day when that is older — never below its `raw_complete_from` |
+| `setProjectRetention(db, projectId, days, now?)` | the one way to change a project's retention window: moves `raw_complete_from` with it on an increase (§4) |
 | `firstSeenRows(db, projectId, fromDay, toDay)` | installs first seen per day — retention cohorts and "new installs"; **counts only, never an install id** |
 | `firstSeenFloorDay(db, projectId)` | oldest day whose `first_seen_day` is trustworthy, or `null` for none — label cohorts at or below it (§4) |
 | `totalInstalls(db, projectId, throughDay?)` | installs ever seen, cumulative (a sum over `firstSeenRows` is not the total) |

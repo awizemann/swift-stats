@@ -82,6 +82,81 @@ package; schema changes are called out explicitly below.
   installs, retention) count sessions, and that
   `identify(userID:)` is not needed for a stable install.
 
+### Fixed — Cloudflare backend (`backends/cloudflare`, unreleased; next `backend-cloudflare-*` heading)
+
+The batch format and the `/v1` request and response **shapes** are untouched,
+so emitters and readers need no code change. **Some read numbers change**, by
+design: the `null` row of `/v1/events/top?name=` (see the §8.2 amendment below),
+which props survive the 20-prop breakdown cap, and days that used to read as
+zero after a retention increase. Two new migrations: `0007_raw_complete_from.sql`
+(two columns; **required** by the new Worker code) and
+`0008_raw_tables_cascade.sql` (a rebuild of the raw tables, not required by the
+code; rehearse it before applying it to a large database). `npm run deploy`
+applies both — wrangler cannot apply only the first; ADOPTION.md §11 gives the
+exact steps to apply `0007` alone and schedule `0008`, and how to set
+`raw_complete_from` by hand for projects whose retention was raised before this
+release.
+
+- **Re-rolling a day for one project wiped other projects' rollups.** The nightly
+  rollup deleted and rebuilt a whole day across every project, so the night a
+  longer-retention project expired a day (or after a failed delete, or a
+  `set-retention` change) it replaced its neighbours' rollups for that day —
+  whose raw rows were already gone — with nothing. Rollups are now per project.
+- **Raw tables now cascade with their project** (migration `0008`). `events`,
+  `batches` and `batch_context` had no foreign key, so a project delete left
+  orphaned rows, and one orphaned row made the rollup fail its FK for that day,
+  which skipped the retention sweep for every project, every night. `0008`
+  rebuilds the three tables with `ON DELETE CASCADE` (columns, STRICT, ids and
+  every index preserved) and drops existing orphans; the job also tolerates and
+  ages out orphans if the Worker is deployed before the migration. `0005`'s
+  `installs` backfill now skips orphaned events instead of failing the migration.
+- **Raising a project's retention made already-swept days read as zero.**
+  `rawBoundaryDay` now routes on observed raw rows (`today - 89`, or the
+  project's oldest raw day when older) rather than the project's clock cutoff.
+- **The breakdown prop cap could drop the most common prop.** Props are ranked by
+  how often they are present, not by value rows plus the null row.
+- **Read numbers change: the breakdown `null` row is counted per day.** Its
+  "absent" half now counts only on days the prop was reported at least once for
+  that event name — the rule the daily rollups always applied — so a range
+  answers the same `null` row whether its days are served from raw events or
+  rollups. Before, a range served from raw events counted every event before a
+  prop was introduced as "did not report". **Wire schema `v1` contract
+  amendment (no wire-format change):** §8.2 now states this per-day rule; the
+  `schema` string stays `v1`.
+- **A retention increase could still corrupt already-swept days** (migration
+  `0007`). A late batch or a clamped wrong-clock event landing in a day the old
+  window had swept was read as that day's whole answer, and rolled up over its
+  real history when the day expired again. `projects.raw_complete_from`,
+  recorded by `admin.mjs set-retention` and the new `setProjectRetention()`
+  export on an increase, keeps ingest, reads and the sweep off those days. Raise
+  retention only through one of those two.
+- **The nightly job stays inside the per-invocation subrequest limit** (1,000
+  Cloudflare-service calls on Workers Free; each D1 call or `db.batch()` is one)
+  and the cron's 15-minute wall time. It works only on projects with something to
+  do, least recently visited first, caps any one project's backlog at 31 days a
+  night so a deep backlog cannot starve its neighbours, and stops before a budget
+  (`ROLLUP_QUERY_BUDGET`, default 900, about 297 daily-active projects) or 10
+  minutes of wall time, resuming the next night. A night that ends with work left
+  logs `rollup_work_left`. Each project's rotation is committed inside its own
+  batches, so a pass cut off by the Free plan's 10 ms cron CPU limit still moves
+  the projects it worked on to the back; the budget cannot be set below 16.
+- **One project's sweep failure no longer skips the others**, and each expiring
+  project-day is rolled and deleted in one atomic batch, so a large backlog
+  cannot exceed a single statement's limits and an interrupted pass never leaves
+  a partial day. The delete and the marker clear re-check the project's current
+  window in SQL, so a `set-retention` racing the nightly pass cannot make it
+  delete days the new window keeps.
+- **`firstSeenFloorDay()` no longer moves when retention changes.** It read the
+  project's current window; raising retention dropped the floor below the
+  0005 backfill's boundary spike and labelled those installs exact. It is now
+  the backfill day's 90-day boundary for every project.
+- **`installs.first_seen_day` is the earliest day seen**, not the first batch to
+  arrive: an older offline batch delivered second now moves it earlier.
+- **Rate-limit buckets are per endpoint**, so the public write key presented to a
+  read endpoint no longer spends the app's ingest bucket. The README now states
+  that the write key can still exhaust its own ingest bucket and that the WAF
+  rule is the control for that.
+
 ## [backend-cloudflare-0.3.0] — 2026-08-19
 
 **Cloudflare backend `0.3.0` — key liveness, first-seen installs, per-project

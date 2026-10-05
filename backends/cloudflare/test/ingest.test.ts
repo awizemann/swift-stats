@@ -18,6 +18,7 @@ import {
   readRequest,
   resetDatabase,
   WRITE_KEY,
+  snapshotDatabase,
 } from './helpers.js';
 import {
   PRE_AUTH_LIMIT_PER_WINDOW,
@@ -354,11 +355,12 @@ describe('per-event idempotency (migration 0003)', () => {
     expect(lines.filter((l) => l.includes('batch_accepted')).length).toBe(1);
   });
 
-  it('still rejects a data-shaped failure rather than silently ignoring the row', async () => {
-    // `ON CONFLICT … DO NOTHING` is deliberately narrower than `INSERT OR
-    // IGNORE`, which would also swallow a NOT NULL / STRICT datatype failure —
-    // the failures the handler answers 400 for. A duplicate `batchId` is the
-    // only conflict that may abort the batch.
+  it('a duplicate batchId still aborts the whole batch: the identity upsert does not widen to the batch row', async () => {
+    // Named for what it asserts. It was called "still rejects a data-shaped
+    // failure", but nothing in it is data-shaped: it pins that the per-event
+    // `ON CONFLICT … DO NOTHING` left the `batches` PRIMARY KEY failure — the §6
+    // duplicate path — intact, so a re-sent batchId with NEW events writes none
+    // of them. The data-shaped half is the next case.
     const id = batchId(9112);
     await post(makeBatch({ batchId: id, events: eventsFor([40]) }));
     const dupe = await post(makeBatch({ batchId: id, events: eventsFor([41]) }));
@@ -366,6 +368,26 @@ describe('per-event idempotency (migration 0003)', () => {
     expect(await dupe.json()).toMatchObject({ duplicate: true });
     // The whole batch aborted on the batches PK, so seq 41 was NOT written.
     expect(await storedSeqs()).toEqual([40]);
+  });
+
+  it('the identity conflict clause does not swallow a data-shaped failure', async () => {
+    // `ON CONFLICT (project_id, install_id, seq) DO NOTHING` is deliberately
+    // narrower than `INSERT OR IGNORE`, which would also swallow a NOT NULL /
+    // STRICT datatype failure — the failures the handler answers 400 for. The
+    // validator stops such rows long before SQL, so this drives the same
+    // statement shape directly: a NULL `name` and a TEXT `seq` must still throw.
+    const insert = (name: string | null, seq: unknown) =>
+      DB.prepare(
+        `INSERT INTO events (
+           project_id, batch_id, day, ts, name, session_id, install_id, app_id, seq, user_id, props, is_debug
+         ) VALUES (?1, 'B', '2026-08-17', '2026-08-17T00:00:00.000Z', ?2, 's', ?3, 'a', ?4, NULL, NULL, 0)
+         ON CONFLICT (project_id, install_id, seq) DO NOTHING`,
+      )
+        .bind(PROJECT, name, INSTALLS.a, seq)
+        .run();
+    await expect(insert(null, 900)).rejects.toThrow(/NOT NULL/);
+    await expect(insert('ok_event', 'not-an-int')).rejects.toThrow(/datatype|cannot store/i);
+    expect(await eventCount()).toBe(0);
   });
 });
 
@@ -395,9 +417,12 @@ describe('authentication (§7)', () => {
   });
 
   it('writes nothing at all when the key is bad', async () => {
+    // Every table, by contents — not just `batches`. A bad key must not leave
+    // a context row, an `installs` row or a `keys.last_used_at` touch either.
+    const before = await snapshotDatabase();
     await post(makeBatch(), { key: null });
-    const batches = await DB.prepare(`SELECT COUNT(*) AS n FROM batches`).first<{ n: number }>();
-    expect(batches?.n).toBe(0);
+    await post(makeBatch(), { key: REVOKED_WRITE_KEY });
+    expect(await snapshotDatabase()).toEqual(before);
   });
 });
 
@@ -946,8 +971,8 @@ describe('rate limiting (§7 429, §8.3 429)', () => {
     // documented 429 was unreachable — nothing in the Worker could produce one.
     resetRateLimiter();
     const nowMs = Date.now();
-    for (let i = 0; i < PRE_AUTH_LIMIT_PER_WINDOW; i += 1) {
-      await checkPreAuthRate(READ_KEY, nowMs);
+    for (let i = 0; i < READ_LIMIT_PER_WINDOW; i += 1) {
+      await checkPreAuthRate(READ_KEY, nowMs, 'read');
     }
 
     const day = new Date().toISOString().slice(0, 10);
@@ -1203,7 +1228,7 @@ describe('the read limiter is tighter than the ingest limiter', () => {
     resetRateLimiter();
     const nowMs = Date.now();
     for (let i = 0; i < READ_LIMIT_PER_WINDOW; i += 1) {
-      await checkPreAuthRate(READ_KEY, nowMs, READ_LIMIT_PER_WINDOW);
+      await checkPreAuthRate(READ_KEY, nowMs, 'read');
     }
 
     const day = new Date().toISOString().slice(0, 10);

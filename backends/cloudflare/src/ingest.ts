@@ -195,7 +195,7 @@ export async function handleIngest(
   // Before `resolveKey`, because `resolveKey` costs a D1 read: running the
   // limiter after it would hand a key-guessing loop one free storage read per
   // attempt, which is the expensive half of the request.
-  await checkPreAuthRate(presentedKey, now.getTime());
+  await checkPreAuthRate(presentedKey, now.getTime(), 'ingest');
 
   const scope = await resolveKey(env.DB, presentedKey, 'write');
   // And again per project, so minting more keys for one project does not multiply
@@ -321,9 +321,10 @@ export async function handleIngest(
   for (const e of batch.events) {
     // §10: a future-dated or implausibly old `ts` is tolerated and clamped into
     // the retention window for AGGREGATION — the PROJECT's window (0006), which
-    // is why `scope.retentionDays` is threaded through here. `ts` itself is
+    // is why `scope.retentionDays` is threaded through here — and never below
+    // the project's `raw_complete_from` (0007). `ts` itself is
     // stored verbatim alongside it.
-    const day = bucketDay(e.ts, now, scope.retentionDays);
+    const day = bucketDay(e.ts, now, scope.retentionDays, scope.rawCompleteFrom);
     const seen = firstSeen.get(e.installId);
     if (seen === undefined || day < seen) firstSeen.set(e.installId, day);
 
@@ -348,8 +349,8 @@ export async function handleIngest(
   // Index of the first event statement: the batch row, then the context row.
   const EVENT_STATEMENTS_FROM = 2;
   // …and one past the last. The `installs` statement below is appended AFTER the
-  // events, and an `INSERT OR IGNORE` that hits a known install reports zero
-  // changed rows exactly like a deduped event does — so the dedupe tally has to
+  // events, and an upsert that hits a known install (and does not move it) reports
+  // zero changed rows exactly like a deduped event does — so the dedupe tally has to
   // stop at the end of the event range or every repeat visitor would be counted
   // as a replayed event.
   const EVENT_STATEMENTS_TO = EVENT_STATEMENTS_FROM + batch.events.length;
@@ -358,7 +359,7 @@ export async function handleIngest(
 
   // ONE statement for every distinct install in the batch, not one per event and
   // not one per install (0005). A 100-event batch from one install is a single
-  // `INSERT OR IGNORE` with one row; the §1 batching rules already guarantee a
+  // upsert with one row; the §1 batching rules already guarantee a
   // batch never mixes install ids, so in practice this is always one row — the
   // multi-row form exists so the statement stays correct if that ever changes,
   // without reintroducing a per-event write.
@@ -368,18 +369,31 @@ export async function handleIngest(
   // `installs` row behind for events that were never written. It also composes
   // cleanly with the per-event identity index (0003): a batch replayed under a
   // fresh `batchId` has its events swallowed by `ON CONFLICT DO NOTHING` and its
-  // `installs` row swallowed by `OR IGNORE`, so neither table double-counts.
+  // `installs` row left as it was by the upsert's `WHERE`, so neither table
+  // double-counts.
   //
-  // `OR IGNORE` is what keeps `first_seen_day` immutable — a later batch from a
-  // known install is a no-op, so the column is the FIRST sighting, never the
-  // latest.
+  // The upsert only ever moves `first_seen_day` EARLIER. It used to be
+  // `INSERT OR IGNORE`, which kept whichever batch happened to ARRIVE first — and
+  // arrival order is not tracking order: §1's offline queue can deliver today's
+  // batch before the one queued three days ago, and the install then read as
+  // first seen today, forever. `MIN` over every sighting is order-independent,
+  // so the stored day is the earliest this backend has seen however the batches
+  // land, and a later sighting is still a no-op (the `WHERE` makes it one).
+  //
+  // One consequence, stated rather than hidden: a batch whose `ts` was clamped by
+  // `bucketDay` (a device with a wrong clock) lands on the retention floor and so
+  // can move a known install's first-seen day back to that floor. It is the same
+  // day the in-batch fold above would have picked had the events shared a batch.
   if (firstSeen.size > 0) {
     const installs = [...firstSeen.entries()];
     const values = installs.map((_, i) => `(?1, ?${i * 2 + 2}, ?${i * 2 + 3})`).join(', ');
     statements.push(
       env.DB.prepare(
-        `INSERT OR IGNORE INTO installs (project_id, install_id, first_seen_day)
-         VALUES ${values}`,
+        `INSERT INTO installs (project_id, install_id, first_seen_day)
+         VALUES ${values}
+         ON CONFLICT (project_id, install_id) DO UPDATE
+           SET first_seen_day = excluded.first_seen_day
+           WHERE excluded.first_seen_day < installs.first_seen_day`,
       ).bind(projectId, ...installs.flatMap(([installId, day]) => [installId, day])),
     );
   }

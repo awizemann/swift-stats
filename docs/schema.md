@@ -531,6 +531,14 @@ With `name=project_opened`:
   app did not report a section" is one thing to a reader. A backend that wants
   to separate them must add a new field in a later revision, not redefine this
   row.
+- The "absent" half of the `null` row is counted **per UTC day, only on days
+  the prop was reported at least once** for that event name (present with any
+  value, including JSON `null`). An event of that name on a day when no event
+  of that name carried the prop is not counted. Over a range, the `null` row is
+  the sum of its days' `null` rows. This keeps a prop that was added (or
+  dropped) part-way through a range from turning every event before (or after)
+  it into "did not report", and it is what lets a backend that aggregates per
+  day answer the same row from raw events and from its daily aggregates.
 - `installs` is distinct `installId` count for that row, and carries the same
   approximate-count caveat as §8.1.
 - Only `string`, `bool` and `null` props are broken down. Numeric props MUST be

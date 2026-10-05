@@ -74,9 +74,20 @@ CREATE INDEX installs_first_seen ON installs (project_id, first_seen_day);
 -- `events` and building a temporary b-tree to group it. That matters here because
 -- this scan touches every surviving raw row on a deployment with real data — it
 -- is why 0003 should be applied first, which the numbering already enforces.
+--
+-- The `WHERE project_id IN (SELECT id FROM projects)` was added AFTER this file
+-- first shipped: a deliberate edit to an already-applied migration, and a safe
+-- one: D1 records applied migrations by name, so a deployment that already
+-- ran 0005 never sees it, while a deployment still BEHIND 0005 needs it to get
+-- past this statement at all. Before 0008, `events` had no foreign key, so a
+-- deleted project could leave orphaned raw rows; `installs` does reference
+-- `projects`, and `OR IGNORE` does not cover a foreign-key failure — one orphaned
+-- event aborted the migration, and a failed migration blocks `npm run deploy`.
+-- An orphan's install has no project to belong to, so skipping it loses nothing.
 INSERT OR IGNORE INTO installs (project_id, install_id, first_seen_day)
 SELECT project_id, install_id, MIN(day)
   FROM events
+ WHERE project_id IN (SELECT id FROM projects)
  GROUP BY project_id, install_id;
 
 -- The boundary that backfill left behind, so a reader can LABEL it.

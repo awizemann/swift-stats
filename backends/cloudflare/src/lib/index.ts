@@ -25,8 +25,14 @@ export {
   MIN_RETENTION_DAYS,
   RAW_RETENTION_DAYS,
   rawCutoffDay,
+  rawFloorDay,
   today,
 } from '../dates.js';
+
+// The one sanctioned way to change a project's retention window (0007): it moves
+// `raw_complete_from` in the same statement. A dashboard that offers a
+// retention setting must call this rather than UPDATE the column itself.
+export { setProjectRetention } from '../retention.js';
 
 // So a consumer can catch a validation failure and map it onto its own
 // transport, with the same stable `code` and the same `message` the public API

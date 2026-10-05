@@ -33,6 +33,12 @@ const PACKAGE_VERSION = (
 ).version;
 const CHANGELOG_MD = readFileSync(join(packageDir, '..', '..', 'CHANGELOG.md'), 'utf8');
 
+// The admin CLI's source, so test/retention.test.ts can assert its
+// `set-retention` statement is the Worker's SET_RETENTION_SQL verbatim — the
+// CLI is dependency-free Node and cannot import it, so the two are kept in step
+// by this test rather than by an import.
+const ADMIN_MJS = readFileSync(join(packageDir, 'scripts', 'admin.mjs'), 'utf8');
+
 export default defineConfig({
   plugins: [
     cloudflareTest({
@@ -44,7 +50,7 @@ export default defineConfig({
         // needed for tests, so `database_id` in wrangler.toml stays a
         // placeholder in the repo.
         d1Databases: { DB: 'stats-test' },
-        bindings: { MIGRATIONS_SQL, PACKAGE_VERSION, CHANGELOG_MD },
+        bindings: { MIGRATIONS_SQL, PACKAGE_VERSION, CHANGELOG_MD, ADMIN_MJS },
       },
       // Storage is deliberately shared across tests: every test calls
       // `resetDatabase()`, which drops the tables and re-applies the migrations

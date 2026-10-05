@@ -10,6 +10,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src/index.js';
 import { runScheduled } from '../src/rollup.js';
+import { setProjectRetention } from '../src/retention.js';
 import { addDays, clampRetentionDays, rawCutoffDay, today, RAW_RETENTION_DAYS } from '../src/dates.js';
 import { KEY_TOUCH_INTERVAL_MS } from '../src/keys.js';
 import {
@@ -504,9 +505,13 @@ describe('projects.retention_days', () => {
 
   it('rawBoundaryDay honours the project window without ever reading past its rows', async () => {
     await setRetention(PROJECT, 180);
-    // No events at all: the boundary is the project's clock cutoff, not the
-    // default's.
-    expect(await rawBoundaryDay(DB, PROJECT, NOW)).toBe(rawCutoffDay(NOW, 180));
+    // No events at all: the boundary is the never-swept line (`today - 89`) for
+    // BOTH projects. It used to be the 180-day project's clock cutoff, which
+    // routed days 90–179 to raw rows that do not exist — and when the window had
+    // just been RAISED from 90, those were exactly the days whose history lives
+    // only in the rollups (integrity.test.ts). A day with no raw rows reads the
+    // same from either store unless a rollup holds it, so the rollups win.
+    expect(await rawBoundaryDay(DB, PROJECT, NOW)).toBe(rawCutoffDay(NOW));
     expect(await rawBoundaryDay(DB, OTHER_PROJECT, NOW)).toBe(rawCutoffDay(NOW));
 
     // With rows older than that cutoff (not yet swept), the observed boundary wins
@@ -586,29 +591,20 @@ describe('firstSeenFloorDay', () => {
     expect(await firstSeenFloorDay(DB, PROJECT)).toBe(addDays(marker, -(RAW_RETENTION_DAYS - 1)));
   });
 
-  it('respects the project’s own retention window, not the global default', async () => {
+  it('is the backfill-day boundary for every project, whatever retention is set later', async () => {
+    // The floor is where the BACKFILL's `MIN(day)` could reach on the day 0005
+    // ran, and the window then was 90 for everyone: `retention_days` (0006) did
+    // not exist yet. It used to read the CURRENT window, so raising a project to
+    // 180 dropped its floor 90 days below the backfill's boundary spike — and the
+    // spike's installs, the very rows this exists to flag, read as exact.
     const marker = (await backfillMarker()) as string;
-    await setRetention(PROJECT, 180);
+    const expected = addDays(marker, -(RAW_RETENTION_DAYS - 1));
+    await setProjectRetention(DB, PROJECT, 180, NOW);
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(expected);
+    expect(await firstSeenFloorDay(DB, OTHER_PROJECT)).toBe(expected);
 
-    // A project keeping 180 days had raw rows 90 days further back on the day the
-    // migration ran, so its backfill could reach further back and its floor sits
-    // there too. Using the global default here would mark 90 days of exact rows
-    // as suspect.
-    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(addDays(marker, -179));
-    // The untouched project is unaffected — the floor is per project, from the
-    // same column the sweep reads.
-    expect(await firstSeenFloorDay(DB, OTHER_PROJECT)).toBe(
-      addDays(marker, -(RAW_RETENTION_DAYS - 1)),
-    );
-  });
-
-  it('clamps an out-of-range retention_days rather than moving the floor to it', async () => {
-    const marker = (await backfillMarker()) as string;
-    // Same clamp every other reader applies (0006). A hand-edited absurdity must
-    // not be able to push the floor past the longest window the sweep can hold.
+    // A hand-edited absurdity in `retention_days` cannot move it either.
     await DB.prepare(`UPDATE projects SET retention_days = 10000 WHERE id = ?1`).bind(PROJECT).run();
-    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(
-      addDays(marker, -(clampRetentionDays(10000) - 1)),
-    );
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(expected);
   });
 });

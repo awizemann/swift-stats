@@ -37,6 +37,25 @@ const HASH_RE = /^[0-9a-f]{64}$/;
 const MIN_RETENTION_DAYS = 90;
 const MAX_RETENTION_DAYS = 400;
 
+// `set-retention`'s statement — VERBATIM the template literal SET_RETENTION_SQL
+// in src/retention.ts (this script cannot import TypeScript). The test suite
+// compares the two texts (test/retention.test.ts), so an edit to one alone fails
+// it. Binds ?1 project id, ?2 window in days, ?3 today; substituted below.
+const SET_RETENTION_SQL = `UPDATE projects
+   SET raw_complete_from = CASE
+         WHEN ?2 > max(${MIN_RETENTION_DAYS}, min(${MAX_RETENTION_DAYS}, COALESCE(retention_days, ${MIN_RETENTION_DAYS})))
+         THEN max(
+                COALESCE(raw_complete_from, ''),
+                min(
+                  date(?3, '-' || (max(${MIN_RETENTION_DAYS}, min(${MAX_RETENTION_DAYS}, COALESCE(retention_days, ${MIN_RETENTION_DAYS}))) - 1) || ' days'),
+                  COALESCE((SELECT MIN(day) FROM events WHERE project_id = projects.id), '9999-12-31')
+                )
+              )
+         ELSE raw_complete_from
+       END,
+       retention_days = ?2
+ WHERE id = ?1`;
+
 // Human-readable free text: a project's display name and a key's label.
 //
 // `q()` escapes the quote, so this is not the injection guard — it is the second
@@ -256,7 +275,15 @@ switch (command) {
       die(`retention must be between ${MIN_RETENTION_DAYS} and ${MAX_RETENTION_DAYS} days`);
     }
     requireProjectExists(projectId);
-    execute(`UPDATE projects SET retention_days = ${n} WHERE id = ${q(projectId)};`);
+    // NOT a bare `SET retention_days`: on an increase this also moves
+    // `raw_complete_from` (0007) in the same statement, so the days the old window
+    // already swept are never treated as raw-complete again.
+    execute(
+      SET_RETENTION_SQL.replaceAll('?1', q(projectId))
+        .replaceAll('?2', String(n))
+        .replaceAll('?3', "date('now')")
+        .replace(/\s+/g, ' ') + ';',
+    );
     console.log('\nRaw events beyond this window are deleted by the nightly job.');
     console.log('Rollups are unaffected — they are kept indefinitely either way.');
     break;

@@ -32,6 +32,14 @@
 //   * already what `keys.key_hash` stores, so it reveals nothing new,
 //   * per-client in the way that matters — one project's key, one bucket.
 //
+// Keyed buckets are ALSO namespaced by endpoint (`ingest:` / `read:`), so the
+// same key presented to both endpoint families is counted twice, separately —
+// see `checkPreAuthRate`. What namespacing cannot fix, and nothing in-Worker can:
+// the write key is public, so anyone holding the app binary can spend that key's
+// INGEST bucket by POSTing to `/v1/events` with it, and the app's real traffic
+// shares that bucket. That is inherent to a key that ships in a binary; the WAF
+// rule in front of the Worker is the control for it, not this file.
+//
 // A request with no key at all shares one `anonymous` bucket. That is deliberate:
 // those requests are 401s, they should be cheap to refuse, and the alternative
 // (not limiting them) leaves the unauthenticated path unbounded.
@@ -126,8 +134,18 @@ export function countAgainst(bucketKey: string, now: number, limit: number): voi
 export async function checkPreAuthRate(
   presentedKey: string | null,
   now: number,
-  /** Per-endpoint ceiling; the read endpoints pass `READ_LIMIT_PER_WINDOW`. */
-  limit: number = PRE_AUTH_LIMIT_PER_WINDOW,
+  /**
+   * Which endpoint family is counting. It picks the ceiling AND the bucket: the
+   * same presented key has one bucket for ingest and a separate one for reads.
+   *
+   * Separate buckets because the write key is public (§7 — it ships in the
+   * binary). Anyone can present it to `/v1/summary` as a "read key"; every such
+   * request is a 401, but while the key's bucket was shared it counted toward
+   * the INGEST ceiling too, so a few hundred cheap 401s a minute on the read
+   * path 429'd the app's own fleet on ingest. Namespaced, abuse of one endpoint
+   * spends only that endpoint's bucket.
+   */
+  endpoint: 'ingest' | 'read' = 'ingest',
 ): Promise<void> {
   // A key shape that cannot be valid does not deserve a SHA-256 either; it goes
   // in the anonymous bucket with the missing-key requests. Mirrors the length
@@ -143,7 +161,8 @@ export async function checkPreAuthRate(
     return;
   }
   const hash = await hashKey(presentedKey);
-  countAgainst(`key:${hash}`, now, limit);
+  if (endpoint === 'read') countAgainst(`read:key:${hash}`, now, READ_LIMIT_PER_WINDOW);
+  else countAgainst(`ingest:key:${hash}`, now, PRE_AUTH_LIMIT_PER_WINDOW);
 }
 
 /** The post-auth ingest limiter, keyed on the project the write key resolved to. */

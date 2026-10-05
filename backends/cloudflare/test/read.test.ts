@@ -13,6 +13,7 @@ import {
   readRequest,
   resetDatabase,
   seedEvents,
+  snapshotDatabase,
 } from './helpers.js';
 
 async function get(path: string, params: Record<string, string>, key: string | null = READ_KEY) {
@@ -229,15 +230,15 @@ describe('GET /v1/summary (§8.1)', () => {
   });
 
   it('is safe: a read writes nothing', async () => {
+    // Every table, by contents. Counting `events` alone missed any UPDATE and any
+    // write to another table. The one documented write on a read path is the
+    // coalesced `keys.last_used_at` touch (0004), and only that column is exempt.
     await seedSummaryFixture();
-    const before = await (env as never as { DB: D1Database }).DB.prepare(
-      `SELECT COUNT(*) AS n FROM events`,
-    ).first<{ n: number }>();
+    const before = await snapshotDatabase(['keys.last_used_at']);
     await get('/v1/summary', { projectId: PROJECT, from: D(16), to: D(14) });
-    const after = await (env as never as { DB: D1Database }).DB.prepare(
-      `SELECT COUNT(*) AS n FROM events`,
-    ).first<{ n: number }>();
-    expect(after?.n).toBe(before?.n);
+    await get('/v1/events/top', { projectId: PROJECT, from: D(16), to: D(14) });
+    await get('/v1/events/top', { projectId: PROJECT, from: D(16), to: D(14), name: 'project_opened' });
+    expect(await snapshotDatabase(['keys.last_used_at'])).toEqual(before);
   });
 });
 

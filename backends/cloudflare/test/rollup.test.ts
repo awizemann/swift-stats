@@ -429,7 +429,7 @@ describe('reads past raw retention are answered from rollups', () => {
     // Roll `oldDay` explicitly (the nightly window only reaches back a few
     // days), then let the sweep remove its raw rows.
     const { rollupStatements } = await import('../src/rollup.js');
-    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString(), PROJECT));
     await runScheduled(testEnv, NOW);
 
     const raw = await DB.prepare(`SELECT COUNT(*) AS n FROM events WHERE day = ?1`)
@@ -459,8 +459,8 @@ describe('reads past raw retention are answered from rollups', () => {
     const { rollupStatements } = await import('../src/rollup.js');
     // Roll BOTH days, so `cutoff` exists in raw AND in rollups. A read that
     // summed the two sources instead of choosing one per day would report 2.
-    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString()));
-    await DB.batch(rollupStatements(testEnv, cutoff, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString(), PROJECT));
+    await DB.batch(rollupStatements(testEnv, cutoff, NOW.toISOString(), PROJECT));
     await runScheduled(testEnv, NOW);
 
     const body = (await (await get({ projectId: PROJECT, from: oldDay, to: cutoff })).json()) as {
@@ -614,13 +614,13 @@ describe('the 00:00–02:10 read window (a day must not read as zero while its r
       { day: rolledOnlyDay, name: 'app_open', installId: INSTALLS.a, sessionId: S1 },
     ]);
     const { rollupStatements } = await import('../src/rollup.js');
-    await DB.batch(rollupStatements(testEnv, rolledOnlyDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, rolledOnlyDay, NOW.toISOString(), PROJECT));
     await DB.prepare(`DELETE FROM events WHERE day = ?1`).bind(rolledOnlyDay).run();
 
     await seedEvents([{ day: rawDay, name: 'app_open', installId: INSTALLS.b, sessionId: S2 }]);
     // `rawDay` also has a (stale, empty) rollup, so a read that summed both
     // sources instead of choosing one per day would be visible.
-    await DB.batch(rollupStatements(testEnv, rawDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, rawDay, NOW.toISOString(), PROJECT));
 
     const body = (await (
       await get({ projectId: PROJECT, from: rolledOnlyDay, to: rawDay })
@@ -639,7 +639,7 @@ describe('the 00:00–02:10 read window (a day must not read as zero while its r
     const oldDay = addDays(TODAY, -RAW_RETENTION_DAYS - 5);
     await seedEvents([{ day: oldDay, name: 'app_open', installId: INSTALLS.a, sessionId: S1 }]);
     const { rollupStatements } = await import('../src/rollup.js');
-    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString(), PROJECT));
     await DB.prepare(`DELETE FROM events WHERE day = ?1`).bind(oldDay).run();
 
     // The project's only raw rows are from yesterday.
@@ -698,7 +698,7 @@ describe('the §8.2 breakdown prop cap applies to every source', () => {
       { day: oldDay, name: 'wide_event', installId: INSTALLS.a, sessionId: S1, props: wideProps(1) },
     ]);
     const { rollupStatements } = await import('../src/rollup.js');
-    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString(), PROJECT));
     await DB.prepare(`DELETE FROM events WHERE day = ?1`).bind(oldDay).run();
 
     const body = await top(oldDay, oldDay);
@@ -714,7 +714,7 @@ describe('the §8.2 breakdown prop cap applies to every source', () => {
     await seedEvents([
       { day: oldDay, name: 'wide_event', installId: INSTALLS.a, sessionId: S1, props: wideProps(1) },
     ]);
-    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString(), PROJECT));
     await DB.prepare(`DELETE FROM events WHERE day = ?1`).bind(oldDay).run();
 
     await seedEvents([
@@ -749,7 +749,7 @@ describe('the §8.2 breakdown prop cap applies to every source', () => {
         props: { p99: `v${i}` },
       })),
     );
-    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString(), PROJECT));
     await DB.prepare(`DELETE FROM events WHERE day = ?1`).bind(oldDay).run();
 
     await seedEvents([
@@ -783,7 +783,7 @@ describe('the §8.2 breakdown past raw retention', () => {
     ]);
 
     const { rollupStatements } = await import('../src/rollup.js');
-    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString()));
+    await DB.batch(rollupStatements(testEnv, oldDay, NOW.toISOString(), PROJECT));
     await DB.prepare(`DELETE FROM events WHERE day = ?1`).bind(oldDay).run();
 
     const ctx = createExecutionContext();

@@ -48,21 +48,27 @@ const TABLES = [
  * point: a suite that builds its own tables passes while the migration that
  * ships is wrong, which is the failure mode this is guarding against.
  */
-export async function resetDatabase(): Promise<void> {
+export async function resetDatabase(
+  options: {
+    /**
+     * Apply only the first N migration files (in filename order) and seed the
+     * fixtures against THAT schema. For a test that has to build the state an
+     * older deployment was in — orphaned rows a later migration must heal, say —
+     * and then apply the rest with `applyMigrationsFrom(N)`.
+     */
+    migrations?: number;
+    /** Migration indexes (0-based) to leave out, e.g. to stage "0007 without 0008". */
+    skip?: number[];
+  } = {},
+): Promise<void> {
   for (const table of TABLES) {
     await DB.prepare(`DROP TABLE IF EXISTS ${table}`).run();
   }
 
-  for (const file of MIGRATIONS_SQL) {
-    // Strip every `--` comment before splitting. The migration is heavily
-    // commented and a comment containing a `;` would otherwise split a statement
-    // in half. Safe here because no string literal in the migration contains `--`.
-    const sql = file.replace(/--[^\n]*/g, '');
-    for (const statement of sql.split(';')) {
-      const trimmed = statement.trim();
-      if (trimmed !== '') await DB.prepare(trimmed).run();
-    }
-  }
+  const skip = new Set(options.skip ?? []);
+  await applyMigrations(
+    MIGRATIONS_SQL.slice(0, options.migrations ?? MIGRATIONS_SQL.length).filter((_, i) => !skip.has(i)),
+  );
 
   const now = '2026-08-17T00:00:00.000Z';
   await DB.batch([
@@ -84,6 +90,65 @@ export async function resetDatabase(): Promise<void> {
   await seed(OTHER_WRITE_KEY, OTHER_PROJECT, 'write', null);
   await seed(OTHER_READ_KEY, OTHER_PROJECT, 'read', null);
   await seed(REVOKED_WRITE_KEY, PROJECT, 'write', '2026-08-16T00:00:00.000Z');
+}
+
+/** How many migration files ship. */
+export const MIGRATION_COUNT = MIGRATIONS_SQL.length;
+
+/** Apply every migration file from index `from` (0-based, filename order) on. */
+export async function applyMigrationsFrom(from: number): Promise<void> {
+  await applyMigrations(MIGRATIONS_SQL.slice(from));
+}
+
+/** Apply the single migration file at index `i` (0-based, filename order). */
+export async function applyMigration(i: number): Promise<void> {
+  await applyMigrations(MIGRATIONS_SQL.slice(i, i + 1));
+}
+
+async function applyMigrations(files: string[]): Promise<void> {
+  for (const file of files) {
+    // Strip every `--` comment before splitting. The migration is heavily
+    // commented and a comment containing a `;` would otherwise split a statement
+    // in half. Safe here because no string literal in the migration contains `--`.
+    const sql = file.replace(/--[^\n]*/g, '');
+    for (const statement of sql.split(';')) {
+      const trimmed = statement.trim();
+      if (trimmed !== '') await DB.prepare(trimmed).run();
+    }
+  }
+}
+
+/**
+ * Every row of every table, keyed by table name, for "this did not write" checks.
+ *
+ * Whole CONTENTS, not row counts: an UPDATE changes no count, and an UPDATE is
+ * exactly the write a read path is most likely to grow by accident. Tables are
+ * discovered from `sqlite_master` rather than listed, so a table added by a
+ * future migration is covered without anyone remembering to add it here.
+ * `ignoreColumns` names a `table.column` whose writes are documented and
+ * expected (the coalesced `keys.last_used_at` touch, 0004).
+ */
+export async function snapshotDatabase(
+  ignoreColumns: string[] = [],
+): Promise<Record<string, unknown[]>> {
+  const { results: tables } = await DB.prepare(
+    `SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%'
+      ORDER BY name`,
+  ).all<{ name: string }>();
+  const out: Record<string, unknown[]> = {};
+  for (const { name } of tables) {
+    const { results } = await DB.prepare(`SELECT * FROM ${name} ORDER BY rowid`).all<Record<string, unknown>>();
+    out[name] = results.map((row) => {
+      const copy = { ...row };
+      for (const ic of ignoreColumns) {
+        const [t, c] = ic.split('.');
+        if (t === name && c !== undefined) delete copy[c];
+      }
+      return copy;
+    });
+  }
+  return out;
 }
 
 /** Set a project's raw-retention window (migration 0006). */

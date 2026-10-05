@@ -1,0 +1,52 @@
+-- swift-stats Cloudflare/D1 backend — migration 0007.
+--
+-- Two nullable columns on `projects`, both bookkeeping for the nightly job and
+-- the raw/rollup boundary. Additive: `ADD COLUMN` with no default, no rewrite,
+-- and NULL is the correct value for every existing row.
+--
+-- 1. `raw_complete_from` — the oldest day from which this project's raw rows are
+--    known to be COMPLETE. NULL means "no constraint beyond the retention
+--    window".
+--
+--    Why it is needed. Raw rows below a project's retention cutoff are deleted
+--    nightly, after that day is rolled up. Raising the window (90 -> 180) moves
+--    the cutoff back 90 days at once, but the 90 days in between were already
+--    swept under the old window: their history lives only in the rollups, and
+--    their raw rows are gone. Anything that then treated those days as raw-
+--    complete was wrong in the expensive direction:
+--
+--      * ingest's `bucketDay` floor followed the new cutoff, so a late batch (or
+--        a wrong-clock `ts` clamped onto the floor) wrote ONE raw row into a day
+--        whose real rows were long gone;
+--      * the read boundary followed the oldest raw row, so that one row dragged
+--        it down and every day between it and today-89 read raw — zeros — while
+--        the rollups held the real numbers;
+--      * and the night that day expired again under the new window, the sweep
+--        re-rolled it from the lone row, replacing its real rollup with a count
+--        of one. Rollups are the only copy past retention, so that was permanent.
+--
+--    The marker records the boundary at the moment of the raise: the OLD clock
+--    cutoff (or the project's oldest surviving raw day, if that is older — those
+--    days had not been swept yet and are complete). The effective raw floor is
+--    then `max(rawCutoffDay(now, retention_days), raw_complete_from)`, used by
+--    ingest clamping, by `rawBoundaryDay`, and by the sweep, which never re-rolls
+--    a day below the marker from raw (its rollup is authoritative; stray raw rows
+--    there are deleted without being rolled). Once the clock cutoff passes the
+--    marker it is moot, and the sweep clears it.
+--
+--    Written by `setProjectRetention` (src/retention.ts) and by
+--    `admin.mjs set-retention`, which run the same single UPDATE so the marker
+--    and the new window cannot disagree. A bare `UPDATE projects SET
+--    retention_days = …` skips it: do not raise retention that way.
+--
+-- 2. `rolled_at` — when the nightly job last VISITED this project: re-rolled it
+--    and swept it, or swept its share of a backlog. NULL = never. The job
+--    processes projects with work in ascending `rolled_at` order under a
+--    per-invocation query budget (D1 caps queries per Worker invocation), so a
+--    project the budget did not reach tonight goes first tomorrow, a project with
+--    a long backlog goes to the back once it has had its share, and none can
+--    starve. Bookkeeping only; nothing reads it as data.
+
+ALTER TABLE projects ADD COLUMN raw_complete_from TEXT;   -- YYYY-MM-DD UTC, or NULL
+
+ALTER TABLE projects ADD COLUMN rolled_at TEXT;           -- ISO 8601 UTC ms, §0, or NULL
