@@ -36,6 +36,9 @@ public final class ManualClock: StatsClock, Clock, @unchecked Sendable {
         var sleepers: [Sleeper] = []
         var nextID = 0
         var requestedSleeps: [Duration] = []
+        /// `waitForSleepers(count:)` callers, resumed by `sleep(for:)` the
+        /// moment enough sleepers are registered.
+        var registrationWaiters: [(id: Int, count: Int, continuation: CheckedContinuation<Void, Never>)] = []
     }
 
     private let state: Mutex<State>
@@ -66,11 +69,15 @@ public final class ManualClock: StatsClock, Clock, @unchecked Sendable {
 
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let alreadyDue = state.withLock { state -> Bool in
-                    guard state.elapsed < deadline else { return true }
+                let (alreadyDue, satisfied) = state.withLock { state -> (Bool, [CheckedContinuation<Void, Never>]) in
+                    guard state.elapsed < deadline else { return (true, []) }
                     state.sleepers.append(Sleeper(id: id, deadline: deadline, continuation: continuation))
-                    return false
+                    let count = state.sleepers.count
+                    let ready = state.registrationWaiters.filter { $0.count <= count }.map(\.continuation)
+                    state.registrationWaiters.removeAll { $0.count <= count }
+                    return (false, ready)
                 }
+                for waiter in satisfied { waiter.resume() }
                 if alreadyDue { continuation.resume() }
             }
         } onCancel: {
@@ -106,6 +113,14 @@ public final class ManualClock: StatsClock, Clock, @unchecked Sendable {
         for sleeper in due { sleeper.continuation.resume() }
     }
 
+    /// Moves **only** the wall clock, as a user changing the device time does:
+    /// the monotonic clock and every sleeper are unaffected. Negative values
+    /// set it back. This is what lets a test check that elapsed-time logic
+    /// never reads the wall clock (§10).
+    public func shiftWallClock(by seconds: TimeInterval) {
+        state.withLock { $0.wallBase = $0.wallBase.addingTimeInterval(seconds) }
+    }
+
     /// How many sleepers are currently waiting. Use `waitForSleepers` rather
     /// than reading this in a loop.
     public var pendingSleepCount: Int {
@@ -118,11 +133,52 @@ public final class ManualClock: StatsClock, Clock, @unchecked Sendable {
         state.withLock { $0.requestedSleeps }
     }
 
-    /// Yields (never sleeps) until at least `count` sleepers are registered, so
-    /// a test cannot `advance` past a deadline that has not been set yet.
-    /// Returns `false` if they never arrived.
+    /// Suspends until at least `count` sleepers are **pending** at once, so a
+    /// test cannot `advance` past a deadline that has not been set yet.
+    ///
+    /// Signalled by `sleep(for:)` itself the moment a sleeper registers — no
+    /// polling, so it does not depend on how busy the machine is. It counts
+    /// sleepers waiting *now*, the same number ``pendingSleepCount`` reports:
+    /// one that registered and was already resumed by an `advance` (or
+    /// cancelled) does not count. So call it before advancing past the
+    /// deadlines it is waiting for, not after.
+    ///
+    /// It waits for as long as that takes; a sleeper that never arrives is a
+    /// hang, which a test's time limit turns into a failure — and the
+    /// cancellation that time limit delivers resumes this call rather than
+    /// leaking it. To assert that a sleeper does *not* arrive, use
+    /// ``waitForSleepers(count:maxYields:)``.
+    public func waitForSleepers(count: Int = 1) async {
+        let id = state.withLock { state -> Int in
+            state.nextID += 1
+            return state.nextID
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let ready = state.withLock { state -> Bool in
+                    // Checked under the lock, so a cancellation whose handler
+                    // ran before this waiter was stored still resumes it.
+                    guard state.sleepers.count < count, !Task.isCancelled else { return true }
+                    state.registrationWaiters.append((id, count, continuation))
+                    return false
+                }
+                if ready { continuation.resume() }
+            }
+        } onCancel: {
+            let waiter = state.withLock { state -> CheckedContinuation<Void, Never>? in
+                guard let index = state.registrationWaiters.firstIndex(where: { $0.id == id }) else { return nil }
+                return state.registrationWaiters.remove(at: index).continuation
+            }
+            waiter?.resume()
+        }
+    }
+
+    /// The bounded form: yields (never sleeps) up to `maxYields` times for
+    /// `count` sleepers to register, and returns `false` if they did not. Only
+    /// for a negative assertion — a yield budget is a race against the
+    /// scheduler, so "arrived" should be awaited with ``waitForSleepers(count:)``.
     @discardableResult
-    public func waitForSleepers(count: Int = 1, maxYields: Int = 10_000) async -> Bool {
+    public func waitForSleepers(count: Int, maxYields: Int) async -> Bool {
         for _ in 0..<maxYields {
             if pendingSleepCount >= count { return true }
             await Task.yield()
@@ -132,13 +188,18 @@ public final class ManualClock: StatsClock, Clock, @unchecked Sendable {
 
     /// Resumes everything still waiting. Call in teardown so a suspended retry
     /// task does not outlive the test.
+    /// Also releases any `waitForSleepers(count:)` still waiting, so a test
+    /// that failed before its sleeper arrived does not leak a suspended task.
     public func cancelAllSleepers() {
-        let sleepers: [Sleeper] = state.withLock { state in
+        let (sleepers, waiters) = state.withLock { state in
             let all = state.sleepers
+            let waiting = state.registrationWaiters.map(\.continuation)
             state.sleepers.removeAll()
-            return all
+            state.registrationWaiters.removeAll()
+            return (all, waiting)
         }
         for sleeper in sleepers { sleeper.continuation.resume() }
+        for waiter in waiters { waiter.resume() }
     }
 
     private func resume(id: Int) {

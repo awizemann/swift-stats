@@ -61,6 +61,18 @@ package; schema changes are called out explicitly below.
   a choice via `setConsent`. §14 adds Device ID to the SDK manifest's collected
   types; §2.5 and §9 note that granting `identity` does not by itself send a
   `userId`. The `schema` string stays `v1`; batches and endpoints are unchanged.
+- **Breaking (StatsTesting): `ManualClock.waitForSleepers(count:)` now waits
+  for the sleepers instead of spending a yield budget, and returns nothing.**
+  It is signalled by `sleep(for:)` registering, counts sleepers pending at
+  that moment (one already resumed by an `advance` does not count — call it
+  before advancing), and is resumed, not leaked, if the waiting task is
+  cancelled (e.g. by a test time limit). Code that used its `Bool` result, or
+  that wants a bounded check — to assert that a sleeper does *not* arrive —
+  calls `waitForSleepers(count:maxYields:) -> Bool` with `maxYields` passed
+  explicitly. The package's own retry tests now await progress this way.
+  "Backoff is capped…" was intermittently failing because of the old
+  step-and-yield driver: the retry had registered and fired, but the fixed
+  yield budget ran out before the flush it woke had finished sending.
 
 ### Added
 
@@ -72,6 +84,17 @@ package; schema changes are called out explicitly below.
   session mints an ephemeral install id because `identity` is not granted
   (with the new default, only apps that deny it). Install-based metrics (installs, active installs,
   first-seen installs, retention) then count sessions. No values are logged.
+- **`StatsTesting.ManualClock.shiftWallClock(by:)`** — moves only the wall
+  clock, as a user changing the device time does; the monotonic clock and
+  sleepers are unaffected.
+- **`StatsTesting.InMemorySink.waitForBatches(_:)`** — suspends until that
+  many batches have been sent, signalled by `send` itself.
+- **`StatsTesting.RelaunchProbe.installIDsAcrossRelaunch(configuration:)`** —
+  runs two launches of a client built from your configuration (each tracks,
+  flushes to an `InMemorySink` and shuts down) under a unique app id and
+  temporary storage it cleans up, and returns both `installId`s and `seq`s, so
+  a test can assert a stable install under the default consent and a
+  per-session one under `[.usage, .diagnostics]`. See the README.
 
 ### Documentation
 
@@ -81,6 +104,105 @@ package; schema changes are called out explicitly below.
   `.identity` install-based metrics (installs, active installs, first-seen
   installs, retention) count sessions, and that
   `identify(userID:)` is not needed for a stable install.
+
+### Fixed
+
+- **Two `StatsClient`s for one app id no longer double-send or repeat
+  `seq`: the second forwards to the first.** Two clients for one app id (or
+  one consumer-supplied `storageDirectory`) shared the queue file and the
+  persisted `seq` but each held its own copy of both, so queued records were
+  sent twice and different events went out with the same `(installId, seq)`.
+  Now the first client to be used **owns** the app id, and every other client
+  for it forwards every call — `track`, `record`, `identify`, `setConsent`,
+  `setEnabled`, `reset`, `flush`, the lifecycle calls, `currentConsent`,
+  `isEnabled`, `hasStableInstallIdentity`, `queuedEventCount` — to the owner,
+  so behavior is the same whichever handle the app uses (an opt-out through a
+  settings screen's own client opts the app out). A forwarding client's own
+  configuration is ignored, with one `warning`. When the owner is shut down
+  or deallocated, the next call on another client takes ownership, re-reads
+  the persisted consent, opt-out and `seq`, and from then on sends with its
+  own configuration. A call forwarded while the owner is shutting down is not
+  dropped: it waits for that shutdown to finish and then goes to the next
+  owner (so an opt-out made in that window is applied). Across handles, events
+  keep arrival order, each with the timestamp of its own call. `shutdown()` is
+  now terminal: a shut-down client does nothing. Two clients for **different**
+  app ids sharing one `storageDirectory` are not forwarded — the second app's
+  events would go out as the first — so the later one is refused: every call
+  does nothing; the first ordinary call is logged at `error` and then one in
+  every 100, and every `setConsent`, `setEnabled(false)` and `reset()` is
+  logged at `fault` because it cannot be applied. A call forwarded while the
+  owner shuts down waits as long as the in-flight send, i.e. at most the
+  sink's request timeout. **Source note:**
+  `currentConsent`, `isEnabled` and `hasStableInstallIdentity` are now
+  `get async` (callers outside the actor already `await` them).
+- **A deallocated client's in-flight flush stops.** A client's flush `Task`
+  holds its dispatcher, not the client, so `deinit` could run mid-send; the
+  dispatcher then kept sending and writing the queue file while the next owner
+  started on it. `deinit` (and `shutdown()`) now revoke the client's store and
+  dispatcher before giving up the app id: no further send, and no file write,
+  delete or rename. An acceptance that arrives after that is not recorded; the
+  next owner re-sends the batch, a duplicate §6 dedupes.
+- **Privacy: under denied `identity`, `seq` no longer runs across sessions.**
+  Each per-session ephemeral install id now has its own in-memory `seq` space
+  starting at 0, never persisted (§6, §11). The single counter it replaced —
+  persisted, and continuing from one ephemeral id to the next — let a backend
+  chain the sessions denied `identity` exists to keep apart. The persisted
+  `seq` now counts only events of the stable install. Consequence: after a
+  mid-life grant of `.identity`, the stable install's events start at its own
+  `seq` (0 for a fresh install), not after the ephemeral ones.
+- **A queue file that cannot be read is no longer overwritten.** A failed load
+  (e.g. iOS before first unlock under complete file protection) used to mark
+  the queue loaded-and-empty, and the next append — `FileHandle(forWritingAtPath:)`
+  returns `nil` for any error — recreated the file from that one group, wiping
+  the backlog. The store now stays unloaded and retries on the next operation,
+  holds new events in memory, sends nothing, and never writes, replaces or
+  compacts the file until a load succeeds, then merges the held events in
+  behind the backlog. Appends use the throwing `FileHandle(forWritingTo:)` and
+  recreate the file only on `ENOENT`. A file that stays unreadable — at least
+  10 failed loads over at least 60 seconds — is moved aside as
+  `queue.unreadable` (at most one is kept) and a fresh queue starts, logged at
+  `error`; except that on iOS and the other embedded platforms an `EPERM`
+  failure, the data-protection signature before first unlock, is only ever
+  waited out. `queue.unreadable` holds unsent events, so it is deleted by any
+  discard (opt-out, revocation) and once a later load of the queue succeeds.
+- **Resolving the default queue location no longer creates directories.** It
+  used `FileManager.url(for: .applicationSupportDirectory, create: true)`, so a
+  client that collects nothing created `Application Support` (on a fresh iOS
+  container) just by checking for a queue to discard. The path is now resolved
+  without creating anything, and the directories are created on the first
+  write — everything above the SDK's own `swift-stats` directory (including
+  the `<appId>` level, previously 0700) with default attributes, `swift-stats`
+  itself 0700. A collection-off client with nothing queued
+  no longer touches the disk on `flush()` at all.
+- **A queue rewrite killed mid-way replays instead of skipping.** The
+  consumed-prefix marker is now invalidated *before* the atomic replace rather
+  than after it, closing a window in which an old marker could validate
+  against the new file and skip unsent records on the next launch.
+- **No retry outlives `shutdown()` or a discard.** An answer that arrived for
+  a request already on the wire when the client was shut down, opted out or
+  revoked used to schedule a retry (and arm a backoff that blocked the next
+  flush after re-enabling). It is now ignored, except that an accepted or
+  permanently dropped batch is still removed; a shut-down dispatcher starts no
+  flush or timer. A retry that woke up just as a newer one was scheduled no
+  longer clears the newer one and its backoff window (retries carry a
+  generation).
+- **`flush()`, `reset()` and `applicationDidEnterBackground()` never send while
+  collection is off.** A queue left by an earlier launch was sent by `flush()`
+  even under a stored opt-out or a consent without `usage`. With collection off
+  by choice the leftover queue is now discarded, not held — holding it would
+  send it the moment the person opted back in, which §11's discard-on-revocation
+  exists to prevent. (If the SDK's own suite cannot be opened the queue is held.)
+  A configured consent that drops a group in an app update, with no
+  `setConsent` call, is still not treated as a revocation: the install UUID is
+  kept.
+- **`session_end`'s `duration_s` is measured on the monotonic clock**, so a
+  device clock set back mid-session can no longer make it negative.
+- **A refused event name is no longer logged verbatim.** The log carries its
+  scalar count and an `os_log` hash instead, since a name that fails
+  validation may be user content passed by mistake.
+- **An over-long `appVersion` / `appBuild` (more than 32 scalars) is truncated**
+  to the schema §3 limit and logged at `error`, instead of being sent as-is and
+  turning every batch into a permanent 400.
 
 ### Fixed — Cloudflare backend (`backends/cloudflare`, unreleased; next `backend-cloudflare-*` heading)
 

@@ -1,5 +1,6 @@
 import Foundation
 @testable import Stats
+import StatsTesting
 import Testing
 
 /// What the queue file and its `queue.head` marker are allowed to cost.
@@ -662,6 +663,221 @@ struct QueueFileTests {
             "only the torn record is lost; the append that followed it is intact"
         )
         #expect(Self.lineCount(queue) == 4, "and the load normalized the file")
+    }
+
+    // MARK: - A queue file that exists but cannot be read or written
+
+    /// Regression (data loss). On iOS a file with complete protection cannot be
+    /// read before first unlock; `0000` stands in for that here. The load used to
+    /// fail, mark the store loaded-and-empty anyway, and the next append — whose
+    /// `FileHandle(forWritingAtPath:)` returned `nil` for *any* error — took the
+    /// "no file" branch and atomically replaced the backlog with that one group.
+    ///
+    /// Now a failed load leaves the store unloaded: appends wait in memory, no
+    /// batch is handed out, nothing replaces the file, and the load is retried
+    /// on the next operation.
+    @Test("An unreadable queue file is never replaced; appends wait in memory until it loads")
+    func unreadableQueueIsNotReplaced() async throws {
+        let directory = Self.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = directory.appendingPathComponent("queue.jsonl")
+        let writer = Self.store(in: directory)
+        _ = await writer.append((0..<3).map(Self.record))
+        await writer.remove(through: 0)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: queue.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: queue.path) }
+
+        let store = Self.store(in: directory)
+        _ = await store.append((3..<5).map(Self.record))
+        #expect(await store.count == 2, "the new records are held in memory")
+        #expect(await Self.names(of: store).isEmpty, "nothing is sent before the backlog is known")
+        await store.compact()
+        await store.remove(through: 100)
+
+        // "First unlock."
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: queue.path)
+        #expect(Self.lineCount(queue) == 3, "the file was never replaced while it was unreadable")
+        #expect(await Self.names(of: store) == ["e1", "e2", "e3", "e4"], "backlog first, then what waited")
+        #expect(await Self.names(of: Self.store(in: directory)) == ["e1", "e2", "e3", "e4"])
+    }
+
+    /// What is held while unloaded obeys the cap like anything else, and the
+    /// merge keeps the newest `maxQueued` across file and memory: the file's
+    /// records are older, so they absorb the overflow first.
+    @Test("Held records obey the cap while unloaded, and the merge keeps the newest")
+    func heldRecordsCapAndMerge() async throws {
+        // The merge overflows into the file's records.
+        do {
+            let directory = Self.scratchDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let queue = directory.appendingPathComponent("queue.jsonl")
+            _ = await Self.store(in: directory, maxQueued: 5).append((0..<4).map(Self.record))
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: queue.path)
+
+            let store = Self.store(in: directory, maxQueued: 5)
+            _ = await store.append((4..<7).map(Self.record))
+            #expect(await store.count == 3)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: queue.path)
+            #expect(await Self.names(of: store) == ["e2", "e3", "e4", "e5", "e6"])
+            #expect(await Self.names(of: Self.store(in: directory)) == ["e2", "e3", "e4", "e5", "e6"])
+        }
+        // The held records alone overflow the cap.
+        do {
+            let directory = Self.scratchDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let queue = directory.appendingPathComponent("queue.jsonl")
+            _ = await Self.store(in: directory, maxQueued: 5).append((0..<4).map(Self.record))
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: queue.path)
+
+            let store = Self.store(in: directory, maxQueued: 5)
+            _ = await store.append((4..<11).map(Self.record))
+            #expect(await store.count == 5, "drop-oldest applies to the held records too")
+            #expect(await store.diagnostics.dropped == 2)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: queue.path)
+            #expect(await Self.names(of: store) == ["e6", "e7", "e8", "e9", "e10"])
+            #expect(await Self.names(of: Self.store(in: directory)) == ["e6", "e7", "e8", "e9", "e10"])
+        }
+    }
+
+    /// A file that is never going to be readable must not keep every event in
+    /// memory for good. Past both bounds — enough attempts, over enough time —
+    /// it is moved aside (kept, not deleted) and a fresh queue starts with
+    /// what was held. Discriminating on the bounds: three attempts in no time
+    /// are not enough on their own.
+    @Test("A queue file that stays unreadable is moved aside, and a fresh queue starts")
+    func permanentlyUnreadableIsQuarantined() async throws {
+        let directory = Self.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = directory.appendingPathComponent("queue.jsonl")
+        let aside = directory.appendingPathComponent("queue.unreadable")
+        _ = await Self.store(in: directory).append((0..<3).map(Self.record))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: queue.path)
+
+        let clock = ManualClock()
+        let store = EventStore(
+            fileURL: { queue }, maxQueued: 10_000,
+            clock: clock, quarantineAttempts: 3, quarantineAfter: .seconds(60)
+        )
+        for seq in 3..<6 { _ = await store.append([Self.record(seq)]) }
+        #expect(!FileManager.default.fileExists(atPath: aside.path), "three quick failures are not permanent")
+
+        clock.advance(by: .seconds(61))
+        _ = await store.append([Self.record(6)])
+        #expect(FileManager.default.fileExists(atPath: aside.path), "moved aside, not deleted")
+        #expect(await Self.names(of: store) == ["e3", "e4", "e5", "e6"])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: aside.path)
+        #expect(Self.lineCount(aside) == 3, "the old backlog is intact beside the new queue")
+
+        // The next launch loads the new queue fine, so the set-aside file —
+        // unsent events, of no further use — is deleted.
+        #expect(await Self.names(of: Self.store(in: directory)) == ["e3", "e4", "e5", "e6"])
+        #expect(!FileManager.default.fileExists(atPath: aside.path))
+    }
+
+    /// An opt-out or revocation discards the queue — every copy of it,
+    /// including one set aside as unreadable.
+    @Test("removeAll deletes queue.unreadable too")
+    func removeAllDeletesQuarantinedQueue() async throws {
+        let directory = Self.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let aside = directory.appendingPathComponent("queue.unreadable")
+        let store = Self.store(in: directory)
+        _ = await store.append([Self.record(0)])
+        try Data("{\"left\":\"over\"}\n".utf8).write(to: aside)
+
+        await store.removeAll()
+        #expect(!FileManager.default.fileExists(atPath: aside.path))
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("queue.jsonl").path))
+    }
+
+    /// The data-protection exemption: on iOS a protected file fails with
+    /// `EPERM` until first unlock, and that must only ever be waited out.
+    @Test("EPERM on an embedded platform counts as data protection; EACCES and macOS do not")
+    func dataProtectionClassification() {
+        func readError(_ posix: Int32) -> NSError {
+            NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError, userInfo: [
+                NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(posix))
+            ])
+        }
+        #expect(EventStore.mayBeDataProtection(readError(EPERM), isEmbedded: true))
+        #expect(!EventStore.mayBeDataProtection(readError(EACCES), isEmbedded: true))
+        #expect(!EventStore.mayBeDataProtection(readError(EPERM), isEmbedded: false))
+        let bare = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+        #expect(EventStore.mayBeDataProtection(bare, isEmbedded: true), "no POSIX code to tell: assume protection")
+    }
+
+    /// Asking whether anything is queued, and discarding, must not create the
+    /// directory — a client that collects nothing does both.
+    @Test("count and removeAll create no directory")
+    func readingCreatesNothing() async {
+        let directory = Self.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = Self.store(in: directory)
+        #expect(await store.count == 0)
+        await store.removeAll()
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    /// The append path's half of the same bug: a file that exists but refuses a
+    /// write handle (`EACCES`, `EPERM`) is not a missing file, and must not be
+    /// "recreated" from the one group being appended. Only `ENOENT` recreates.
+    @Test("A queue file that refuses a write handle is not recreated from one group")
+    func unwritableQueueIsNotRecreated() async throws {
+        let directory = Self.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = directory.appendingPathComponent("queue.jsonl")
+        let store = Self.store(in: directory)
+        _ = await store.append((0..<3).map(Self.record))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: queue.path)
+        _ = await store.append([Self.record(3)])
+        #expect(await store.diagnostics.needsRewrite, "the write failed, so memory and disk are reconciled later")
+
+        // "The process died here": the backlog is intact on disk.
+        #expect(await Self.names(of: Self.store(in: directory)) == ["e0", "e1", "e2"])
+
+        // And once the file is writable the next mutation reconciles the two.
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: queue.path)
+        _ = await store.append([Self.record(4)])
+        #expect(await Self.names(of: Self.store(in: directory)) == ["e0", "e1", "e2", "e3", "e4"])
+    }
+
+    /// Regression (crash window). A rewrite used to replace the queue file and
+    /// only then delete the marker. Killed between the two, the old marker sat
+    /// beside the new file — and when the new file is at least as large as the
+    /// old one (a rewrite that also reconciles appended records) and the old
+    /// offset happens to land on a line boundary (fixed-width records), it
+    /// validates and the next launch skips records that were never sent.
+    ///
+    /// The marker is now invalidated *before* the replace, so the same kill
+    /// replays (duplicates, which §6 dedupes) instead of skipping.
+    @Test("A rewrite killed after the replace replays rather than skips")
+    func rewriteCrashWindowReplays() async throws {
+        let directory = Self.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = directory.appendingPathComponent("queue.jsonl")
+        let head = directory.appendingPathComponent("queue.head")
+        let store = Self.store(in: directory)
+
+        _ = await store.append((10..<20).map(Self.fixedWidthRecord))
+        await store.remove(through: 2)
+        #expect(Self.markerFields(head) != nil, "three records consumed, recorded in the marker")
+
+        // A torn tail, so the next append leaves the store needing a rewrite.
+        let handle = try FileHandle(forWritingTo: queue)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("xx".utf8))
+        try handle.close()
+        _ = await store.append((20..<26).map(Self.fixedWidthRecord))
+        #expect(await store.diagnostics.needsRewrite)
+
+        await store.crashAfterNextReplaceForTesting()
+        await store.compact()
+
+        // "The process died here", with the new file in place.
+        let expected = (13..<26).map { String(format: "e%04d", $0) }
+        #expect(await Self.names(of: Self.store(in: directory)) == expected)
     }
 
     // MARK: - Unencodable records

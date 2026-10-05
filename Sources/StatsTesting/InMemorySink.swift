@@ -22,10 +22,28 @@ public actor InMemorySink: StatsSink {
         self.defaultOutcome = defaultOutcome
     }
 
+    /// `waitForBatches(_:)` callers, resumed by `send` once enough batches
+    /// have arrived.
+    private var batchWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
     public func send(_ batch: StatsBatch) async -> SinkOutcome {
         batches.append(batch)
+        let ready = batchWaiters.filter { $0.count <= batches.count }
+        batchWaiters.removeAll { $0.count <= batches.count }
+        for waiter in ready { waiter.continuation.resume() }
         if scripted.isEmpty { return defaultOutcome }
         return scripted.removeFirst()
+    }
+
+    /// Suspends until at least `count` batches have been sent — signalled by
+    /// `send` itself, so a test awaits progress instead of spending a yield
+    /// budget on it. A batch that never comes is a hang, which a test's time
+    /// limit turns into a failure.
+    public func waitForBatches(_ count: Int) async {
+        guard batches.count < count else { return }
+        await withCheckedContinuation { continuation in
+            batchWaiters.append((count, continuation))
+        }
     }
 
     // MARK: Inspection

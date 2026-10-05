@@ -171,6 +171,19 @@ struct EncodingTests {
         #expect(decoded == values)
     }
 
+    /// §3 caps `appVersion` / `appBuild` at 32 scalars and §0 makes an
+    /// over-long one a 400 for the whole batch — every batch, forever, since the
+    /// value comes from the Info.plist. Truncated, the value is legal; the SDK
+    /// logs an error so the cause is visible.
+    @Test("An over-long appVersion / appBuild is truncated to the schema's 32 scalars")
+    func contextFieldClamped() {
+        let long = String(repeating: "9", count: 31) + "é" + "-build.12345"
+        let clamped = StatsEnvironment.clampedContextField(long, limit: 32, field: "appVersion")
+        #expect(clamped.unicodeScalars.count == 32)
+        #expect(long.hasPrefix(clamped))
+        #expect(StatsEnvironment.clampedContextField("1.4.2", limit: 32, field: "appVersion") == "1.4.2")
+    }
+
     @Test("A nested props value cannot be decoded (the schema forbids emitting one)")
     func nestedValueRejected() {
         #expect(throws: (any Error).self) {

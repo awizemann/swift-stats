@@ -32,9 +32,10 @@ struct DispatchTests {
         await harness.client.track("a")
         #expect(await harness.sink.batchCount == 0)
 
-        #expect(await harness.clock.waitForSleepers(count: 1), "the interval timer must be scheduled")
+        // The interval timer must be scheduled.
+        await harness.clock.waitForSleepers(count: 1)
         harness.clock.advance(by: .seconds(30))
-        #expect(await harness.yieldUntil { await harness.sink.batchCount == 1 })
+        await harness.sink.waitForBatches(1)
         #expect(await harness.sink.sentEventNames == ["a"])
         await harness.tearDown()
     }
@@ -100,10 +101,13 @@ struct DispatchTests {
         await harness.tearDown()
     }
 
-    @Test("A retry keeps the batch, backs off from 1 s doubling, and reuses the batchId")
+    @Test("A retry keeps the batch, backs off from 1 s doubling, and reuses the batchId", .timeLimit(.minutes(1)))
     func retryBackoffAndIdempotency() async {
+        // The interval timer is pushed out of range, so the retries are the
+        // only sleepers that fire.
         let harness = Harness(
             flushAt: 10_000,
+            flushInterval: .seconds(1_000_000),
             outcomes: [.retry(after: nil), .retry(after: nil), .accepted]
         )
         await harness.client.track("a")
@@ -119,14 +123,20 @@ struct DispatchTests {
         await harness.client.waitForFlushes()
         #expect(await harness.sink.batchCount == 1, "no send during the backoff window")
 
-        // Attempt 2, driven by the scheduled retry.
-        #expect(await harness.drive(untilBatches: 2, step: .seconds(1)))
+        // Attempt 2, driven by the scheduled retry: wait for it to register
+        // (beside the interval timer), move past it, wait for the send.
+        await harness.clock.waitForSleepers(count: 2)
+        harness.clock.advance(by: .seconds(1))
+        await harness.sink.waitForBatches(2)
+        await harness.client.waitForFlushes()
         #expect(await harness.client.queuedEventCount == 1)
 
         // Attempt 3 succeeds.
-        #expect(await harness.drive(untilBatches: 3, step: .seconds(2)))
-        #expect(await harness.yieldUntil { await harness.client.queuedEventCount == 0 },
-                "acceptance deletes the batch")
+        await harness.clock.waitForSleepers(count: 2)
+        harness.clock.advance(by: .seconds(2))
+        await harness.sink.waitForBatches(3)
+        await harness.client.waitForFlushes()
+        #expect(await harness.client.queuedEventCount == 0, "acceptance deletes the batch")
 
         let batches = await harness.sink.batches
         #expect(batches.count == 3)
@@ -134,8 +144,8 @@ struct DispatchTests {
         #expect(batches.allSatisfy { $0.events.count == 1 })
 
         // Full jitter with a fraction of 1.0 makes the schedule its ceiling:
-        // 1 s then 2 s. (The 30 s entries are the interval timer.)
-        let backoffs = harness.clock.requestedSleeps.filter { $0 != .seconds(30) }
+        // 1 s then 2 s. (The 1 000 000 s entry is the interval timer.)
+        let backoffs = harness.clock.requestedSleeps.filter { $0 != .seconds(1_000_000) }
         #expect(backoffs == [.seconds(1), .seconds(2)])
         await harness.tearDown()
     }
@@ -146,6 +156,8 @@ struct DispatchTests {
         await harness.client.track("a")
         await harness.client.flush()
         await harness.client.waitForFlushes()
+        // The interval timer and the retry; the retry registers on its own task.
+        await harness.clock.waitForSleepers(count: 2)
 
         #expect(harness.clock.requestedSleeps.contains(.seconds(7)))
         #expect(await harness.client.queuedEventCount == 1)
@@ -164,6 +176,8 @@ struct DispatchTests {
         await harness.client.track("a")
         await harness.client.flush()
         await harness.client.waitForFlushes()
+        // The interval timer and the retry; the retry registers on its own task.
+        await harness.clock.waitForSleepers(count: 2)
 
         #expect(harness.clock.requestedSleeps.contains(.seconds(1_800)))
         #expect(
@@ -189,24 +203,38 @@ struct DispatchTests {
         await harness.client.waitForFlushes()
 
         // The interval timer also sleeps (30 s); the retry is the other one.
+        // Awaited, not assumed: the retry task registers its sleep on its own.
+        await harness.clock.waitForSleepers(count: 2)
         let backoffs = harness.clock.requestedSleeps.filter { $0 != .seconds(30) }
         #expect(backoffs.contains(expected), "hint \(hint) should schedule \(expected)")
         await harness.tearDown()
     }
 
-    @Test("Backoff is capped, so a long outage does not schedule an hour-long wait")
+    /// Driven by awaiting progress, not by a step budget: each round waits for
+    /// the retry's sleeper to register, moves the clock past the longest
+    /// possible wait, then waits for the batch that wakes. (It used to step
+    /// the clock a fixed number of times with a few yields each; under a
+    /// loaded parallel run the retry had registered and fired, but the budget
+    /// ran out before the flush it woke had finished sending.) The interval
+    /// timer is pushed out of the test's range so
+    /// the only sleeper that fires is the retry.
+    @Test("Backoff is capped, so a long outage does not schedule an hour-long wait", .timeLimit(.minutes(1)))
     func backoffCap() async {
         let harness = Harness(
             flushAt: 10_000,
+            flushInterval: .seconds(1_000_000),
             outcomes: Array(repeating: .retry(after: nil), count: 12)
         )
         await harness.client.track("a")
         await harness.client.flush()
         await harness.client.waitForFlushes()
         for attempt in 1..<12 {
-            #expect(await harness.drive(untilBatches: attempt + 1, step: .seconds(60)))
+            // The interval timer plus this round's retry.
+            await harness.clock.waitForSleepers(count: 2)
+            harness.clock.advance(by: .seconds(300))
+            await harness.sink.waitForBatches(attempt + 1)
         }
-        let backoffs = harness.clock.requestedSleeps.filter { $0 != .seconds(30) }
+        let backoffs = harness.clock.requestedSleeps.filter { $0 != .seconds(1_000_000) }
         #expect(backoffs.count >= 11)
         #expect(backoffs.allSatisfy { $0 <= .seconds(300) }, "§7 caps a single wait at 5 minutes")
         // 1, 2, 4, 8… doubling until the 5-minute ceiling, then flat.

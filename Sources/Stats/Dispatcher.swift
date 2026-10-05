@@ -22,6 +22,11 @@ actor Dispatcher {
     private var flushGeneration = 0
     private var timerTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
+    /// Bumped by every `scheduleRetry`. A retry task that already woke up can
+    /// still be waiting for this actor when a newer retry is scheduled; the
+    /// generation lets the stale one notice, instead of clearing the newer
+    /// task and its backoff window and flushing early.
+    private var retryGeneration = 0
     private var lastFlushAt: Duration?
     private var consecutiveRetries = 0
     /// The batch a `retry` outcome left at the head of the queue: its id and its
@@ -42,14 +47,42 @@ actor Dispatcher {
     /// Set by a `.tooLarge` outcome: the next attempt sends at most this many
     /// events, as a new batch with a new id (§7's 413 row).
     private var splitBudget: Int?
+    /// Bumped by every teardown (`discardAll()`, `shutdown()`). A flush
+    /// captures it before `sink.send` and compares after: a request already on
+    /// the wire cannot be recalled, but its answer must not schedule a retry,
+    /// re-split, or arm a backoff for a batch that was discarded or a client
+    /// that was torn down. Cancellation alone does not cover this — only the
+    /// newest flush in the chain is cancelled, and the one in `send` may be an
+    /// older one.
+    private var teardownEpoch = 0
+    /// Set by `shutdown()`; no trigger starts a flush or schedules a timer
+    /// after it.
+    private var isShutDown = false
+    /// Shared with the store and the owning client; set when that client is
+    /// gone. Unlike `isShutDown` it can be set from a `deinit`, i.e. while a
+    /// flush is suspended here — so the flush loop re-reads it before every
+    /// send and before touching the store after one.
+    private let revocation: QueueRevocation
+
+    /// Shut down, or revoked: either way no new work starts.
+    private var isStopped: Bool { isShutDown || revocation.isRevoked }
+
+    /// Fired by `shutdown()` once its pending work is cancelled — before it
+    /// waits for the in-flight flush. A test seam: it is how a test knows an
+    /// answer it releases now arrives *after* the teardown, without polling.
+    let shutdownStarted = OneShotSignal()
+
+    /// Internal test seam: whether a retry is scheduled right now.
+    var isRetryScheduled: Bool { retryTask != nil }
 
     private var clock: any StatsClock { configuration.clock }
     private static let maxEventsPerBatch = 100
     private static let maxBytesPerBatch = 262_144
 
-    init(store: EventStore, configuration: StatsConfiguration) {
+    init(store: EventStore, configuration: StatsConfiguration, revocation: QueueRevocation = QueueRevocation()) {
         self.store = store
         self.configuration = configuration
+        self.revocation = revocation
     }
 
     // MARK: Triggers
@@ -59,6 +92,7 @@ actor Dispatcher {
     /// The event is on disk before this returns; the flush it may trigger is
     /// not awaited, so `track()` never blocks on the network.
     func enqueue(_ records: [EventStore.Record]) async {
+        guard !revocation.isRevoked else { return }
         let depth = await store.append(records)
 
         if isBackingOff {
@@ -93,10 +127,12 @@ actor Dispatcher {
     /// Discards the queue without sending — opt-out and consent revocation.
     ///
     /// An in-flight flush is cancelled too: a request already on the wire cannot
-    /// be recalled, but `performFlush` checks cancellation between batches, so
-    /// revocation stops the *next* batch from being sent. `retainedBatch` is
-    /// cleared because the events it pinned no longer exist.
+    /// be recalled, but `performFlush` checks `teardownEpoch` between batches
+    /// and after `send`, so revocation stops the *next* batch from being sent
+    /// and the in-flight answer cannot re-arm a retry or a backoff.
+    /// `retainedBatch` is cleared because the events it pinned no longer exist.
     func discardAll() async {
+        teardownEpoch += 1
         cancelPendingWork()
         flushTask?.cancel()
         retainedBatch = nil
@@ -104,6 +140,8 @@ actor Dispatcher {
         firstAttemptAt = nil
         splitBudget = nil
         consecutiveRetries = 0
+        // (The store itself refuses once revoked: the file may be someone
+        // else's by then.)
         await store.removeAll()
     }
 
@@ -131,7 +169,10 @@ actor Dispatcher {
     /// Cancels the interval timer and any scheduled retry. Queued events stay on
     /// disk; the next launch picks them up.
     func shutdown() async {
+        isShutDown = true
+        teardownEpoch += 1
         cancelPendingWork()
+        shutdownStarted.fire()
         // Cancel the in-flight flush too, and wait for it: otherwise its
         // `store.remove` lands after the owner believed the client was torn down.
         flushTask?.cancel()
@@ -154,6 +195,10 @@ actor Dispatcher {
 
     @discardableResult
     private func startFlush(force: Bool = false) -> Task<Void, Never> {
+        // A torn-down dispatcher sends nothing more; the queue stays on disk.
+        guard !isStopped else { return Task {} }
+        // (Revocation can land while the new task waits on `previous`, so
+        // `performFlush` checks it again before every send.)
         // Chain, do not fork: `previous?.value` is what makes "at most one
         // request in flight" (§7) true even under a burst of triggers.
         let previous = flushTask
@@ -175,7 +220,7 @@ actor Dispatcher {
     }
 
     private func scheduleIntervalFlush() {
-        guard timerTask == nil else { return }
+        guard timerTask == nil, !isStopped else { return }
         let interval = configuration.flushInterval
         timerTask = Task { [weak self, clock] in
             try? await clock.sleep(for: interval)
@@ -186,7 +231,7 @@ actor Dispatcher {
 
     private func intervalElapsed() async {
         timerTask = nil
-        guard !isBackingOff, await store.count > 0 else { return }
+        guard !isStopped, !isBackingOff, await store.count > 0 else { return }
         startFlush()
     }
 
@@ -197,6 +242,8 @@ actor Dispatcher {
         // retry: §7's backoff is a wait, and the alternative is re-sending the
         // same failing batch at event rate during an outage.
         if !force, isBackingOff { return }
+        guard !revocation.isRevoked else { return }
+        let epoch = teardownEpoch
         lastFlushAt = clock.monotonicNow()
 
         // §7's retention ceiling: 24 hours of *attempts* on this batch, after
@@ -216,7 +263,7 @@ actor Dispatcher {
             consecutiveRetries = 0
         }
 
-        while !Task.isCancelled {
+        while !Task.isCancelled, epoch == teardownEpoch, !revocation.isRevoked {
             // Uppercase per §1; a backend accepts either case but MUST NOT be
             // relied on to normalize.
             // A retained batch is only still "the same batch" if the head has not
@@ -260,7 +307,28 @@ actor Dispatcher {
                 continue
             }
 
-            switch await configuration.sink.send(batch) {
+            // Re-read here: `nextBatch` was a suspension, and the owning
+            // client may have been deallocated during it.
+            guard !revocation.isRevoked else { return }
+            let outcome = await configuration.sink.send(batch)
+            // Revoked during the send: the file may already be the next
+            // owner's, so not even an acceptance is recorded — it re-sends
+            // the batch (a duplicate §6 dedupes) rather than racing it.
+            guard !revocation.isRevoked else { return }
+            guard epoch == teardownEpoch, !Task.isCancelled else {
+                // Torn down while the request was on the wire. A backend's
+                // answer about *these* events is still a fact — an accepted or
+                // permanently dropped batch is removed (by id, so a discard in
+                // between costs nothing) rather than re-sent next launch — but
+                // nothing else is touched: no retry, no re-split, no backoff.
+                switch outcome {
+                case .accepted, .drop: await store.remove(through: pending.lastID)
+                case .tooLarge, .retry: break
+                }
+                return
+            }
+
+            switch outcome {
             case .accepted:
                 await store.remove(through: pending.lastID)
                 consecutiveRetries = 0
@@ -324,6 +392,7 @@ actor Dispatcher {
     /// half — it is what stops a fleet of clients that all went offline at once
     /// from returning in lockstep.
     private func scheduleRetry(after serverHint: Duration?) {
+        guard !isStopped else { return }
         let delay: Duration
         if let serverHint {
             // A 429's `Retry-After` is authoritative; jittering it would ignore a
@@ -356,14 +425,18 @@ actor Dispatcher {
 
         retryNotBefore = clock.monotonicNow() + delay
         retryTask?.cancel()
+        retryGeneration += 1
+        let generation = retryGeneration
         retryTask = Task { [weak self, clock] in
             try? await clock.sleep(for: delay)
             guard !Task.isCancelled else { return }
-            await self?.retryElapsed()
+            await self?.retryElapsed(generation: generation)
         }
     }
 
-    private func retryElapsed() async {
+    private func retryElapsed(generation: Int) async {
+        // Superseded while waking up: the newer retry owns the schedule.
+        guard generation == retryGeneration else { return }
         retryTask = nil
         retryNotBefore = nil
         // `force`: this *is* the scheduled retry, so it must not be gated by the

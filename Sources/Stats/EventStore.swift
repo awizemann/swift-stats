@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import os
 
 private nonisolated let logger = Logger(subsystem: StatsLog.subsystem, category: "EventStore")
@@ -120,7 +121,11 @@ actor EventStore {
     /// rule the file uses, so the amortized cost per dropped record stays O(1).
     private var entries: ArraySlice<Entry> = []
     private var nextID = 0
+    /// `true` once the file has been read (or found absent). Stays `false`
+    /// after a failed read — see `loadIfNeeded()` — and every path that would
+    /// write the file checks it first.
     private var didLoad = false
+    private var didLogLoadFailure = false
     /// Set when a disk write failed, or when the file was found in a shape this
     /// store's bookkeeping cannot describe, so the next mutation rewrites the
     /// whole file from memory instead of leaving the two permanently divergent.
@@ -172,16 +177,45 @@ actor EventStore {
     static let defaultMaxLoadBytes = 64 << 20
     private let maxLoadBytes: Int
 
+    /// Set once the client that owned this store has gone (deallocated, shut
+    /// down, or found dead by the next owner). From then on the store touches
+    /// the file no more — another store may already own it — and checks this
+    /// right before every write, delete and rename.
+    ///
+    /// *Before* each one, not during: a write already in progress when the
+    /// flag is set completes. That can only leave records on disk that the
+    /// next owner then sends again — duplicates, which §6 dedupes — never
+    /// remove a record it has not sent.
+    private let revocation: QueueRevocation
+    /// Elapsed time, for the unreadable-file bound below.
+    private let clock: any StatsClock
+
+    /// A queue file that has failed to load this many times, over at least
+    /// `quarantineAfter`, is moved aside — unless the failure looks like data
+    /// protection (see `mayBeDataProtection`), which only ever waits.
+    private let quarantineAttempts: Int
+    private let quarantineAfter: Duration
+    private var loadFailures = 0
+    private var firstLoadFailureAt: Duration?
+
     init(
         fileURL: @escaping @Sendable () -> URL,
         maxQueued: Int,
         ownsDirectory: Bool = true,
-        maxLoadBytes: Int = EventStore.defaultMaxLoadBytes
+        maxLoadBytes: Int = EventStore.defaultMaxLoadBytes,
+        clock: any StatsClock = SystemStatsClock(),
+        revocation: QueueRevocation = QueueRevocation(),
+        quarantineAttempts: Int = 10,
+        quarantineAfter: Duration = .seconds(60)
     ) {
         self.resolveFileURL = fileURL
         self.maxQueued = maxQueued
         self.ownsDirectory = ownsDirectory
         self.maxLoadBytes = maxLoadBytes
+        self.clock = clock
+        self.revocation = revocation
+        self.quarantineAttempts = quarantineAttempts
+        self.quarantineAfter = quarantineAfter
     }
 
     /// The queue file, resolved once, lazily, on the actor.
@@ -199,10 +233,16 @@ actor EventStore {
 
     /// The default location. `Application Support` rather than `Caches`: the
     /// system may evict a cache at any moment, and a dropped queue is data loss.
-    static func defaultFileURL(appId: String) throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
-        )
+    ///
+    /// Resolved **without creating anything**: `urls(for:in:)`, not
+    /// `url(for:…, create: true)`. On iOS `Application Support` does not exist
+    /// in a fresh container, and resolving the path to check for (or delete) a
+    /// queue — which a client that collects nothing still does — must not be
+    /// what creates it. `ensureDirectory()` creates the path when the first
+    /// write needs it.
+    static func defaultFileURL(appId: String) -> URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        else { return nil }
         return base
             .appendingPathComponent(appId, isDirectory: true)
             .appendingPathComponent("swift-stats", isDirectory: true)
@@ -218,6 +258,15 @@ actor EventStore {
     /// file alone. Not part of any public API.
     var diagnostics: (consumedBytes: Int, isMemoryOnly: Bool, needsRewrite: Bool, dropped: Int, appends: Int) {
         (consumedBytes, isMemoryOnly, needsRewrite, totalDropped, totalAppends)
+    }
+
+    /// Internal test seam: the next `rewrite()` stops right after its atomic
+    /// replace, as a kill at that instant would — so a test can open the
+    /// directory and see exactly what a relaunch would load.
+    private var crashAfterNextReplace = false
+
+    func crashAfterNextReplaceForTesting() {
+        crashAfterNextReplace = true
     }
 
     /// Appends and returns the resulting queue depth.
@@ -236,6 +285,22 @@ actor EventStore {
         loadIfNeeded()
         guard !newRecords.isEmpty else { return entries.count }
         totalAppends += 1
+
+        guard didLoad else {
+            // The file could not be read, so it must not be written either:
+            // hold the records in memory (cap included) until a load succeeds
+            // and merges them in behind the backlog.
+            for record in newRecords {
+                entries.append(Entry(id: nextID, record: record, byteLength: 0))
+                nextID += 1
+            }
+            if entries.count > maxQueued {
+                let dropped = entries.count - maxQueued
+                consume(dropped)
+                noteDrops(dropped)
+            }
+            return entries.count
+        }
 
         // Encoded first, because an `Entry` carries the length of the line it
         // occupies and that is only known here. Skipped while memory-only: there
@@ -297,6 +362,10 @@ actor EventStore {
     /// events with 32 long props each do not fit.
     func nextBatch(maxEvents: Int, maxBytes: Int, batchId: String, sentAt: Date) -> Pending? {
         loadIfNeeded()
+        // Nothing is sent ahead of a backlog that could not be read: it is
+        // older, and the merge that follows a successful load renumbers what
+        // is held in memory — so no id may be out in a batch until then.
+        guard didLoad else { return nil }
 
         // A head record that cannot be encoded can never ship, so it is dropped
         // and the next one considered. A loop rather than recursion: with a
@@ -385,6 +454,8 @@ actor EventStore {
     /// that erase the accumulated prefix.
     func remove(through id: Int) {
         loadIfNeeded()
+        // Unloaded, no batch was handed out, so there is nothing to remove.
+        guard didLoad else { return }
         var removed = 0
         for entry in entries {
             guard entry.id <= id else { break }
@@ -405,6 +476,7 @@ actor EventStore {
     /// it doubles as a disk probe while memory-only.
     func compact() {
         loadIfNeeded()
+        guard didLoad else { return }
         if isMemoryOnly {
             probeDisk()
         } else if consumedBytes > 0 || needsRewrite {
@@ -484,6 +556,9 @@ actor EventStore {
     /// revocation both require this (§11), and they require *discarding*, not
     /// flushing.
     func removeAll() {
+        // A revoked store must not delete a file that may belong to the next
+        // owner by now.
+        guard !revocation.isRevoked else { return }
         entries = []
         didLoad = true
         consumedBytes = 0
@@ -495,6 +570,9 @@ actor EventStore {
         // file is ignored on load anyway. The queue file is deleted *first*, so
         // an interruption between the two cannot leave an offset next to a file
         // it does not describe.
+        // A queue set aside as unreadable holds events too, so a discard —
+        // which is what an opt-out or a revocation is — deletes it as well.
+        discardQuarantined()
         for url in [fileURL, headURL] {
             do {
                 if FileManager.default.fileExists(atPath: url.path) {
@@ -520,27 +598,43 @@ actor EventStore {
 
     // MARK: - Disk
 
+    /// Loads the queue file once. A load that **fails** — the file exists but
+    /// cannot be read, as on iOS before first unlock under complete file
+    /// protection — leaves the store unloaded and is retried by the next
+    /// operation. Until one succeeds the store holds new records in memory
+    /// only, hands out no batch, and never writes, replaces or compacts the
+    /// file: everything in it is still unknown, and treating "unreadable" as
+    /// "empty" is how a backlog gets overwritten.
     private func loadIfNeeded() {
         guard !didLoad else { return }
-        didLoad = true
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            didLoad = true
             // No queue file means no consumed prefix; a marker left behind by a
             // deleted queue would only be misleading.
             discardHead()
+            discardQuarantined()
+            // Records held while a load was failing exist only in memory.
+            if !entries.isEmpty { needsRewrite = true }
             return
         }
         let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size])
             .flatMap { $0 as? NSNumber }?.intValue
         if let size, size > maxLoadBytes {
+            didLoad = true
             logger.error(
                 "queue file is \(size, privacy: .public) bytes, past the \(self.maxLoadBytes, privacy: .public)-byte ceiling; discarding it and starting empty"
             )
-            try? FileManager.default.removeItem(at: fileURL)
+            if !revocation.isRevoked { try? FileManager.default.removeItem(at: fileURL) }
             discardHead()
+            if !entries.isEmpty { needsRewrite = true }
             return
         }
         do {
             let data = try Data(contentsOf: fileURL)
+            didLoad = true
+            // The queue is readable again, so a file set aside on an earlier
+            // launch has no further use — and it holds unsent events.
+            discardQuarantined()
             let skip = consumedPrefix(of: data)
             var loaded: [(record: Record, length: Int)] = []
             var malformed = 0
@@ -572,15 +666,28 @@ actor EventStore {
                 // mid-write; anything else means a format change.
                 logger.warning("skipped \(malformed, privacy: .public) unreadable queue line(s)")
             }
+            // Records appended while earlier loads were failing are newer than
+            // everything in the file, so they go after it. They are renumbered
+            // too, so ids stay ascending in queue order — safe, because no
+            // batch was handed out while unloaded, so nothing holds their ids.
+            let held = entries.map(\.record)
             var didTruncate = false
-            if loaded.count > maxQueued {
-                loaded.removeFirst(loaded.count - maxQueued)
+            if loaded.count + held.count > maxQueued {
+                // `held` is already within the cap, so the oldest file
+                // records absorb the whole overflow.
+                loaded.removeFirst(min(loaded.count, loaded.count + held.count - maxQueued))
                 didTruncate = true
             }
-            entries = ArraySlice(loaded.map { item in
+            var merged = loaded.map { item in
                 defer { nextID += 1 }
                 return Entry(id: nextID, record: item.record, byteLength: item.length)
-            })
+            }
+            for record in held {
+                // Length 0: not on disk; the rewrite below writes them.
+                merged.append(Entry(id: nextID, record: record, byteLength: 0))
+                nextID += 1
+            }
+            entries = ArraySlice(merged)
             consumedBytes = skip
             liveBytes = entries.reduce(0) { $0 + $1.byteLength }
             logger.debug("loaded \(self.entries.count, privacy: .public) queued event(s)")
@@ -593,12 +700,112 @@ actor EventStore {
             // Marker validity after this branch: `rewrite()` replaces the file
             // and deletes the marker. Without it, `consumedBytes` is exactly the
             // offset the (still valid) marker on disk records.
-            if malformed > 0 || didTruncate || unaccounted || shouldCompact {
+            if malformed > 0 || didTruncate || unaccounted || shouldCompact || !held.isEmpty {
                 rewrite()
             }
         } catch {
-            logger.error("could not read the queue file: \(error.localizedDescription, privacy: .public)")
+            // Not loaded: retried by the next operation. Logged once per
+            // process, since that is once per event until it succeeds.
+            if !didLogLoadFailure {
+                didLogLoadFailure = true
+                logger.error("""
+                    could not read the queue file: \(error.localizedDescription, privacy: .public) — \
+                    holding new events in memory and retrying; the file is left untouched
+                    """)
+            }
+            loadFailures += 1
+            let now = clock.monotonicNow()
+            if firstLoadFailureAt == nil { firstLoadFailureAt = now }
+            // Waiting forever on a file that will never be readable would keep
+            // every event in memory only, for good. Data protection is the one
+            // failure that is *expected* to clear (at first unlock), so it is
+            // never cut short; anything else that persists for both bounds is
+            // treated as permanent.
+            if !Self.mayBeDataProtection(error),
+               loadFailures >= quarantineAttempts,
+               let first = firstLoadFailureAt, now - first >= quarantineAfter {
+                quarantineUnreadableFile()
+            }
         }
+    }
+
+    /// The queue file sits next to it as `queue.unreadable` — at most one,
+    /// the newest — so nothing is destroyed, and the store starts a fresh file
+    /// with whatever it was holding in memory.
+    private func quarantineUnreadableFile() {
+        guard !revocation.isRevoked else { return }
+        let aside = quarantineURL
+        do {
+            if FileManager.default.fileExists(atPath: aside.path) {
+                try FileManager.default.removeItem(at: aside)
+            }
+            try FileManager.default.moveItem(at: fileURL, to: aside)
+        } catch {
+            logger.error("could not move the unreadable queue file aside: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        logger.error("""
+            the queue file stayed unreadable after \(self.loadFailures, privacy: .public) attempts; \
+            moved it aside as queue.unreadable and started a fresh queue
+            """)
+        didLoad = true
+        consumedBytes = 0
+        liveBytes = 0
+        // Its offset described the file that was just moved away.
+        discardHead()
+        if !entries.isEmpty { rewrite() }
+    }
+
+    /// `queue.unreadable`, beside the queue file.
+    private var quarantineURL: URL {
+        fileURL.deletingPathExtension().appendingPathExtension("unreadable")
+    }
+
+    /// Deletes a set-aside queue, if there is one. Best-effort: it is only
+    /// ever a single file, and failing to delete it is logged, not retried.
+    private func discardQuarantined() {
+        guard !revocation.isRevoked else { return }
+        let url = quarantineURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            logger.error("could not delete queue.unreadable: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Whether a read failure could be iOS data protection — a protected file
+    /// before first unlock — which clears by itself and so must only ever be
+    /// waited out.
+    ///
+    /// The package is Foundation-only, so `UIApplication.isProtectedDataAvailable`
+    /// is out of reach; the error is the signal. A protected file fails to open
+    /// with `EPERM` ("operation not permitted"), where an ordinary permission
+    /// problem is `EACCES`. On the embedded platforms `EPERM` — or a "no
+    /// permission" error that carries no POSIX code to tell — is treated as
+    /// possibly protection. macOS has no such state for this file, so any
+    /// persistent failure there counts.
+    static func mayBeDataProtection(_ error: any Error, isEmbedded: Bool = EventStore.isEmbeddedPlatform) -> Bool {
+        guard isEmbedded else { return false }
+        let error = error as NSError
+        let posix: Int? = if error.domain == NSPOSIXErrorDomain {
+            error.code
+        } else if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError,
+                  underlying.domain == NSPOSIXErrorDomain {
+            underlying.code
+        } else {
+            nil
+        }
+        if let posix { return posix == Int(EPERM) }
+        return error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoPermissionError
+    }
+
+    static var isEmbeddedPlatform: Bool {
+        #if os(macOS)
+        false
+        #else
+        true
+        #endif
     }
 
     /// The marker's consumed-byte offset, or 0 when it is absent, unparseable,
@@ -679,30 +886,39 @@ actor EventStore {
         let expectedEnd = UInt64(consumedBytes + liveBytes - lines.count)
         var toWrite = lines
         let wrote = performWrite("append to the queue file") {
-            if let handle = FileHandle(forWritingAtPath: self.fileURL.path) {
-                defer { try? handle.close() }
-                let end = try handle.seekToEnd()
-                if end != expectedEnd {
-                    // The file is not the size this store's bookkeeping says it
-                    // is: a write was torn by a kill, or something else touched
-                    // the file. `seekToEnd` already told us for free, so no
-                    // `stat` is needed. A leading newline keeps a torn partial
-                    // line from merging with the first record written here —
-                    // the fragment becomes its own malformed line, which the
-                    // loader skips, instead of swallowing a good record.
-                    if end > 0 { toWrite = Data([UInt8(ascii: "\n")]) + toWrite }
-                    // The extra bytes belong to no entry, so the byte
-                    // bookkeeping is off until a rewrite normalizes the file.
-                    self.needsRewrite = true
-                }
-                try handle.write(contentsOf: toWrite)
-            } else {
-                // No file to append to: what lands on disk is exactly these
-                // records, so any consumed prefix described a file that is gone.
+            let handle: FileHandle
+            do {
+                // The throwing initializer, not `FileHandle(forWritingAtPath:)`:
+                // that one returns `nil` for *every* failure, and treating
+                // "permission denied" or "protected until first unlock" as "no
+                // file" replaced the whole backlog with this one group.
+                handle = try FileHandle(forWritingTo: self.fileURL)
+            } catch where Self.isMissingFile(error) {
+                // Really no file to append to: what lands on disk is exactly
+                // these records, so any consumed prefix described a file that
+                // is gone. `.withoutOverwriting`, so a file that appears in
+                // between is never replaced.
                 recreated = true
-                try lines.write(to: self.fileURL, options: .atomic)
+                try lines.write(to: self.fileURL, options: .withoutOverwriting)
                 self.restrictPermissions(of: self.fileURL)
+                return
             }
+            defer { try? handle.close() }
+            let end = try handle.seekToEnd()
+            if end != expectedEnd {
+                // The file is not the size this store's bookkeeping says it
+                // is: a write was torn by a kill, or something else touched
+                // the file. `seekToEnd` already told us for free, so no
+                // `stat` is needed. A leading newline keeps a torn partial
+                // line from merging with the first record written here —
+                // the fragment becomes its own malformed line, which the
+                // loader skips, instead of swallowing a good record.
+                if end > 0 { toWrite = Data([UInt8(ascii: "\n")]) + toWrite }
+                // The extra bytes belong to no entry, so the byte
+                // bookkeeping is off until a rewrite normalizes the file.
+                self.needsRewrite = true
+            }
+            try handle.write(contentsOf: toWrite)
         }
         if wrote, recreated {
             // The stale marker is deleted, not just ignored: an offset from the
@@ -725,9 +941,21 @@ actor EventStore {
     /// a failed write — never once per appended event.
     ///
     /// Marker validity: the file is replaced, so every previous offset is
-    /// meaningless. `consumedBytes` goes to zero and the marker is deleted, in
-    /// that order and only after the new file is on disk.
+    /// meaningless — and the marker is invalidated **before** the replace. The
+    /// other order had a crash window: killed between "new file in place" and
+    /// "marker deleted", the old offset sat beside the new file, and when the
+    /// new file was at least the old size with a line boundary at that offset
+    /// it validated and the next launch skipped records never sent. Now a kill
+    /// anywhere in here leaves no marker, so the worst case is a replay of
+    /// already-consumed records, which §6 dedupes.
+    ///
+    /// Never runs before the file has been loaded: replacing a file this store
+    /// could not read would throw its backlog away.
     private func rewrite() {
+        guard didLoad else {
+            needsRewrite = true
+            return
+        }
         var data = Data()
         var rebuilt: [Entry] = []
         rebuilt.reserveCapacity(entries.count)
@@ -745,6 +973,7 @@ actor EventStore {
             logger.error("could not encode the queue: \(error.localizedDescription, privacy: .public)")
             return
         }
+        discardHead()
         let wrote = performWrite("rewrite the queue file") {
             try data.write(to: self.fileURL, options: .atomic)
             self.restrictPermissions(of: self.fileURL)
@@ -753,11 +982,16 @@ actor EventStore {
             needsRewrite = true
             return
         }
+        if crashAfterNextReplace {
+            // Test seam: "the process was killed here", with the new file in
+            // place and nothing after it run.
+            crashAfterNextReplace = false
+            return
+        }
         needsRewrite = false
         entries = ArraySlice(rebuilt)
         liveBytes = data.count
         consumedBytes = 0
-        discardHead()
     }
 
     /// Persists the consumed-byte offset, tagged with the queue file's size as
@@ -786,6 +1020,7 @@ actor EventStore {
     /// deleted file cannot be mistaken for a description of a file that was
     /// replaced under it.
     private func discardHead() {
+        guard !revocation.isRevoked else { return }
         try? FileManager.default.removeItem(at: headURL)
         guard FileManager.default.fileExists(atPath: headURL.path) else { return }
         // Could not delete it. Overwrite it with an explicit "nothing consumed"
@@ -793,7 +1028,23 @@ actor EventStore {
         // If even that fails, the marker is almost certainly unreadable as well
         // (a directory, a hostile mode), which the loader already treats as
         // absent — so this is logged and not escalated to a rewrite loop.
-        _ = writeMarker(Data("0 \(liveBytes)\n".utf8))
+        // `0 0`, not `0 <size>`: it is also written ahead of a replace, when
+        // no size is yet known to be true of the file that will be there.
+        _ = writeMarker(Data("0 0\n".utf8))
+    }
+
+    /// `ENOENT`, however Foundation wraps it: the one failure to open the
+    /// queue file for writing that means "there is no file", and so the only
+    /// one that may recreate it.
+    private static func isMissingFile(_ error: any Error) -> Bool {
+        let error = error as NSError
+        if error.domain == NSPOSIXErrorDomain { return error.code == Int(ENOENT) }
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError,
+           underlying.domain == NSPOSIXErrorDomain {
+            return underlying.code == Int(ENOENT)
+        }
+        return error.domain == NSCocoaErrorDomain
+            && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError)
     }
 
     /// Writes the marker file. Deliberately **not** routed through
@@ -801,6 +1052,7 @@ actor EventStore {
     /// that were already sent, while degrading the whole store to memory-only
     /// over it would cost every unsent event on the next launch.
     private func writeMarker(_ marker: Data) -> Bool {
+        guard !revocation.isRevoked else { return false }
         do {
             try ensureDirectory()
             try marker.write(to: headURL, options: .atomic)
@@ -825,6 +1077,9 @@ actor EventStore {
     /// I/O rather than a failed write and an error per tracked event.
     @discardableResult
     private func performWrite(_ what: String, _ body: () throws -> Void) -> Bool {
+        // Not a failure: the store is no longer this file's owner, so it
+        // neither writes nor counts towards degrading to memory.
+        guard !revocation.isRevoked else { return false }
         do {
             try ensureDirectory()
             try body()
@@ -864,12 +1119,20 @@ actor EventStore {
     private func ensureDirectory() throws {
         let directory = fileURL.deletingLastPathComponent()
         if !FileManager.default.fileExists(atPath: directory.path) {
-            // 0700 on the directory the SDK owns. `withIntermediateDirectories`
-            // applies these attributes only to directories it actually creates,
-            // so an existing `Application Support` is left alone.
+            // Everything above the queue's own directory — `Application
+            // Support` itself on a fresh iOS container — is created with
+            // default attributes: it is the app's directory, not the SDK's.
+            // `withIntermediateDirectories` would otherwise give each one the
+            // 0700 meant for the directory below.
+            try FileManager.default.createDirectory(
+                at: directory.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: nil
+            )
+            // 0700 on the directory the SDK owns.
             try FileManager.default.createDirectory(
                 at: directory,
-                withIntermediateDirectories: true,
+                withIntermediateDirectories: false,
                 attributes: ownsDirectory ? [.posixPermissions: 0o700] : nil
             )
             if ownsDirectory { excludeFromBackupIfNeeded(directory) }
@@ -948,5 +1211,91 @@ actor EventStore {
     ) -> Int? {
         let batch = StatsBatch(batchId: batchId, sentAt: sentAt, context: context, events: events)
         return try? batch.serialized().count
+    }
+}
+
+/// "The client that owned this queue is gone": shared by one client's
+/// `EventStore` and `Dispatcher`, set by that client's `deinit` and
+/// `shutdown()` — or by the next owner, under the registry lock, when it finds
+/// the previous owner already deallocated.
+///
+/// A flag behind a `Mutex` rather than actor state because `deinit` is
+/// synchronous and cannot hop to an actor. It exists because a client's
+/// `deinit` can run while its dispatcher is still mid-flush (the flush `Task`
+/// holds the dispatcher, not the client): without it the old dispatcher kept
+/// sending, and writing, a file the next owner had already started on.
+final class QueueRevocation: Sendable {
+    private let revoked = Mutex(false)
+
+    init() {}
+
+    func revoke() {
+        revoked.withLock { $0 = true }
+    }
+
+    var isRevoked: Bool {
+        revoked.withLock { $0 }
+    }
+}
+
+/// Fires once; `wait()` returns immediately after that, and suspends until it
+/// before. What a forwarding client awaits while the owner it forwarded to is
+/// shutting down — and what a test awaits instead of polling.
+final class OneShotSignal: Sendable {
+    private struct State {
+        var fired = false
+        var waiters: [CheckedContinuation<Void, Never>] = []
+        /// Test seam: callers of `waitForWaiters`, resumed when enough
+        /// `wait()` callers have arrived.
+        var arrivalWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    }
+
+    private let state = Mutex(State())
+
+    init() {}
+
+    func fire() {
+        let (waiters, arrivals) = state.withLock { state in
+            state.fired = true
+            defer {
+                state.waiters.removeAll()
+                state.arrivalWaiters.removeAll()
+            }
+            return (state.waiters, state.arrivalWaiters.map(\.continuation))
+        }
+        for waiter in waiters { waiter.resume() }
+        for arrival in arrivals { arrival.resume() }
+    }
+
+    /// Test seam: suspends until `count` callers are waiting in `wait()` (or
+    /// the signal has fired) — how a test knows a call really is parked here.
+    func waitForWaiters(_ count: Int) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let ready = state.withLock { state in
+                guard !state.fired, state.waiters.count < count else { return true }
+                state.arrivalWaiters.append((count, continuation))
+                return false
+            }
+            if ready { continuation.resume() }
+        }
+    }
+
+    var hasFired: Bool {
+        state.withLock { $0.fired }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let (fired, arrivals) = state.withLock { state -> (Bool, [CheckedContinuation<Void, Never>]) in
+                guard !state.fired else { return (true, []) }
+                state.waiters.append(continuation)
+                let count = state.waiters.count
+                let ready = state.arrivalWaiters.filter { $0.count <= count }.map(\.continuation)
+                state.arrivalWaiters.removeAll { $0.count <= count }
+                return (false, ready)
+            }
+            for arrival in arrivals { arrival.resume() }
+            if fired { continuation.resume() }
+        }
     }
 }

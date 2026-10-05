@@ -209,6 +209,30 @@ await client.flush()
 clock.advance(by: .seconds(30))     // drives the interval flush and the backoff
 ```
 
+`await clock.waitForSleepers(count:)` and `await sink.waitForBatches(_:)` wait
+for progress itself (a sleeper registering, a batch arriving), so a test never
+spends a yield budget hoping the scheduler got there first.
+
+To pin what a relaunch does to the install id under *your* consent
+configuration, `RelaunchProbe` runs two launches of a client built from it —
+each tracks one event and shuts down, the second rebuilt from the same
+configuration — under a unique app id and temporary storage that it cleans up:
+
+```swift
+@Test func installIsStableUnderTheDefaultConsent() async throws {
+    let configuration = StatsConfiguration(appId: "com.example.App", installIdSalt: "salt", sink: InMemorySink())
+    let probe = try #require(await RelaunchProbe.installIDsAcrossRelaunch(configuration: configuration))
+    #expect(probe.installIdBeforeRelaunch == probe.installIdAfterRelaunch)
+}
+
+@Test func installIsPerSessionWithoutIdentity() async throws {
+    var configuration = StatsConfiguration(appId: "com.example.App", installIdSalt: "salt", sink: InMemorySink())
+    configuration.consent = [.usage, .diagnostics]
+    let probe = try #require(await RelaunchProbe.installIDsAcrossRelaunch(configuration: configuration))
+    #expect(probe.installIdBeforeRelaunch != probe.installIdAfterRelaunch)
+}
+```
+
 ## Cloudflare backend
 
 [`backends/cloudflare/`](backends/cloudflare/README.md) is a complete,

@@ -107,6 +107,26 @@ struct SessionTests {
         await harness.tearDown()
     }
 
+    /// §10 measures the gap on the monotonic clock; `duration_s` used the wall
+    /// clock, so a user setting the device clock back an hour mid-session sent
+    /// `duration_s: -3540`.
+    @Test("session_end's duration is monotonic, so a clock set backwards cannot make it negative")
+    func sessionDurationIsMonotonic() async {
+        let harness = Harness(autoEvents: [.sessions], sessionGap: .seconds(300))
+        await harness.client.track("first")
+        harness.clock.advance(by: .seconds(60))
+        harness.clock.shiftWallClock(by: -3_600)
+        await harness.client.track("second")
+        harness.clock.advance(by: .seconds(600))
+        await harness.client.track("third")
+        await harness.client.flush()
+        await harness.client.waitForFlushes()
+
+        let end = await harness.sink.sentEvents.first { $0.name == "session_end" }
+        #expect(end?.props["duration_s"] == .int(60))
+        await harness.tearDown()
+    }
+
     @Test("A session that never resumes gets no session_end")
     func noSessionEndWithoutResume() async {
         let harness = Harness(autoEvents: .sessions)

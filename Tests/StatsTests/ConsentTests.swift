@@ -453,9 +453,15 @@ struct ConsentTests {
     /// recorded `[.usage, .diagnostics]` via `setConsent`) makes to get a
     /// stable install: adding `.identity` to whatever is current. That is a
     /// pure grant, so it must not be mistaken for a revocation — the queue
-    /// survives, `seq` keeps counting, and the next session runs under one
-    /// persisted install UUID.
-    @Test("Adding .identity to the current consent keeps the queue and seq, and stabilizes the install")
+    /// survives, and the next session runs under one persisted install UUID.
+    ///
+    /// `seq` is per install id (§2.2), and the pre-grant id was a per-session
+    /// ephemeral one with its own `seq` space (§6, §11). So the two pre-grant
+    /// events are 0 and 1 under the ephemeral id, and the stable install starts
+    /// its own count at 0. This used to assert `[0, 1, 2, 3]` — one counter
+    /// running across both ids, which is exactly the chain a backend could
+    /// follow from an ephemeral session into the stable install.
+    @Test("Adding .identity to the current consent keeps the queue, and stabilizes the install")
     func grantingIdentityIsMigrationSafe() async {
         let harness = Harness(consent: [.usage, .diagnostics], sessionGap: .seconds(300))
         await harness.client.track("a")
@@ -479,12 +485,112 @@ struct ConsentTests {
 
         let events = await harness.sink.sentEvents
         #expect(events.map(\.name) == ["a", "b", "c", "d"])
-        #expect(events.map(\.seq) == [0, 1, 2, 3], "a grant must not reset seq")
+        #expect(events.map(\.seq) == [0, 1, 0, 1], "each install id has its own seq space")
         #expect(events[2].installId == events[3].installId, "the install is now stable across sessions")
         #expect(events[0].installId != events[2].installId, "the pre-grant id was ephemeral")
         let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
         #expect(suite?.string(forKey: "installUUID") != nil)
         await harness.tearDown()
+    }
+
+    /// §11 / §6: under denied `identity` each session's ephemeral install id
+    /// has its own `seq` space. A counter that ran on across sessions — and was
+    /// persisted across launches — let a backend chain the "unlinkable"
+    /// sessions back together: session two's first `seq` is session one's last
+    /// plus one.
+    @Test("Denied identity: seq restarts at 0 for every ephemeral id and is never persisted")
+    func ephemeralSeqSpace() async {
+        let harness = Harness(
+            consent: [.usage, .diagnostics], autoEvents: [.sessions], sessionGap: .seconds(300)
+        )
+        await harness.client.track("a")
+        await harness.client.track("b")
+        harness.clock.advance(by: .seconds(400))
+        await harness.client.track("c")
+        await harness.client.flush()
+        await harness.client.waitForFlushes()
+
+        let events = await harness.sink.sentEvents
+        #expect(events.map(\.name) == ["session_start", "a", "b", "session_end", "session_start", "c"])
+        // `session_end` closes the first session under the first id, so it is
+        // that id's next number; the second id starts over.
+        #expect(events.map(\.seq) == [0, 1, 2, 3, 0, 1])
+        #expect(events[3].installId == events[0].installId)
+        #expect(events[4].installId != events[0].installId)
+        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        #expect((suite?.integer(forKey: "seq") ?? 0) == 0, "an ephemeral seq is never written to disk")
+        await harness.client.shutdown()
+        harness.clock.cancelAllSleepers()
+
+        // A relaunch is a new session, so a new ephemeral id starting at 0.
+        let relaunched = harness.relaunched(consent: [.usage, .diagnostics], uuids: Harness.relaunchUUIDs)
+        await relaunched.client.track("d")
+        await relaunched.client.flush()
+        await relaunched.client.waitForFlushes()
+        #expect(await relaunched.sink.sentEvents.map(\.seq) == [0])
+        await relaunched.tearDown()
+    }
+
+    /// §11: a state that collects nothing must send nothing either. A queue
+    /// left by an earlier launch (here: written under `.usage`, then a recorded
+    /// `.none` whose revocation discard is bypassed by writing the stored choice
+    /// directly, as a configured downgrade or a failed delete would leave it)
+    /// used to go out on the next `flush()`, because `flush()` never looked at
+    /// consent.
+    @Test("flush() and reset() never send while collection is off; the leftover queue is discarded")
+    func flushAndResetRespectCollectingState() async {
+        let harness = Harness(flushAt: 10_000)
+        await harness.client.track("a")
+        await harness.client.shutdown()
+        harness.clock.cancelAllSleepers()
+
+        // Consent `.none` recorded without going through `setConsent`.
+        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        suite?.set(StatsConsent.none.rawValue, forKey: "consent")
+        suite?.set(true, forKey: "consentRecorded")
+
+        let relaunched = harness.relaunched()
+        await relaunched.client.flush()
+        await relaunched.client.waitForFlushes()
+        await relaunched.client.reset()
+        await relaunched.client.waitForFlushes()
+        #expect(await relaunched.sink.batchCount == 0, "nothing is sent while collection is off")
+        #expect(await relaunched.client.queuedEventCount == 0, "and the leftover queue is discarded")
+        await relaunched.client.shutdown()
+        relaunched.clock.cancelAllSleepers()
+
+        // Opted out instead of consent-less: the same.
+        let other = Harness(flushAt: 10_000)
+        await other.client.track("a")
+        await other.client.shutdown()
+        other.clock.cancelAllSleepers()
+        UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: other.appId))?.set(false, forKey: "enabled")
+        let reopened = other.relaunched()
+        await reopened.client.flush()
+        await reopened.client.waitForFlushes()
+        #expect(await reopened.sink.batchCount == 0)
+        #expect(await reopened.client.queuedEventCount == 0)
+        await reopened.tearDown()
+        await relaunched.tearDown()
+    }
+
+    /// Backgrounding is the flush most apps rely on, so it gets the same rule
+    /// as `flush()`: under a stored opt-out the leftover queue is discarded,
+    /// never sent.
+    @Test("applicationDidEnterBackground() under a stored opt-out sends nothing and discards the leftover queue")
+    func backgroundRespectsOptOut() async {
+        let harness = Harness(flushAt: 10_000)
+        await harness.client.track("a")
+        await harness.client.shutdown()
+        harness.clock.cancelAllSleepers()
+        UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))?.set(false, forKey: "enabled")
+
+        let relaunched = harness.relaunched()
+        await relaunched.client.applicationDidEnterBackground()
+        await relaunched.client.waitForFlushes()
+        #expect(await relaunched.sink.batchCount == 0)
+        #expect(await relaunched.client.queuedEventCount == 0)
+        await relaunched.tearDown()
     }
 
     @Test("Disabled: nothing is captured and the queue is cleared")

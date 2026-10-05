@@ -153,6 +153,40 @@ struct StorageTests {
         clock.cancelAllSleepers()
     }
 
+    /// The default location, with collection off: `flush()`, `reset()` and
+    /// backgrounding all look for a leftover queue to discard, and looking
+    /// must not create the SDK's directory — nor, on a fresh iOS container,
+    /// `Application Support` itself (which this macOS test cannot observe:
+    /// it always exists here; `defaultFileURL` no longer uses the creating
+    /// `url(for:…create: true)` call either way).
+    @Test("With collection off, the default location's directory is never created")
+    func collectionOffCreatesNoDefaultDirectory() async throws {
+        let appId = "com.example.nodir\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+        let queue = try #require(EventStore.defaultFileURL(appId: appId))
+        let appDirectory = queue.deletingLastPathComponent().deletingLastPathComponent()
+        defer {
+            try? FileManager.default.removeItem(at: appDirectory)
+            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+        }
+
+        let clock = ManualClock()
+        var configuration = Self.configuration(
+            appId: appId, directory: appDirectory, consent: .none, sink: InMemorySink(), clock: clock
+        )
+        configuration.storageDirectory = nil
+        let client = StatsClient(configuration: configuration)
+        await client.flush()
+        await client.reset()
+        await client.applicationDidEnterBackground()
+        await client.setEnabled(false)
+        await client.flush()
+        #expect(await client.queuedEventCount == 0)
+        #expect(!FileManager.default.fileExists(atPath: appDirectory.path))
+
+        await client.shutdown()
+        clock.cancelAllSleepers()
+    }
+
     /// Discriminating on the *re-application*, not just on creation: the file is
     /// first created by an append and then rewritten atomically when a batch is
     /// removed. A `chmod` done once at creation passes the first check and fails

@@ -16,6 +16,12 @@ private nonisolated let logger = Logger(subsystem: StatsLog.subsystem, category:
 /// not marked `Sendable`. Access is synchronous on purpose: these are small
 /// scalar reads on the client actor, and making them `async` would add
 /// suspension points that widen the window between capture and disk for no gain.
+extension StatsConfiguration {
+    /// The SDK's own `UserDefaults` suite for this configuration's app id.
+    /// `package` so `StatsTesting` can clean up after an isolated probe.
+    package var identitySuiteName: String { StatsIdentityStore.suiteName(appId: appId) }
+}
+
 struct StatsIdentityStore: @unchecked Sendable {
     private let defaults: UserDefaults
     /// `false` when the dedicated suite could not be opened. §9 allows the

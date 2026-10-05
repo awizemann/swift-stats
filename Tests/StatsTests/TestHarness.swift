@@ -134,34 +134,9 @@ final class Harness: Sendable {
         UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
     }
 
-    /// Advances the clock in steps until the sink has received `count` batches.
-    ///
-    /// Stepping repeatedly (rather than advancing once) removes the only race a
-    /// manual clock has: a sleeper that has not registered yet cannot be advanced
-    /// past, and a later step catches it. Still no real waiting — the clock only
-    /// moves because this moves it.
-    @discardableResult
-    func drive(untilBatches count: Int, step: Duration, maxSteps: Int = 200) async -> Bool {
-        for _ in 0..<maxSteps {
-            if await sink.batchCount >= count { return true }
-            clock.advance(by: step)
-            // Several yields per step: under a parallel test run the retry task
-            // may not have been scheduled yet, and a single yield is not enough
-            // to let it register its next sleep.
-            for _ in 0..<8 { await Task.yield() }
-        }
-        return await sink.batchCount >= count
-    }
-
-    /// Yields until `condition` holds. Polls with `Task.yield()` and never
-    /// sleeps, so it cannot be a source of flakiness by timing — only by a real
-    /// failure to make progress, which surfaces as a returned `false`.
-    @discardableResult
-    func yieldUntil(_ condition: @Sendable () async -> Bool, maxYields: Int = 10_000) async -> Bool {
-        for _ in 0..<maxYields {
-            if await condition() { return true }
-            await Task.yield()
-        }
-        return false
-    }
+    // No `drive(untilBatches:)` / `yieldUntil` any more: both spent a fixed
+    // yield budget waiting for progress, which a loaded parallel run could
+    // exhaust before a retry task had even registered its sleep. Await the
+    // progress itself instead — `ManualClock.waitForSleepers(count:)` and
+    // `InMemorySink.waitForBatches(_:)` are signalled by the event.
 }

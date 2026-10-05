@@ -36,15 +36,74 @@ private nonisolated let logger = Logger(subsystem: StatsLog.subsystem, category:
 ///
 /// Skipping them costs the `app_open` / `app_background` auto-events and the
 /// flush-on-background; everything else still works.
+///
+/// ## One owner per app id; every other client forwards to it
+///
+/// Create one client per app id and share it — that is the cheap, obvious
+/// shape. But a second client for the same app id (a settings screen that
+/// builds its own, a per-window client) is safe too: the queue file and the
+/// persisted `seq` belong to the app id, so only one client may own them, and
+/// any other client for that app id **forwards every call to the owner**. `track`, `record`, `identify`, `setConsent`, `setEnabled`,
+/// `reset`, `flush`, the lifecycle calls and the read-only state all behave
+/// exactly as if they had been made on the owner, so an opt-out made through
+/// any handle is the opt-out. The forwarding client's own configuration (its
+/// sink, consent, clock …) is ignored while it forwards, and it says so once,
+/// at `warning`.
+///
+/// The first client to be used becomes the owner. When the owner is shut down
+/// or deallocated, the next call on any other client claims ownership, and that
+/// client re-reads the persisted consent, opt-out and `seq` before it acts —
+/// and from then on sends with **its own** configuration (sink, clock, auto
+/// events …). A call that reaches an owner while it is shutting down is not
+/// dropped: it waits for the shutdown to finish (as long as the in-flight send,
+/// so bounded by the sink's request timeout) and goes to the next owner.
+/// A client that was itself ``shutdown()`` stays shut down and never forwards.
+///
+/// Across handles, events keep **arrival order** at the owner, and each keeps
+/// the timestamp of the call that made it — a `record()` through a forwarding
+/// client is stamped by that client's clock, when it was called.
+///
+/// Two clients for **different** app ids must not share a `storageDirectory`.
+/// That is not forwarded — the second app's events would go out as the first
+/// app — so the later client is refused: every call on it does nothing. The
+/// first ordinary call is logged at `error`, then one in every 100; every
+/// `setConsent`, `setEnabled(false)` and `reset()` is logged at `fault`,
+/// because the choice it carries cannot be applied to another app's queue.
 public actor StatsClient {
     private let configuration: StatsConfiguration
     private let store: EventStore
-    private let dispatcher: Dispatcher
+    /// Internal (not private) only so tests can reach its seams.
+    let dispatcher: Dispatcher
 
     /// Opened on first use by `prepareIfNeeded()`, never in `init`.
     private var identityStore: StatsIdentityStore?
     /// `false` until `prepareIfNeeded()` has run.
     private var didPrepare = false
+
+    /// Identifies this client in `StatsClientRegistry`. `nonisolated` so
+    /// `deinit` and `record()` can use it without a hop.
+    private nonisolated let leaseToken = StatsClientRegistry.makeToken()
+    /// The registry keys this client owns or forwards for: its app id and an
+    /// explicit storage directory.
+    private nonisolated let registryKeys: [String]
+    /// Shared with this client's store and dispatcher, and registered with
+    /// its claim: set when this client is gone (see `QueueRevocation`).
+    private nonisolated let revocation: QueueRevocation
+    /// True while this client owns its app id — claimed by `role()`, given up
+    /// by `shutdown()` or `deinit`.
+    private var holdsLease = false
+    /// Set by `shutdown()`. Terminal: a torn-down client does nothing, because
+    /// the app id it owned may already belong to another client.
+    private var isShutDown = false
+    /// The forwarding warning is said once per client.
+    private var didWarnForwarding = false
+    /// Set at the start of `shutdown()`: from here on a forwarded call is not
+    /// run here but handed back (see `runIfOwner`), even while the shutdown
+    /// is still waiting for drains and an in-flight send.
+    private var isClosing = false
+    /// Fired at the very end of `shutdown()`, after the app id is released —
+    /// what a forwarding client waits for before it resolves again.
+    nonisolated let shutDownSignal = OneShotSignal()
 
     private var consent: StatsConsent
     private var enabled: Bool
@@ -81,7 +140,7 @@ public actor StatsClient {
     /// One `record()` call: everything needed to run the normal capture path
     /// later, including the wall clock reading taken at the *call*, so a queued
     /// entry keeps the timestamp it was recorded at.
-    private struct RecordedEvent: Sendable {
+    struct RecordedEvent: Sendable {
         var name: String
         var props: [String: StatsValue]
         var at: Date
@@ -140,6 +199,17 @@ public actor StatsClient {
     /// requires `seq` to be strictly increasing per install; a gap is allowed,
     /// a repeat is not.
     private var nextSeqValue = 0
+    /// The next `seq` of the current session's **ephemeral** install id, or
+    /// `nil` while the session runs under the stable one (or none is running).
+    ///
+    /// §6 and §11: each per-session ephemeral id has its own `seq` space,
+    /// starting at 0 and held in memory only. One counter running across them —
+    /// let alone a persisted one — would let a backend chain the sessions that
+    /// denied `identity` exists to keep apart: session two would start at
+    /// session one's last `seq` plus one. Rotated together with
+    /// `sessionInstallId`, so `session_end` still takes its number from the id
+    /// it is stamped with.
+    private var ephemeralNextSeq: Int?
     /// How many times this client has warned that its install id is
     /// per-session. At most 1: the warning is said once per client, the first
     /// time a session mints an ephemeral id. Internal so tests can assert on
@@ -164,11 +234,12 @@ public actor StatsClient {
 
     private struct Session {
         var id: String
-        /// Wall clock of the session's first event — `duration_s` is measured
-        /// from it.
-        var firstEventAt: Date
         /// Wall clock of the most recent event — `session_end`'s `ts`.
         var lastEventAt: Date
+        /// Monotonic reading of the session's first event. `duration_s` is
+        /// `lastActivity - firstActivity`: on the wall clock a user setting the
+        /// device time back mid-session made it negative.
+        var firstActivity: Duration
         /// Monotonic reading of the most recent event: the inactivity gap is
         /// measured on the monotonic clock so a device clock change cannot
         /// fabricate or suppress a session (§10).
@@ -205,12 +276,15 @@ public actor StatsClient {
         // *creates directories*. It runs on the `EventStore` actor, on demand.
         let appId = configuration.appId
         let storageDirectory = configuration.storageDirectory
+        let revocation = QueueRevocation()
+        self.revocation = revocation
+        self.registryKeys = StatsClientRegistry.keys(for: configuration)
         self.store = EventStore(
             fileURL: {
                 if let storageDirectory {
                     return storageDirectory.appendingPathComponent("queue.jsonl", isDirectory: false)
                 }
-                if let defaultURL = try? EventStore.defaultFileURL(appId: appId) {
+                if let defaultURL = EventStore.defaultFileURL(appId: appId) {
                     return defaultURL
                 }
                 // No Application Support (a sandbox oddity): fall back to a
@@ -227,9 +301,11 @@ public actor StatsClient {
             // Both fallbacks above are directories this SDK creates for itself;
             // a consumer-supplied `storageDirectory` is not, so its permissions
             // and backup state are left exactly as the app set them.
-            ownsDirectory: storageDirectory == nil
+            ownsDirectory: storageDirectory == nil,
+            clock: configuration.clock,
+            revocation: revocation
         )
-        self.dispatcher = Dispatcher(store: store, configuration: configuration)
+        self.dispatcher = Dispatcher(store: store, configuration: configuration, revocation: revocation)
 
         // Provisional: `prepareIfNeeded()` replaces these with the persisted
         // choice, which wins (§11). Until then they are what the configuration
@@ -238,6 +314,15 @@ public actor StatsClient {
         self.consent = configuration.consent
         self.enabled = configuration.enabled
         self.projectId = configuration.projectId
+    }
+
+    /// A client dropped without `shutdown()` gives its app id up here. It
+    /// revokes its store and dispatcher **first**: a flush of this client's may
+    /// still be running (its `Task` holds the dispatcher, not the client), and
+    /// it must stop before the next owner can start on the same file.
+    deinit {
+        revocation.revoke()
+        StatsClientRegistry.release(token: leaseToken)
     }
 
     /// Opens the `UserDefaults` suite, loads the persisted consent / opt-out /
@@ -256,13 +341,7 @@ public actor StatsClient {
         )
         self.identityStore = identity
 
-        // A persisted choice wins; the configuration's values apply until one
-        // exists. Only `setConsent` / `setEnabled` persist (§11).
-        self.consent = identity.storedConsent ?? configuration.consent
-        self.enabled = identity.storedEnabled ?? configuration.enabled
-        self.userIdHash = self.consent.contains(.identity) ? identity.userIdHash : nil
-        // Read once per process, then kept in memory (see `nextSeqValue`).
-        self.nextSeqValue = identity.seq
+        loadPersistedState(from: identity)
 
         // §0/§2 field formats the emitter can check locally. A bad value would
         // otherwise turn every batch into a permanent 400 (§7) with no local
@@ -280,6 +359,146 @@ public actor StatsClient {
         if !identity.isAvailable {
             logger.error("collection is disabled: the SDK could not open its own UserDefaults suite")
         }
+    }
+
+    /// A persisted choice wins; the configuration's values apply until one
+    /// exists. Only `setConsent` / `setEnabled` persist (§11). `seq` is read
+    /// here and then kept in memory (see `nextSeqValue`).
+    ///
+    /// Run at first use and again whenever this client becomes the owner: a
+    /// client that forwarded for a while holds values from before the previous
+    /// owner changed them.
+    private func loadPersistedState(from identity: StatsIdentityStore) {
+        consent = identity.storedConsent ?? configuration.consent
+        enabled = identity.storedEnabled ?? configuration.enabled
+        userIdHash = consent.contains(.identity) ? identity.userIdHash : nil
+        nextSeqValue = identity.seq
+    }
+
+    /// What a public call on this client does.
+    private enum Role {
+        /// This client owns the app id: act.
+        case owner
+        /// Another client does: hand the call to it.
+        case forward(StatsClient)
+        /// Shut down: do nothing.
+        case inactive
+        /// Another client, for a **different** app id, owns this client's
+        /// `storageDirectory`. Forwarding would send this app's events as that
+        /// app; owning would put two stores on one file. So: nothing, loudly.
+        case refused
+    }
+
+    /// Resolves the role for one call. Claims ownership when no live client
+    /// owns any of this client's keys — on first use, or after the owner went
+    /// away — and then re-reads the persisted state. Never awaits: the
+    /// registry lock is held only inside `resolve`, never across a suspension.
+    private func role() -> Role {
+        prepareIfNeeded()
+        if isShutDown { return .inactive }
+        if holdsLease { return .owner }
+        switch StatsClientRegistry.resolve(registryKeys, token: leaseToken, client: self, revocation: revocation) {
+        case .claimed:
+            holdsLease = true
+            loadPersistedState(from: identity)
+            return .owner
+        case .directoryConflict:
+            return .refused
+        case .owner(let owner):
+            if !didWarnForwarding {
+                didWarnForwarding = true
+                logger.warning("""
+                    another StatsClient already owns this appId (or storageDirectory); this client \
+                    forwards every call to it, and its own configuration is ignored while it does. \
+                    Share one client per appId.
+                    """)
+            }
+            return .forward(owner)
+        }
+    }
+
+    /// Where one public call goes.
+    private enum Route<T> {
+        /// The owner ran it; here is its result.
+        case forwarded(T)
+        /// This client is the owner: run it here.
+        case mine
+        /// Do nothing (shut down, or refused).
+        case skip
+    }
+
+    /// Resolves `role()` and, for a forwarding client, runs `body` on the
+    /// owner. An owner that is shutting down hands the call back once its
+    /// shutdown has finished and the app id is free, and this resolves again —
+    /// claiming ownership itself, or finding the new owner — so a call that
+    /// lands in that window is applied rather than dropped. That matters most
+    /// for `setConsent` / `setEnabled`. Each pass waits for one owner's
+    /// shutdown to complete, so the loop ends.
+    private func route<T: Sendable>(
+        _ call: String, privacy: Bool = false,
+        _ body: @Sendable (isolated StatsClient) async -> T
+    ) async -> Route<T> {
+        while true {
+            switch role() {
+            case .owner: return .mine
+            case .inactive: return .skip
+            case .refused:
+                logRefusal(call, privacy: privacy)
+                return .skip
+            case .forward(let owner):
+                if let value = await owner.runIfOwner(body) { return .forwarded(value) }
+            }
+        }
+    }
+
+    /// Runs a call forwarded from another client, if this client still owns
+    /// its app id. `nil` means "not here": either it is shutting down — then
+    /// only after that shutdown has finished and released the app id — or it
+    /// no longer owns it. Never awaits a forwarding client, so forwarding
+    /// cannot deadlock.
+    func runIfOwner<T: Sendable>(_ body: @Sendable (isolated StatsClient) async -> T) async -> T? {
+        guard holdsLease, !isClosing, !isShutDown else {
+            if isClosing || isShutDown { await shutDownSignal.wait() }
+            return nil
+        }
+        return await body(self)
+    }
+
+    /// Non-privacy calls on a refused client counted so far — the rate limit on
+    /// their log line.
+    private var refusedCalls = 0
+    /// A refused client logs its first non-privacy call and then one in every
+    /// this many: once per `track()` would bury everything else in the log.
+    private static let refusalLogInterval = 100
+
+    /// A refused client says why it did nothing: for ordinary calls on the
+    /// first and then every `refusalLogInterval`-th, and for **every** privacy
+    /// call at `fault`, since the person's choice was not applied.
+    private func logRefusal(_ call: String, privacy: Bool) {
+        if !privacy {
+            refusedCalls += 1
+            guard refusedCalls == 1 || refusedCalls % Self.refusalLogInterval == 0 else { return }
+        }
+        if privacy {
+            logger.fault("""
+                \(call, privacy: .public) was NOT applied: this StatsClient's storageDirectory \
+                belongs to a StatsClient for a different appId, so this client does nothing. \
+                Give each appId its own storageDirectory.
+                """)
+        } else {
+            logger.error("""
+                \(call, privacy: .public) did nothing (\(self.refusedCalls, privacy: .public) refused \
+                call(s) so far): this StatsClient's storageDirectory belongs to a StatsClient for a \
+                different appId. Give each appId its own storageDirectory.
+                """)
+        }
+    }
+
+    /// True for the one client that may touch this app id's queue and state.
+    /// For the owner-only paths below, which a public entry point has already
+    /// routed through `route()`.
+    private var isLive: Bool {
+        holdsLease && !isShutDown
     }
 
     /// The identity store, opening it on first use.
@@ -329,6 +548,7 @@ public actor StatsClient {
         // Anything `record()`ed earlier by this caller has to reach `capture()`
         // first, or a `record("a"); await track("b")` pair could land as `b, a`.
         await drainRecordedIfNeeded()
+        guard case .mine = await route("track()", { await $0.track(name, props: props) }) else { return }
         guard isCollecting else { return }
         guard isAcceptableEventName(name) else { return }
         await capture(name: name, props: props, at: now)
@@ -358,6 +578,22 @@ public actor StatsClient {
         // here is legal from a nonisolated context and needs no hop.
         let entry = RecordedEvent(name: name, props: props, at: configuration.clock.wallNow())
 
+        // Another client owns the app id: hand the call straight to it, still
+        // without a hop, and with the timestamp taken at *this* call. Only with
+        // nothing of our own buffered, though — entries already waiting here
+        // reach the owner through the pump, and a direct hand-off would
+        // overtake them. An owner that has started shutting down refuses, and
+        // the entry is buffered here instead, for the pump to re-route.
+        let owner: StatsClient? = recorded.withLock { buffer in
+            guard !buffer.isShutDown, buffer.entries.isEmpty, !buffer.pumpScheduled else { return nil }
+            return StatsClientRegistry.liveOwner(of: registryKeys, excluding: leaseToken)
+        }
+        if let owner, owner.acceptForwarded([entry], capped: true) { return }
+        bufferRecorded(entry)
+    }
+
+    /// `record()`'s own buffer: append under the cap, schedule one pump.
+    private nonisolated func bufferRecorded(_ entry: RecordedEvent) {
         enum Outcome { case pump, overflowed(Int), none }
         let outcome: Outcome = recorded.withLock { buffer in
             guard !buffer.isShutDown else { return .none }
@@ -376,16 +612,61 @@ public actor StatsClient {
 
         switch outcome {
         case .overflowed(let dropped):
-            logger.error("""
-                record() buffer is full at \(self.maxRecordedBuffer, privacy: .public) entries; \
-                dropping the newest (\(dropped, privacy: .public) so far) until it drains
-                """)
+            logOverflow(dropped)
         case .pump:
             // Weak, so a dropped client is deallocated rather than kept alive by
             // its own drainer.
             Task { [weak self] in await self?.drainRecorded() }
         case .none:
             break
+        }
+    }
+
+    private nonisolated func logOverflow(_ dropped: Int) {
+        logger.error("""
+            record() buffer is full at \(self.maxRecordedBuffer, privacy: .public) entries; \
+            dropping the newest (\(dropped, privacy: .public) so far) until it drains
+            """)
+    }
+
+    /// Takes another client's recorded-but-not-captured entries into this
+    /// client's `record()` buffer, behind anything already there, and
+    /// schedules a pump if none is, so they reach disk even when the caller
+    /// does not drain.
+    ///
+    /// `capped` applies this client's `record()` cap — for a single call
+    /// forwarded straight from another client's `record()`, which has not been
+    /// accepted anywhere yet; past the cap it is dropped and logged exactly as
+    /// this client's own `record()` would. Uncapped — entries a forwarding
+    /// client already accepted into its own buffer — they are never dropped.
+    ///
+    /// Returns `false` only when this client's buffer is closed (it is shutting
+    /// down): nothing was taken, and the caller keeps the entries to re-route.
+    nonisolated func acceptForwarded(_ entries: [RecordedEvent], capped: Bool) -> Bool {
+        enum Outcome { case closed, accepted(pump: Bool), overflowed(Int?) }
+        let outcome: Outcome = recorded.withLock { buffer in
+            guard !buffer.isShutDown else { return .closed }
+            if capped, buffer.entries.count + entries.count > maxRecordedBuffer {
+                buffer.dropped += entries.count
+                buffer.lifetimeDropped += entries.count
+                guard !buffer.didLogDrop else { return .overflowed(nil) }
+                buffer.didLogDrop = true
+                return .overflowed(buffer.dropped)
+            }
+            buffer.entries.append(contentsOf: entries)
+            guard !buffer.pumpScheduled else { return .accepted(pump: false) }
+            buffer.pumpScheduled = true
+            return .accepted(pump: true)
+        }
+        switch outcome {
+        case .closed:
+            return false
+        case .overflowed(let dropped):
+            if let dropped { logOverflow(dropped) }
+            return true
+        case .accepted(let pump):
+            if pump { Task { [weak self] in await self?.drainRecorded() } }
+            return true
         }
     }
 
@@ -401,6 +682,9 @@ public actor StatsClient {
         recordedPumpTask = task
         await task.value
         if recordedPumpTask == task { recordedPumpTask = nil }
+        // A forwarding client's `record()` calls land in the owner's buffer,
+        // so "everything accepted so far is on disk" includes draining that.
+        _ = await route("drainRecorded()") { await $0.drainRecorded() }
     }
 
     /// Skips the `Task` allocation when there is nothing recorded and no pump in
@@ -429,6 +713,23 @@ public actor StatsClient {
                 return entries
             }
             guard !batch.isEmpty else { return }
+            // Recorded here before an owner existed (or before this one took
+            // over): hand them on in order, with their call-time timestamps.
+            switch await route("record()", { owner -> Bool in
+                guard owner.acceptForwarded(batch, capped: false) else { return false }
+                await owner.drainRecorded()
+                return true
+            }) {
+            case .forwarded(true), .skip:
+                continue
+            case .forwarded(false):
+                // The owner closed between the routing and the hand-off: put
+                // the batch back, ahead of anything newer, and route it again.
+                recorded.withLock { $0.entries.insert(contentsOf: batch, at: 0) }
+                continue
+            case .mine:
+                break
+            }
             var didCapture = false
             for entry in batch {
                 // Re-checked per entry: consent may have been revoked while this
@@ -455,11 +756,19 @@ public actor StatsClient {
     /// whole batch a 400.
     private func isAcceptableEventName(_ name: String) -> Bool {
         guard !StatsEventName.isValidForApp(name) else { return true }
+        // The refused string is logged as a length and a hash, never verbatim:
+        // a name that fails validation is, by definition, not one of the app's
+        // constant identifiers, and may well be user content passed by mistake.
+        let scalars = name.unicodeScalars.count
         if StatsEventName.reserved.contains(name) || name.hasPrefix(StatsEventName.reservedPrefix) {
-            logger.error("refused reserved event name \(name, privacy: .public) (schema §12)")
+            logger.error("""
+                refused a reserved event name (\(scalars, privacy: .public) scalars, \
+                \(name, privacy: .private(mask: .hash))) (schema §12)
+                """)
         } else {
             logger.error("""
-                refused malformed event name \(name, privacy: .public): \
+                refused a malformed event name (\(scalars, privacy: .public) scalars, \
+                \(name, privacy: .private(mask: .hash))): \
                 must match ^[a-z][a-z0-9_]*$ and be 1-64 scalars (schema §2.1)
                 """)
         }
@@ -490,10 +799,10 @@ public actor StatsClient {
             logger.error("identify() was given an empty id; ignoring")
             return
         }
-        prepareIfNeeded()
         // Events recorded before this call belong to the un-identified stretch,
         // so they are captured before the hash is attached.
         await drainRecordedIfNeeded()
+        guard case .mine = await route("identify(userID:)", { await $0.identify(userID: userID) }) else { return }
         guard enabled else {
             logger.warning("identify() ignored: the client is opted out")
             return
@@ -506,8 +815,10 @@ public actor StatsClient {
     // MARK: - Consent and opt-out
 
     public var currentConsent: StatsConsent {
-        prepareIfNeeded()
-        return consent
+        get async {
+            if case .forwarded(let value) = await route("currentConsent", { await $0.currentConsent }) { return value }
+            return consent
+        }
     }
 
     /// Whether sessions started from now on carry a stable `installId`.
@@ -526,8 +837,10 @@ public actor StatsClient {
     /// group deletes it, so the next identified session mints a new one.
     /// `identify(userID:)` plays no part in any of this.
     public var hasStableInstallIdentity: Bool {
-        prepareIfNeeded()
-        return consent.contains(.identity)
+        get async {
+            if case .forwarded(let value) = await route("hasStableInstallIdentity", { await $0.hasStableInstallIdentity }) { return value }
+            return consent.contains(.identity)
+        }
     }
 
     /// Records a consent choice.
@@ -543,7 +856,15 @@ public actor StatsClient {
     /// opt-out does not. See ``setEnabled(_:)`` for why, and ``reset()`` for the
     /// call that forgets the UUID without touching either switch.
     public func setConsent(_ groups: StatsConsent) async {
-        prepareIfNeeded()
+        // Through any handle, the choice is the owner's: a settings screen
+        // with its own client must opt the app out, not itself.
+        // A forwarding client hands over what it recorded first, so those
+        // events meet the choice in the order they were made.
+        if !holdsLease { await drainRecordedIfNeeded() }
+        // Any consent call is a privacy choice: refused, it is logged at fault.
+        guard case .mine = await route("setConsent(_:)", privacy: true, { await $0.setConsent(groups) })
+        else { return }
+        guard isLive else { return }
         let revoked = consent.subtracting(groups)
         consent = groups
         identity.storeConsent(groups)
@@ -570,8 +891,10 @@ public actor StatsClient {
     /// The master opt-out. `true` by default; `false` means no capture at all,
     /// whatever consent says.
     public var isEnabled: Bool {
-        prepareIfNeeded()
-        return enabled
+        get async {
+            if case .forwarded(let value) = await route("isEnabled", { await $0.isEnabled }) { return value }
+            return enabled
+        }
     }
 
     /// The master opt-out. `false` clears the queue, ends the session and forgets
@@ -595,8 +918,10 @@ public actor StatsClient {
     /// it — that is the call that regenerates (or deletes) the UUID, and the only
     /// one that does so without changing a switch.
     public func setEnabled(_ newValue: Bool) async {
-        prepareIfNeeded()
-        guard newValue != enabled else { return }
+        if !holdsLease { await drainRecordedIfNeeded() }
+        guard case .mine = await route("setEnabled(_:)", privacy: !newValue, { await $0.setEnabled(newValue) })
+        else { return }
+        guard isLive, newValue != enabled else { return }
         enabled = newValue
         identity.storeEnabled(newValue)
         guard !newValue else { return }
@@ -619,8 +944,14 @@ public actor StatsClient {
     /// Attempts one flush and returns when the attempt is done. A `retry`
     /// outcome leaves the batch queued and schedules the backoff; it does not
     /// keep this call waiting.
+    ///
+    /// Sends nothing while the client is not collecting: opted out or without
+    /// `usage` consent, a queue left from an earlier launch is discarded
+    /// instead (§11).
     public func flush() async {
         await drainRecordedIfNeeded()
+        guard case .mine = await route("flush()", { await $0.flush() }) else { return }
+        guard await mayFlush() else { return }
         await dispatcher.flushNow()
     }
 
@@ -631,13 +962,14 @@ public actor StatsClient {
     /// This is the call that **forgets the install**, which neither switch does
     /// on its own: ``setEnabled(_:)`` keeps the stored UUID and ``setConsent(_:)``
     /// only deletes it on a revocation. Pair it with an opt-out when you want
-    /// "stop collecting *and* forget me".
+    /// "stop collecting *and* forget me". While not collecting, the old
+    /// identity's queue is discarded rather than flushed (§9 allows either).
     public func reset() async {
-        prepareIfNeeded()
         // Everything recorded before the reset belongs to the old identity, so
         // it is captured (and flushed) before the identity rotates.
         await drainRecordedIfNeeded()
-        await dispatcher.flushNow()
+        guard case .mine = await route("reset()", privacy: true, { await $0.reset() }) else { return }
+        if await mayFlush() { await dispatcher.flushNow() }
         if consent.contains(.identity) {
             _ = identity.regenerateInstallUUID(makeUUID: configuration.uuidProvider.uuid)
         } else {
@@ -659,25 +991,62 @@ public actor StatsClient {
     /// — see `Dispatcher.waitForFlushes()`.
     public func waitForFlushes() async {
         await drainRecordedIfNeeded()
+        guard case .mine = await route("waitForFlushes()", { await $0.waitForFlushes() }) else { return }
         await dispatcher.waitForFlushes()
     }
 
-    /// Cancels the interval timer and any pending retry, leaving queued events on
-    /// disk for the next launch. Call it when tearing a client down (a test's
-    /// teardown, or an app that builds a client per window).
+    /// Cancels the interval timer and any pending retry, waits for an in-flight
+    /// flush, and leaves queued events on disk for the next launch — then gives
+    /// up ownership of the app id, so the next call on another client (or a
+    /// client created afterwards) takes over (see "One owner per app id" on
+    /// the type). On a client that forwards, it only hands over what this
+    /// client had buffered and stops it; the owner is not shut down.
+    ///
+    /// While an owner's shutdown runs, a call forwarded to it from another
+    /// client waits for the shutdown to finish — which takes as long as the
+    /// in-flight send, so it is bounded by the sink's request timeout — and
+    /// then goes to the next owner.
+    ///
+    /// Terminal: a shut-down client captures, sends, forwards and changes
+    /// nothing. Call it when tearing a client down for good — a test's
+    /// teardown, or an app replacing its client. It is not a pause.
     public func shutdown() async {
+        // Forwarded calls stop being run here from this point: they wait for
+        // the end of this shutdown and then go to whoever owns the app id
+        // next, instead of reaching a client that would drop them.
+        isClosing = true
+        if holdsLease { StatsClientRegistry.markClosing(token: leaseToken) }
+        defer { shutDownSignal.fire() }
         // Close the door first, then drain what was already accepted: a
         // `record()` arriving after this must not restart the drainer on a
         // client the owner believes is torn down.
         recorded.withLock { $0.isShutDown = true }
         await drainRecorded()
         recordedPumpTask = nil
+        // From here on every entry point is a no-op; a drain already past its
+        // checks finishes before the claim is released.
+        isShutDown = true
+        await drainTask?.value
         await dispatcher.shutdown()
+        if holdsLease {
+            holdsLease = false
+            // Revoked before the release, as in `deinit`: nothing of this
+            // client's may touch the file once another client can own it.
+            revocation.revoke()
+            StatsClientRegistry.release(token: leaseToken)
+        }
     }
 
-    /// Current queue depth, for diagnostics and tests.
+    /// Current queue depth, for diagnostics and tests — the owner's, through
+    /// any client for the app id. `0` once this client is shut down.
     public var queuedEventCount: Int {
-        get async { await store.count }
+        get async {
+            switch await route("queuedEventCount", { await $0.queuedEventCount }) {
+            case .forwarded(let count): return count
+            case .skip: return 0
+            case .mine: return await store.count
+            }
+        }
     }
 
     /// Test seam: the `record()` buffer's current depth and the total entries
@@ -693,7 +1062,10 @@ public actor StatsClient {
     /// Test seam: `EventStore`'s internal diagnostics, including the number of
     /// `append()` calls that have reached it — see `EventStore.diagnostics`.
     package var storeDiagnostics: (consumedBytes: Int, isMemoryOnly: Bool, needsRewrite: Bool, dropped: Int, appends: Int) {
-        get async { await store.diagnostics }
+        get async {
+            if case .forwarded(let value) = await route("storeDiagnostics", { await $0.storeDiagnostics }) { return value }
+            return await store.diagnostics
+        }
     }
 
     // MARK: - Lifecycle (called by the consumer, see the type's docs)
@@ -706,6 +1078,7 @@ public actor StatsClient {
         // Anything recorded before the app became active keeps its place ahead
         // of `app_open`.
         await drainRecordedIfNeeded()
+        guard case .mine = await route("applicationDidBecomeActive()", { await $0.applicationDidBecomeActive() }) else { return }
         guard isCollecting else { return }
         await beginSessionIfNeeded(at: now)
         // §12 defines `app_open` as "the app becomes active in the foreground",
@@ -721,7 +1094,8 @@ public actor StatsClient {
     /// be sent before the process may be suspended.
     public func applicationDidEnterBackground() async {
         await drainRecordedIfNeeded()
-        guard isCollecting else { return }
+        guard case .mine = await route("applicationDidEnterBackground()", { await $0.applicationDidEnterBackground() }) else { return }
+        guard await mayFlush() else { return }
         if configuration.autoEvents.contains(.appBackground), session != nil {
             await capture(name: "app_background", props: [:], at: configuration.clock.wallNow(), isAuto: true)
         }
@@ -735,7 +1109,43 @@ public actor StatsClient {
     /// configuration's provisional value rather than the persisted opt-out.
     private var isCollecting: Bool {
         prepareIfNeeded()
-        return enabled && consent.contains(.usage) && identity.isAvailable
+        return isLive && enabled && consent.contains(.usage) && identity.isAvailable
+    }
+
+    /// Whether a flush may send, decided **before** it does — `flush()`,
+    /// `reset()` and `applicationDidEnterBackground()` all ask.
+    ///
+    /// A queue can outlive the state that allowed it: written by an earlier
+    /// launch, then a stored opt-out or a stored consent without `usage` (a
+    /// revocation discard that failed, a choice written while another client
+    /// held the queue). Sending it would put events on the wire from a state
+    /// that §11 says collects nothing, so a flush never sends unless the client
+    /// is collecting right now.
+    ///
+    /// When collection is off by a *choice* — opted out, or `usage` not
+    /// granted — the leftover queue is discarded rather than held. Holding it
+    /// would send it the moment the person opted back in, which is exactly
+    /// what `setEnabled(false)` and a revocation exist to prevent (§11
+    /// discards on revocation, never flushes). When it is off only because the
+    /// SDK's own suite could not be opened, nothing is known about the choice,
+    /// so the queue is held.
+    ///
+    /// A *configured* consent that drops a group in an app update (with no
+    /// `setConsent` call) is still not a revocation: the install UUID is kept.
+    /// Only the queue rule above applies to it.
+    private func mayFlush() async -> Bool {
+        guard isLive else { return false }
+        if isCollecting { return true }
+        guard !enabled || !consent.contains(.usage) else { return false }
+        // Nothing queued, nothing to discard — and no reason to touch the
+        // disk at all: a client that collects nothing calls this on every
+        // `flush()` and background. (Asking the store only checks for a file;
+        // the queue location is resolved without creating directories.)
+        guard await store.count > 0 else { return false }
+        pending.removeAll()
+        discardGeneration += 1
+        await dispatcher.discardAll()
+        return false
     }
 
     /// Session bookkeeping plus the actual enqueue.
@@ -819,6 +1229,10 @@ public actor StatsClient {
 
     private func nextSeq() -> Int {
         prepareIfNeeded()
+        if let ephemeral = ephemeralNextSeq {
+            ephemeralNextSeq = ephemeral + 1
+            return ephemeral
+        }
         let value = nextSeqValue
         nextSeqValue = value + 1
         return value
@@ -836,8 +1250,8 @@ public actor StatsClient {
         let previous = session
         let newSession = Session(
             id: makeSessionId(at: now),
-            firstEventAt: now,
             lastEventAt: now,
+            firstActivity: monotonic,
             lastActivity: monotonic,
             didEmitAppOpen: false
         )
@@ -848,7 +1262,7 @@ public actor StatsClient {
         // and context that session actually ran with. Under denied `identity`
         // consent those differ every session (§11).
         if let previous, configuration.autoEvents.contains(.sessions) {
-            let duration = previous.lastEventAt.timeIntervalSince(previous.firstEventAt)
+            let duration = (previous.lastActivity - previous.firstActivity).timeInterval
             emitSessionEvent(
                 name: "session_end",
                 sessionId: previous.id,
@@ -862,8 +1276,11 @@ public actor StatsClient {
         if consent.contains(.identity) {
             let uuid = identity.installUUID(makeUUID: configuration.uuidProvider.uuid)
             sessionInstallId = identity.installId(for: uuid)
+            ephemeralNextSeq = nil
         } else {
             sessionInstallId = identity.installId(for: configuration.uuidProvider.uuid())
+            // A fresh id, so a fresh `seq` space (§6).
+            ephemeralNextSeq = 0
             warnEphemeralInstallOnce()
         }
 
@@ -942,6 +1359,133 @@ public actor StatsClient {
     private func endSessionState() {
         session = nil
         sessionInstallId = nil
+        ephemeralNextSeq = nil
         sessionContext = nil
+    }
+}
+
+/// Which client owns each app id — and each consumer-supplied storage
+/// directory — in this process (see "One owner per app id" on
+/// ``StatsClient``). A process-wide `Mutex`, because the clients are separate
+/// actors and a claim has to be atomic across them. The lock is only ever held
+/// for a dictionary lookup: never across an `await`.
+nonisolated enum StatsClientRegistry {
+    private struct Owner {
+        var token: Int
+        /// Weak: the registry must not keep a dropped client alive. `nil`
+        /// means the owner was deallocated and its `deinit` has not released
+        /// the entry yet.
+        weak var client: StatsClient?
+        /// The owner's store-and-dispatcher flag, so a claimant that finds the
+        /// owner already gone stops them itself, under this lock, before it
+        /// starts on the same file — closing the window between "the weak
+        /// reference is nil" and "the owner's `deinit` has run".
+        var revocation: QueueRevocation
+        /// Set when the owner starts shutting down. It still owns the file
+        /// until its shutdown finishes, so a claimant must wait (it is still
+        /// returned by `resolve`), but `record()` no longer hands entries to it.
+        var isClosing = false
+    }
+
+    private struct State {
+        var nextToken = 0
+        var owners: [String: Owner] = [:]
+    }
+
+    private static let state = Mutex(State())
+
+    static func makeToken() -> Int {
+        state.withLock { state in
+            state.nextToken += 1
+            return state.nextToken
+        }
+    }
+
+    /// What a client owns or forwards for: its app id, which names the
+    /// `UserDefaults` suite (and the default queue location), plus an explicit
+    /// storage directory, which holds a queue file whatever app id uses it.
+    static func keys(for configuration: StatsConfiguration) -> [String] {
+        var keys = ["appId:\(configuration.appId)"]
+        if let directory = configuration.storageDirectory {
+            keys.append("directory:\(directory.standardizedFileURL.path)")
+        }
+        return keys
+    }
+
+    enum Resolution {
+        /// The caller now owns every one of its keys.
+        case claimed
+        /// A live client owns the caller's app id: forward to it.
+        case owner(StatsClient)
+        /// A live client owns only the caller's storage directory — so it is
+        /// a client for a different app id, which must not be forwarded to.
+        case directoryConflict
+    }
+
+    private static func isAppIdKey(_ key: String) -> Bool { key.hasPrefix("appId:") }
+
+    /// The live owner of the caller's app id, or a refusal when only its
+    /// storage directory is taken (by another app id), or — when neither is —
+    /// a claim of all its keys. All or nothing, so an owner always owns its
+    /// whole key set and never has anyone to forward to: forwarding is one hop
+    /// and cannot loop.
+    static func resolve(
+        _ keys: [String], token: Int, client: StatsClient, revocation: QueueRevocation
+    ) -> Resolution {
+        state.withLock { state in
+            func liveOther(_ key: String) -> StatsClient? {
+                guard let owner = state.owners[key], owner.token != token else { return nil }
+                return owner.client
+            }
+            for key in keys where isAppIdKey(key) {
+                if let live = liveOther(key) { return .owner(live) }
+            }
+            for key in keys where !isAppIdKey(key) {
+                if liveOther(key) != nil { return .directoryConflict }
+            }
+            for key in keys {
+                // A dead owner's work is stopped before its file changes hands.
+                if let owner = state.owners[key], owner.token != token { owner.revocation.revoke() }
+                state.owners[key] = Owner(token: token, client: client, revocation: revocation)
+            }
+            return .claimed
+        }
+    }
+
+    /// The live, not-closing owner of the caller's app id, without claiming:
+    /// `record()`'s synchronous hand-off. A closing owner is skipped, so the
+    /// entry is buffered here and routed (and, if need be, waits) via the pump.
+    static func liveOwner(of keys: [String], excluding token: Int) -> StatsClient? {
+        state.withLock { state in
+            for key in keys where isAppIdKey(key) {
+                if let owner = state.owners[key], owner.token != token, !owner.isClosing,
+                   let live = owner.client {
+                    return live
+                }
+            }
+            return nil
+        }
+    }
+
+    /// Marks `token`'s entries as closing (see `Owner.isClosing`).
+    static func markClosing(token: Int) {
+        state.withLock { state in
+            for (key, owner) in state.owners where owner.token == token {
+                state.owners[key]?.isClosing = true
+            }
+        }
+    }
+
+    /// Internal test seam: whether `key`'s owner is shutting down.
+    static func isClosing(_ key: String) -> Bool {
+        state.withLock { $0.owners[key]?.isClosing ?? false }
+    }
+
+    /// Releases whatever `token` owns. A no-op for a token that owns nothing —
+    /// including one whose keys a later claimant has already taken over.
+    static func release(token: Int) {
+        state.withLock { state in
+            state.owners = state.owners.filter { $0.value.token != token }
+        }
     }
 }
