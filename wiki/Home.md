@@ -52,7 +52,9 @@ stats.record("project_opened", props: ["section": "analytics"])   // never suspe
 - **The schema is the product.** Anything that speaks `POST /v1/events` is a
   valid backend. `v1` will not break.
 - **Consent is three independent, persisted groups** — `usage`, `diagnostics`,
-  `identity` — and the opt-out you ship is `setEnabled(false)`.
+  `identity` — and the opt-out you ship is `setEnabled(false)`. The default
+  grants all three: per-install by default, per-user only when the app calls
+  `identify(userID:)`.
 
 ## Repository map
 

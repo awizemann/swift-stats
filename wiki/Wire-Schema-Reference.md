@@ -95,7 +95,7 @@ Optional; present only after `identify(userID:)`, on every subsequent event unti
 - It MUST NOT be an email, phone number, username, or anything a person could be contacted or identified by outside the app's own database.
 - Lives under the **`identity`** consent group; denied → the field MUST be omitted entirely, and `identify()` MUST NOT re-enable withheld linkage. `reset()` clears it.
 - A backend MUST treat it as opaque, MUST NOT expose it in the `v1` read contract, and MUST NOT use it to join across projects.
-- An app that calls `identify()` MUST declare **User ID** in its own privacy manifest and nutrition label (§14).
+- An app that calls `identify()` MUST declare **User ID** in its own privacy manifest and nutrition label (§14). The default `identity` grant does not by itself send a `userId`; it only permits one.
 
 ## 3. Context ([§3](../docs/schema.md#3-the-context-object))
 
@@ -224,13 +224,13 @@ Session id: `<epochSeconds>-<8 random digits>`, e.g. `1786012978-40371852`, patt
 
 ## 11. Consent ([§11](../docs/schema.md#11-consent))
 
-Opt-out by default, per app. The default SHOULD be `usage` + `diagnostics` and MUST NOT include `identity` (matching `StatsConsent.default`). A recorded `none` collects **nothing** — no queue file, no install id generated, no context sampled. The choice is persisted in the SDK's own UserDefaults suite and always wins over the configured default, which applies exactly once on first run.
+Opt-out by default, per app; per-install by default, per-user only when the app asks. The default SHOULD be `usage` + `diagnostics` + `identity` (matching `StatsConsent.default`): a stable, salted, random per-install `installId`, and **no `userId` unless the app calls `identify()`**. An app wanting per-session ids configures `usage` + `diagnostics`. A recorded `none` collects **nothing** — no queue file, no install id generated, no context sampled. The choice is persisted in the SDK's own UserDefaults suite; the configured consent applies on every launch until the app first records a choice (`setConsent`), and from then on the recorded choice always wins. (Amended 2026-10-05: the default previously excluded `identity`. A `v1` contract amendment; the wire format is unchanged.)
 
 | Group | Covers |
 |---|---|
 | `usage` | Event names, `props`, sessions, auto-events (§12). |
 | `diagnostics` | The context object's diagnostic fields: os/device/arch/screen/locale/region, `isDebug`, `isTestFlight`, `colorScheme`. |
-| `identity` | A stable `installId` across launches, and the `userId` field. Denied → a **per-session ephemeral** install id (fresh random UUID per session, hashed the same way) and `userId` omitted entirely. |
+| `identity` | A stable `installId` across launches, and permission for the `userId` field (sent only after `identify()`). Denied → a **per-session ephemeral** install id (fresh random UUID per session, hashed the same way) and `userId` omitted entirely. |
 
 `usage` denied means nothing is emitted at all. `diagnostics` denied still sends a well-formed context with the §3 fallbacks; `sdkVersion`, `appVersion`, `appBuild` and `bundleId` are always sent. Revoking consent MUST discard (not flush) the queue and delete the stored install UUID, so re-granting starts a new identity — unlike an app's end-user opt-out master switch, which discards the queue but **keeps** the UUID. Consent is never on the wire: a backend receives only what consent permitted.
 
@@ -257,12 +257,12 @@ Retention: a backend MUST document its raw-event retention, SHOULD keep raw even
 
 ## 14. Privacy manifest ([§14](../docs/schema.md#14-privacy-manifest))
 
-`Sources/Stats/Resources/PrivacyInfo.xcprivacy` MUST stay consistent with the schema: `NSPrivacyTracking` `false` with empty `NSPrivacyTrackingDomains`; collected types **Product Interaction** (names and `props`) and **Other Diagnostic Data** (the context object), both *not linked to identity* and *not used for tracking*, purposes App Functionality + Analytics; accessed API `NSPrivacyAccessedAPICategoryUserDefaults`, reason **CA92.1**.
+`Sources/Stats/Resources/PrivacyInfo.xcprivacy` MUST stay consistent with the schema: `NSPrivacyTracking` `false` with empty `NSPrivacyTrackingDomains`; collected types **Product Interaction** (names and `props`) and **Other Diagnostic Data** (the context object), both *not linked to identity* and *not used for tracking*, purposes App Functionality + Analytics; and **Device ID** (the stable `installId` the default `identity` grant produces), *not linked*, *not tracking*, purpose Analytics; accessed API `NSPrivacyAccessedAPICategoryUserDefaults`, reason **CA92.1**.
 
-It deliberately does **not** declare `NSPrivacyCollectedDataTypeUserID` — the SDK collects no account identifier on its own; an app calling `identify(userID:)` must add User ID to its own manifest and nutrition label. `StatsTests` asserts these values, so a contradicting manifest change fails CI. See [Contributing & Testing](Contributing-&-Testing).
+Device ID is declared because the SDK collects a stable install id on its own under its default consent; an app that denies `identity` over-declares, the safe direction. It deliberately does **not** declare `NSPrivacyCollectedDataTypeUserID` — the SDK collects no account identifier on its own; an app calling `identify(userID:)` must add User ID to its own manifest and nutrition label. `StatsTests` asserts these values, so a contradicting manifest change fails CI. See [Contributing & Testing](Contributing-&-Testing).
 
 ## 15. Versioning ([§15](../docs/schema.md#15-versioning-this-document))
 
 `v1` may gain **optional** fields and new enum values without changing the `schema` string — backends ignore unknown keys (§0) and accept unknown enum values where §3 says so. A breaking change (removing or renaming a field, tightening a limit, changing a §8.1 row definition) requires `v2`, a new `schema` value and a new path prefix (`/v2/events`); a backend SHOULD serve both side by side for at least one release cycle, and MUST reject a `schema` it does not implement with **400** rather than guessing. The schema version is independent of the SDK version: `Stats.schemaVersion` names the version a build speaks, `Stats.sdkVersion` the build.
 
-_Last updated: 2026-08-19 — rewritten from docs/schema.md_
+_Last updated: 2026-10-05 — §11 default now includes `identity`; §14 adds Device ID_

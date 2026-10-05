@@ -59,17 +59,18 @@ func makeStats(writeKey: String) throws -> StatsClient {
         flushAt: 20,                                 // flush at N queued events
         flushInterval: .seconds(30),                 // …or T since the last flush
         autoEvents: [.appOpen, .appBackground, .sessions]  // opt-in, default none
-        // consent defaults to [.usage, .diagnostics]
+        // consent defaults to [.usage, .diagnostics, .identity]: per-install
         // sessionGap defaults to 30 min on macOS, 5 min on iOS
     ))
 }
 
 let stats = try makeStats(writeKey: writeKey)
 
-// 2. Consent already defaults to [.usage, .diagnostics], so this line is only
-//    needed to CHANGE it — to grant .identity (a stable install id + userId), or
-//    to pass .none if your policy wants collect-nothing-until-asked.
-await stats.setConsent([.usage, .diagnostics])   // .identity withheld → per-session id
+// 2. Consent already defaults to [.usage, .diagnostics, .identity] — a stable
+//    install id, and a userId only if you also call identify() — so this line
+//    is only needed to CHANGE it: to drop .identity (per-session ids), or to
+//    pass .none if your policy wants collect-nothing-until-asked.
+await stats.setConsent([.usage, .diagnostics])   // .identity denied → per-session id
 
 // 3. Record. Names are snake_case; props are flat and never carry user text.
 //    `record()` is not async: it never suspends the caller, so it is safe in a
@@ -106,8 +107,8 @@ Every parameter of `StatsConfiguration.init`, with its real default
 | `flushInterval` | `.seconds(30)` | Flush when this much time has passed since the last flush and at least one event is queued. |
 | `maxQueued` | `10_000` | Local queue cap; past it the **oldest** events are dropped (§5). Clamped to `max(1, maxQueued)`. |
 | `sessionGap` | `StatsConfiguration.defaultSessionGap` — 30 min on macOS, 5 min everywhere else | Inactivity gap that starts a new session (§10), measured on the monotonic clock. |
-| `enabled` | `true` | Master opt-out. `false` means no capture at all and a cleared queue. The persisted choice wins after first run. |
-| `consent` | `.default` = `[.usage, .diagnostics]` | Initial consent, used only the first time the app runs; afterwards the persisted choice wins (§11). |
+| `enabled` | `true` | Master opt-out. `false` means no capture at all and a cleared queue. Used on every launch until the app first calls `setEnabled(_:)`; from then on the persisted choice wins. |
+| `consent` | `.default` = `[.usage, .diagnostics, .identity]` | Used on every launch until the app first calls `setConsent(_:)`; from then on the persisted choice wins (§11). The default gives a stable per-install id and no `userId` unless you call `identify(userID:)`; pass `[.usage, .diagnostics]` for per-session ids (install-based metrics then count sessions). |
 | `autoEvents` | `.none` | Which reserved auto-events to emit: `.appOpen`, `.appBackground`, `.sessions` (§12). |
 | `storageDirectory` | `nil` → `Application Support/<appId>/swift-stats/` | Directory for `queue.jsonl`. A directory you supply is created if missing and otherwise left exactly as your app set it. |
 | `screenMetrics` | `.headless` | Screen width/height/scale; the core never imports AppKit/UIKit. |
@@ -143,8 +144,9 @@ their own work; a test that wants only the drain can `await stats.drainRecorded(
 Event names must match `^[a-z][a-z0-9_]*$`, 1–64 scalars, and must not be one of
 the reserved names (§2.1, §12). A refused name is dropped and logged at `error`.
 
-`identify(userID:)` is opt-in, hashed with your salt before it leaves the device,
-and most apps should never call it. It is ignored while the client is opted out,
+`identify(userID:)` is opt-in — it is what turns per-install analytics into
+per-user ones — hashed with your salt before it leaves the device, and most apps
+should never call it. It is ignored while the client is opted out,
 and its value is never emitted while `identity` consent is denied.
 
 ## Consent groups — what they really cover
@@ -155,16 +157,43 @@ Three independent groups (`Sources/Stats/StatsConsent.swift`, schema §11):
 |---|---|---|
 | `usage` | Event names, `props`, sessions, auto-events (§12). | Nothing is emitted at all, whatever the other groups say. |
 | `diagnostics` | The **context object's** device/OS fields: `osName`, `osVersion`, `deviceModel`, `arch`, screen metrics, `locale`, `region`, `isDebug`, `isTestFlight`, `colorScheme`. | A well-formed `context` is still sent (the field is required) with the documented unknown values: `osVersion` major only, `deviceModel` `"unknown"`, `locale` language only, `region` `"ZZ"`, screen `0`/`0`/`1.0`, `colorScheme` omitted. |
-| `identity` | A stable `installId` across launches, and the `userId` field (§2.5). | A fresh ephemeral install id per session, and `userId` omitted even if `identify()` was called. |
+| `identity` | A stable `installId` across launches, and permission for the `userId` field (§2.5), which is sent only after `identify()`. | A fresh ephemeral install id per session, and `userId` omitted even if `identify()` was called. |
 
 `diagnostics` is **not** crash/error/performance reporting — swift-stats collects
 no crashes, no stack traces and no performance timings. It governs the context
 fields listed above and nothing else.
 
-Defaults: `.default` is `[.usage, .diagnostics]`. `.identity` is deliberately not
-in it, because a stable install id and a `userId` change what your app must
-disclose (§14). `.none` collects nothing at all — no queue, no install id, no
-context.
+Defaults: `.default` is `[.usage, .diagnostics, .identity]` (`.all` is the same
+set) — per-install by default, per-user only when you call `identify(userID:)`.
+The stable install id is a **Device ID** your app must disclose (§14). Pass
+`[.usage, .diagnostics]` to opt out of a stable install: per-session ids, and
+install-based metrics count sessions. `.none` collects nothing at all — no
+queue, no install id, no context.
+
+**Upgrading from an earlier release**, where the default was
+`[.usage, .diagnostics]`: an app that never called `setConsent(_:)` has no
+recorded choice, so it moves to per-install ids at its next launch. Add
+**Device ID** (not linked, not tracking) to its privacy label. An app that
+explicitly passes `[.usage, .diagnostics]`, or recorded it via `setConsent`, is
+unaffected.
+
+> **If your app calls `identify(userID:)` and never recorded consent:** on the
+> previous release `identity` was denied, so the `userId` was suppressed. From
+> the next launch after upgrading, the first `identify()` call makes the SDK
+> **send a hashed `userId`** on every event (and persist it). Either declare **User ID** and mark Product Interaction, Other
+> Diagnostic Data and Device ID as **Linked**, or keep the old behavior by
+> passing `consent: [.usage, .diagnostics]` in your configuration or recording
+> it with `setConsent([.usage, .diagnostics])`.
+
+`.default` used **by name** changes meaning too: an "Accept" button wired to
+`setConsent(.default)` now grants `identity`. A value already recorded via
+`setConsent(.default)` on the previous release is stored as
+`[.usage, .diagnostics]` and stays per-session.
+
+Dashboards see a break at the upgrade: installs and active installs drop from
+session counts to real install counts, and every existing device shows up once
+as a new first-seen install in the upgrade week, so retention cohorts spanning
+it are not comparable.
 
 ### The opt-out / revoke / reset asymmetry
 
@@ -215,10 +244,13 @@ inside the actor on the first `record()`, `track()` or
 
 1. **Call the two lifecycle methods** (above).
 2. **Declare what you collect.** The package ships its own `PrivacyInfo.xcprivacy`
-   (tracking `false`, Product Interaction + Other Diagnostic Data, `UserDefaults`
-   reason CA92.1), but *your app* must declare Product Interaction and Other
-   Diagnostic Data in its manifest and nutrition label — plus **User ID** if and
-   only if you call `identify(userID:)` (§14).
+   (tracking `false`, Product Interaction + Other Diagnostic Data + Device ID,
+   `UserDefaults` reason CA92.1), but *your app* must declare Product
+   Interaction, Other Diagnostic Data and Device ID (none linked to identity) in
+   its manifest and nutrition label — plus **User ID** if and only if you call
+   `identify(userID:)` (§14). If you call `identify(userID:)`, mark Product
+   Interaction, Other Diagnostic Data and Device ID as **Linked** in your own
+   label and manifest, and add User ID.
 3. **Choose a salt and never change it.** Any constant string committed with the
    app. Changing it silently re-identifies every install as new.
 4. **Ship an opt-out control** — `setEnabled(false)` plus `setConsent(_:)`; both
