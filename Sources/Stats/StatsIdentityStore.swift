@@ -104,8 +104,9 @@ struct StatsIdentityStore: @unchecked Sendable {
 
     // MARK: Consent and opt-out
 
-    /// `nil` when this app has never recorded a choice, so a configuration's
-    /// initial value applies exactly once.
+    /// `nil` when this app has never recorded a choice via `setConsent`, so the
+    /// configured consent applies on this launch — and on every launch until a
+    /// choice is recorded.
     var storedConsent: StatsConsent? {
         guard defaults.bool(forKey: Key.consentRecorded) else { return nil }
         return StatsConsent(rawValue: defaults.integer(forKey: Key.consent))

@@ -71,7 +71,7 @@ struct StorageTests {
 
         // Reading state, and asking the queue how deep it is, are all still free.
         #expect(await client.isEnabled)
-        #expect(await client.currentConsent == [.usage, .diagnostics])
+        #expect(await client.currentConsent == StatsConsent.default)
         #expect(await client.queuedEventCount == 0)
         #expect(
             !FileManager.default.fileExists(atPath: directory.path),

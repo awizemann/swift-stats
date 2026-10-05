@@ -521,10 +521,20 @@ side is two functions in `src/lib/queries.ts`: `firstSeenRows` (per-day counts)
 and `totalInstalls` (cumulative).
 
 These count `install_id`s, so they are only install counts for emitters that
-grant `identity` consent. Under the SDK's default consent (`identity` withheld,
-§11) every session has its own `install_id`, so install-based metrics
-(installs, active installs, first-seen installs, retention) count sessions.
-A stable install needs `.identity` granted, not `identify(userID:)`.
+grant `identity` consent. The SDK's default consent grants it (§11), so a
+default-configured app sends one stable `install_id` per install. An app that
+configures or records `identity` denied gets its own `install_id` every
+session, so its install-based metrics (installs, active installs, first-seen
+installs, retention) count sessions. A stable install needs `.identity`
+granted, not `identify(userID:)`.
+
+**Upgrade break.** SDK releases before the per-install default denied
+`identity` unless the app granted it. When an app that never recorded consent
+upgrades, its numbers change at that point: installs and active installs drop
+from session counts to real install counts, and every existing device writes
+one new `installs` row, appearing as a first-seen install in the upgrade week.
+Retention cohorts and new-versus-returning figures that span the upgrade are
+not comparable.
 
 **Why (what is otherwise unrecoverable).** Raw events are deleted at the
 retention cutoff, and the rollups that outlive them store per-day **distinct

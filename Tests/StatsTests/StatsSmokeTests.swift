@@ -30,10 +30,20 @@ struct StatsSmokeTests {
 
         let collected = try #require(plist["NSPrivacyCollectedDataTypes"] as? [[String: Any]])
         let types = collected.compactMap { $0["NSPrivacyCollectedDataType"] as? String }
+        // Device ID because the default consent includes `identity`, so a
+        // stable install id is collected without the app opting in. User ID
+        // must never appear: it is collected only if the app calls identify().
         #expect(types.sorted() == [
+            "NSPrivacyCollectedDataTypeDeviceID",
             "NSPrivacyCollectedDataTypeOtherDiagnosticData",
             "NSPrivacyCollectedDataTypeProductInteraction"
         ])
+        #expect(!types.contains("NSPrivacyCollectedDataTypeUserID"))
+        let deviceID = try #require(
+            collected.first { $0["NSPrivacyCollectedDataType"] as? String == "NSPrivacyCollectedDataTypeDeviceID" }
+        )
+        #expect(deviceID["NSPrivacyCollectedDataTypePurposes"] as? [String]
+                == ["NSPrivacyCollectedDataTypePurposeAnalytics"])
         // Nothing may be declared linked-to-identity or used for tracking.
         #expect(collected.allSatisfy { $0["NSPrivacyCollectedDataTypeLinked"] as? Bool == false })
         #expect(collected.allSatisfy { $0["NSPrivacyCollectedDataTypeTracking"] as? Bool == false })

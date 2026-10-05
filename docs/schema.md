@@ -1,6 +1,6 @@
 # swift-stats wire schema — `v1`
 
-Status: **stable for `v1`** · Last changed: 2026-08-17
+Status: **stable for `v1`** · Last changed: 2026-10-05
 
 This document is the canonical contract between *any* emitter (the `Stats` Swift
 SDK, a JS snippet on a Worker/Pages site, a curl script) and *any* backend
@@ -220,7 +220,8 @@ subsequent event of that install until `reset()` or a new `identify` call.
 - **Disclosure**: an app that uses `identify()` collects an account identifier
   and MUST declare **User ID** in its own privacy manifest and App Store
   nutrition label. The SDK's bundled manifest does not declare it, because the
-  SDK does not collect one unless asked — see §14.
+  SDK does not collect one unless asked — see §14. The default `identity`
+  grant (§11) does not by itself send a `userId`; it only permits one.
 
 ## 3. The context object
 
@@ -575,7 +576,9 @@ Error bodies are `{"error": "<machine_code>", "message": "<human text>"}`;
   event of that install. The SDK hashes the supplied value with the same salt
   before it goes on the wire, so a raw identifier never leaves the device, and
   the whole feature lives under the `identity` consent group (§11) — denied means
-  the field is omitted. It is opt-in and most apps should not use it.
+  the field is omitted. Granting `identity` (the default) does not send a
+  `userId`; only an `identify()` call does. It is opt-in and most apps should
+  not use it.
 - A backend MUST NOT create its own identifier — no IP-derived id, no cookie,
   no fingerprint — and MUST NOT store the client IP alongside events (§13).
 
@@ -612,17 +615,23 @@ Error bodies are `{"error": "<machine_code>", "message": "<human text>"}`;
 
 ## 11. Consent
 
-- **Opt-out by default, per app.** An emitter's default consent SHOULD be
-  `usage` + `diagnostics`, and MUST NOT include `identity` — a stable
-  `installId` and a `userId` change what the consuming *app* has to disclose
-  (§14), so `identity` is granted in code or not at all.
+- **Opt-out by default, per app; per-install by default, per-user only when
+  the app asks.** An emitter's default consent SHOULD be `usage` +
+  `diagnostics` + `identity`: a stable, salted, random per-install `installId`
+  (§9), and **no `userId` unless the app calls `identify()`** (§2.5). An app
+  that wants per-session install ids instead configures `usage` +
+  `diagnostics`. A stable `installId` is a device-level identifier the
+  consuming app has to disclose (§14). (Amended 2026-10-05: the default
+  previously excluded `identity`. A `v1` contract amendment; the wire format is
+  unchanged.)
 - **A recorded `none` collects nothing.** With no groups granted, an emitter
   MUST collect nothing whatsoever: no queue file, no install id generated, no
   context sampled. An app whose privacy policy or jurisdiction requires
   opt-*in* configures `none` and records a choice before anything is collected.
 - The choice is **per app**, persisted in the SDK's own UserDefaults suite, and
-  survives relaunch. The persisted choice always wins over the configured
-  default, which therefore applies exactly once, on first run.
+  survives relaunch. Only an explicit recorded choice is persisted (the Swift
+  SDK's `setConsent`); the configured consent applies on every launch until
+  the app first records one, and from then on the recorded choice always wins.
 - The end-user opt-out an app ships is the **master switch**, not consent, and
   the two differ deliberately about the install id: the master switch discards
   the queue but KEEPS the persisted install UUID (a person who turns it off and
@@ -720,14 +729,25 @@ stay consistent with this document:
 - `NSPrivacyTracking`: `false`; `NSPrivacyTrackingDomains`: empty.
 - Collected data types: **Product Interaction** (event names and `props`) and
   **Other Diagnostic Data** (the context object) — both *not linked to
-  identity*, *not used for tracking*, purposes App Functionality + Analytics.
+  identity*, *not used for tracking*, purposes App Functionality + Analytics —
+  and **Device ID** (the stable `installId` the default `identity` grant
+  produces, §9/§11) — *not linked to identity*, *not used for tracking*,
+  purpose Analytics.
 - Accessed API: `NSPrivacyAccessedAPICategoryUserDefaults`, reason **CA92.1**.
+
+Device ID is declared because the SDK collects a stable install identifier on
+its own under its default consent. An app that configures `identity` denied
+sends only per-session ids; the declaration over-states its collection, which
+is the safe direction.
 
 The package manifest deliberately does **not** declare `NSPrivacyCollectedDataTypeUserID`, because the SDK collects no
 account identifier on its own. An app that calls `identify(userID:)` (§2.5) is
 sending one, and **that app** must add User ID to its own manifest and nutrition
 label. This is called out here because it is the one place where using an
-optional SDK feature changes the consumer's disclosure obligations.
+optional SDK feature changes the consumer's disclosure obligations. Such an app
+MUST also mark Product Interaction, Other Diagnostic Data and Device ID as
+**linked** to the user in its own manifest and label, because a `userId` links
+them; the SDK's bundled manifest keeps them not-linked.
 
 A consuming app must declare the same collected types in its own manifest and
 answer the App Store nutrition label accordingly. `StatsTests` asserts these

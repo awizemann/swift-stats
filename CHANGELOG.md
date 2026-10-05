@@ -9,6 +9,59 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-install by default: `StatsConsent.default` is now
+  `[.usage, .diagnostics, .identity]`** (was `[.usage, .diagnostics]`), and so
+  is the `consent` default of `StatsConfiguration`. Out of the box each install
+  gets a stable, salted, random install id that persists across sessions and
+  launches, so install-based metrics (installs, active installs, first-seen
+  installs, retention) count installs. A `userId` is still sent **only** after
+  the app calls `identify(userID:)` — per-user analytics stay opt-in.
+  `StatsConsent.all` is kept and now equals `.default`.
+  **Upgrade consequence:** consent is persisted only by `setConsent(_:)`, and
+  launch uses the recorded choice if there is one, else the configured value.
+  So an app that **never called `setConsent`** moves from per-session to
+  per-install ids at its next launch after upgrading, and must declare
+  **Device ID** (not linked to the user, not used for tracking, purpose
+  Analytics) on its App Store privacy label and in its own manifest. An app
+  that **explicitly passed `[.usage, .diagnostics]`** — in its configuration or
+  via `setConsent` — is unaffected and keeps per-session ids (and the
+  once-per-client warning).
+- **Important — apps that call `identify(userID:)` and never recorded consent
+  will start sending a `userId`.** On 0.2.0 `identity` was denied for them, so
+  the `userId` was suppressed (kept in memory only, never on disk). From the
+  next launch after upgrading, the first `identify()` call makes the hashed
+  `userId` **sent on every event and persisted**. Either declare
+  **User ID** and mark Product Interaction, Other Diagnostic Data and Device ID
+  as **Linked** in your label and manifest, or keep the old behavior by passing
+  `consent: [.usage, .diagnostics]` in the configuration or recording it with
+  `setConsent([.usage, .diagnostics])`.
+- **`.default` used by name changes meaning.** Code that passes
+  `StatsConsent.default` explicitly — for example an "Accept" button wired to
+  `setConsent(.default)` — now grants `identity`. A value already recorded via
+  `setConsent(.default)` on 0.2.0 was stored as `[.usage, .diagnostics]` and
+  stays that way (per-session ids) until the app records a new choice.
+- **Dashboards see a data break at the upgrade.** For an app moving to
+  per-install ids, installs and active installs drop from session counts to
+  real install counts, and every existing device appears once as a new
+  first-seen install in the upgrade week, so retention cohorts and
+  new-versus-returning figures spanning the upgrade are not comparable.
+- **Privacy manifest:** the bundled `PrivacyInfo.xcprivacy` now declares
+  `NSPrivacyCollectedDataTypeDeviceID` (not linked, not tracking, purpose
+  Analytics), because the SDK now collects a stable install id on its own. It
+  still does not declare User ID. The `StatsTests` manifest assertion is
+  updated to match.
+- **Wire schema `v1` contract amendment (no wire-format change):** §11 now says
+  an emitter's default consent SHOULD be `usage` + `diagnostics` + `identity`
+  (a stable, salted, random per-install id; no `userId` unless `identify()`),
+  replacing "SHOULD be `usage` + `diagnostics` and MUST NOT include
+  `identity`". §11 also corrects "the configured default applies exactly once,
+  on first run" to: the configured consent applies until the app first records
+  a choice via `setConsent`. §14 adds Device ID to the SDK manifest's collected
+  types; §2.5 and §9 note that granting `identity` does not by itself send a
+  `userId`. The `schema` string stays `v1`; batches and endpoints are unchanged.
+
 ### Added
 
 - **`StatsClient.hasStableInstallIdentity`** — `true` when the current
@@ -16,14 +69,15 @@ package; schema changes are called out explicitly below.
   now on carry a stable `installId`. Changes after `setConsent(_:)`; a
   mid-session grant takes effect at the next session.
 - **A `warning` log, once per client** (category `Client`), the first time a
-  session mints an ephemeral install id because `identity` is not granted —
-  which is the default. Install-based metrics (installs, active installs,
+  session mints an ephemeral install id because `identity` is not granted
+  (with the new default, only apps that deny it). Install-based metrics (installs, active installs,
   first-seen installs, retention) then count sessions. No values are logged.
 
 ### Documentation
 
 - `StatsConsent.identity` / `.default`, the README quick start and the
-  Cloudflare `ADOPTION.md` `installs` section now say plainly that without
+  Cloudflare `ADOPTION.md` `installs` section describe the per-install default
+  and say plainly that without
   `.identity` install-based metrics (installs, active installs, first-seen
   installs, retention) count sessions, and that
   `identify(userID:)` is not needed for a stable install.

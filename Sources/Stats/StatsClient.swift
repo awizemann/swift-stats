@@ -154,10 +154,12 @@ public actor StatsClient {
 
     /// The hashed `userId`, if `identify()` was called.
     ///
-    /// Persisted **only** while `identity` consent is granted. With it denied,
-    /// §2.5 says the call is "remembered in memory but never emitted" — writing
-    /// the hash to disk then would let a later grant resume a linkage the person
-    /// never re-authorized.
+    /// Persisted **only** if `identity` consent is granted when `identify()` is
+    /// called. With it denied the hash is kept in memory only and not emitted
+    /// (§2.5); writing it to disk then would let a grant on a later launch
+    /// resume a linkage the person never re-authorized. A grant later in the
+    /// *same process* does make the in-memory hash appear on the events that
+    /// follow — it is still not persisted, so it is gone after a relaunch.
     private var userIdHash: String?
 
     private struct Session {
@@ -468,11 +470,15 @@ public actor StatsClient {
     ///
     /// The value is hashed with the install salt before it is stored or sent, so
     /// a raw identifier never leaves the device — but pass something opaque
-    /// anyway. Most apps should never call this: it makes an account's events
-    /// linkable, which is a real privacy cost.
+    /// anyway. This is what turns per-install analytics into per-user ones:
+    /// without it no `userId` is ever sent. Most apps should never call it — it
+    /// makes an account's events linkable, which is a real privacy cost.
     ///
-    /// Under denied `identity` consent the call is remembered but never emitted,
-    /// and `identify()` cannot re-enable linkage consent withheld.
+    /// Under denied `identity` consent the hash is kept in memory and not
+    /// emitted, and `identify()` cannot re-enable linkage consent withheld. If
+    /// `.identity` is granted later in the same process, events from then on
+    /// carry it; it is not persisted, so after a relaunch it is gone until
+    /// `identify()` is called again.
     ///
     /// - Important: calling this puts the SDK's **User ID** data type in play, so
     ///   the consuming app must declare `NSPrivacyCollectedDataTypeUserID` in its
@@ -882,10 +888,11 @@ public actor StatsClient {
 
     /// Says once per client that the install id it just minted is per-session.
     ///
-    /// The default consent withholds `identity`, so an app that never grants it
-    /// gets a fresh install id every session — and install-based metrics that
-    /// silently count sessions. Evaluated here, at the first mint, rather than
-    /// at configuration time: that is the only point at which it is certainly
+    /// The default consent grants `identity`, so this fires only for an app
+    /// whose consent denies it (configured or recorded) — it gets a fresh
+    /// install id every session, and install-based metrics that silently count
+    /// sessions. Evaluated here, at the first mint, rather than at
+    /// configuration time: that is the only point at which it is certainly
     /// true. An app that grants `.identity` before its first session, or that
     /// starts disabled and never opens one, is never warned.
     private func warnEphemeralInstallOnce() {
@@ -894,7 +901,7 @@ public actor StatsClient {
         logger.warning("""
             identity consent is not granted, so installId is per-session: \
             install-based metrics (installs, active installs, first-seen installs, retention) \
-            will count sessions. Grant .identity (e.g. consent: .all) for a stable install; \
+            will count sessions. Grant .identity (the default consent includes it) for a stable install; \
             identify() is not needed
             """)
     }

@@ -47,14 +47,15 @@ public struct StatsConfiguration: Sendable {
     /// `StatsClient.setConsent(_:)`. Only `setConsent` persists a choice, and
     /// once one is persisted it wins over this value for good.
     ///
-    /// Default `[.usage, .diagnostics]`: the package is **opt-out by default for
-    /// an app**, because the app — not the package — is the thing with a privacy
-    /// policy and a jurisdiction, and the end-user opt-out it must ship is
-    /// `setEnabled(false)`. `.identity` is deliberately **not** in the default:
-    /// granting it means a stable install id (and a `userId` if the app calls
-    /// `identify(userID:)`), which changes what the consumer has to disclose
-    /// (§14), so it has to be asked for in code. Without it, install-based
-    /// metrics count sessions.
+    /// Default ``StatsConsent/default`` (`[.usage, .diagnostics, .identity]`):
+    /// per-install by default. Each install gets a stable, salted, random
+    /// install id; a `userId` is added only if the app calls
+    /// `identify(userID:)`. The app — not the package — is the thing with a
+    /// privacy policy and a jurisdiction, and the end-user opt-out it must ship
+    /// is `setEnabled(false)`.
+    ///
+    /// Pass `[.usage, .diagnostics]` to opt out of a stable install: install
+    /// ids are then per-session, and install-based metrics count sessions.
     ///
     /// Pass `.none` for collect-nothing-until-asked; with `.none` recorded,
     /// nothing at all is collected — no queue, no install id, no context.

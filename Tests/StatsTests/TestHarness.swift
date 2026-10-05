@@ -40,8 +40,13 @@ final class Harness: Sendable {
         colorScheme: "dark"
     )
 
+    /// `sdkDefaultConsent: true` ignores `consent` and leaves
+    /// `StatsConfiguration.consent` at the SDK's own default — what an app gets
+    /// when its configuration never mentions consent. (A separate flag rather
+    /// than an optional `consent`, because `.none` would then mean `nil`.)
     init(
         consent: StatsConsent = [.usage, .diagnostics, .identity],
+        sdkDefaultConsent: Bool = false,
         autoEvents: StatsAutoEvents = .none,
         flushAt: Int = 1_000,
         flushInterval: Duration = .seconds(30),
@@ -75,13 +80,13 @@ final class Harness: Sendable {
             maxQueued: maxQueued,
             sessionGap: sessionGap,
             enabled: enabled,
-            consent: consent,
             autoEvents: autoEvents,
             storageDirectory: self.directory,
             clock: clock,
             uuidProvider: self.uuids,
             randomSource: random
         )
+        if !sdkDefaultConsent { configuration.consent = consent }
         // `package`, not part of the public init: see StatsConfiguration.
         configuration.contextOverride = context
         self.configuration = configuration
@@ -94,16 +99,28 @@ final class Harness: Sendable {
         UUID(uuidString: String(format: "00000000-0000-4000-8000-%012d", index))!
     }
 
+    /// A UUID sequence disjoint from ``defaultUUIDs``.
+    static let relaunchUUIDs: [UUID] = (1...64).map { index in
+        UUID(uuidString: String(format: "00000000-0000-4000-9000-%012d", index))!
+    }
+
     /// A second client over the same app id and directory: "the app relaunched".
     /// The session-id digits are shifted, standing in for the fresh randomness a
     /// real relaunch gets: without it the two runs' first sessions would share an
     /// id, since the manual clock starts both in the same wall-clock second.
+    ///
+    /// Pass `uuids` (e.g. ``relaunchUUIDs``) when the test compares install ids
+    /// across the relaunch: with the same fixed sequence, a per-session id
+    /// minted after the relaunch would equal the one minted before it.
     func relaunched(
         consent: StatsConsent = [.usage, .diagnostics, .identity],
+        sdkDefaultConsent: Bool = false,
+        uuids: [UUID] = Harness.defaultUUIDs,
         contextOverride: StatsContext? = Harness.exampleContext
     ) -> Harness {
         Harness(
-            consent: consent, appId: appId, directory: directory,
+            consent: consent, sdkDefaultConsent: sdkDefaultConsent, uuids: uuids,
+            appId: appId, directory: directory,
             firstDigits: 51_000_000, contextOverride: contextOverride
         )
     }

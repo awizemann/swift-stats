@@ -29,11 +29,14 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
   storage, no location, no free text, no session replay. The list of things the
   schema forbids is written down and normative:
   [schema §13](docs/schema.md#13-deliberately-never-collected).
-- **Opt-out by default, per app.** With no configuration the SDK collects usage
-  and diagnostics — `consent` defaults to `[.usage, .diagnostics]` — and the
-  opt-out you ship for a person is `setEnabled(false)`. `identity` is **not** in
-  the default and has to be asked for in code, because a stable install id and a
-  `userId` change what your app must disclose
+- **Opt-out by default, per app; per-install by default, per-user only when you
+  ask.** With no configuration the SDK collects usage and diagnostics under a
+  stable, salted, random per-install id — `consent` defaults to
+  `[.usage, .diagnostics, .identity]` — and the opt-out you ship for a person is
+  `setEnabled(false)`. No `userId` is ever sent unless you call
+  `identify(userID:)`. Pass `[.usage, .diagnostics]` to opt out of a stable
+  install (per-session ids; install metrics then count sessions). The stable id
+  is a **Device ID** your app must disclose
   ([schema §14](docs/schema.md#14-privacy-manifest)). If your policy or
   jurisdiction wants collect-nothing-until-asked, pass `consent: .none`: with
   `.none` recorded there is no queue, no id and no context. Consent is three
@@ -104,20 +107,20 @@ func makeStats(writeKey: String) throws -> StatsClient {
         flushAt: 20,                                 // flush at N queued events
         flushInterval: .seconds(30),                 // …or T since the last flush
         autoEvents: [.appOpen, .appBackground, .sessions]  // opt-in, default none
-        // consent defaults to [.usage, .diagnostics]
+        // consent defaults to [.usage, .diagnostics, .identity]: per-install
         // sessionGap defaults to 30 min on macOS, 5 min on iOS
     ))
 }
 
 let stats = try makeStats(writeKey: writeKey)
 
-// 2. Consent already defaults to [.usage, .diagnostics], so this line is only
-//    needed to CHANGE it — to grant .identity (a stable install id, and a userId
-//    only if you also call identify()), or to pass .none if your policy wants
-//    collect-nothing-until-asked. Without .identity the install id is
-//    per-session, so install-based metrics (installs, active installs,
-//    first-seen installs, retention) count sessions.
-await stats.setConsent([.usage, .diagnostics])   // .identity withheld → per-session id
+// 2. Consent already defaults to [.usage, .diagnostics, .identity] — a stable
+//    install id, and a userId only if you also call identify() — so this line
+//    is only needed to CHANGE it: to pass .none if your policy wants
+//    collect-nothing-until-asked, or to drop .identity. Without .identity the
+//    install id is per-session, so install-based metrics (installs, active
+//    installs, first-seen installs, retention) count sessions.
+await stats.setConsent([.usage, .diagnostics])   // .identity denied → per-session id
 
 // 3. Record. Names are snake_case; props are flat and never carry user text.
 //    `record()` is not async: it never suspends the caller, so it is safe in a
@@ -356,11 +359,15 @@ the suite opened lazily inside the actor on the first `record()`, `track()` or
    ```
 
 2. **Declare what you collect.** The package ships its own
-   `PrivacyInfo.xcprivacy`, but *your app* must declare **Product Interaction**
-   and **Other Diagnostic Data** (neither linked to identity, neither used for
-   tracking) in its manifest and nutrition label — and additionally **User ID**
+   `PrivacyInfo.xcprivacy`, but *your app* must declare **Product Interaction**,
+   **Other Diagnostic Data** and **Device ID** (none linked to identity, none
+   used for tracking) in its manifest and nutrition label — Device ID because
+   the default consent sends a stable install id — and additionally **User ID**
    if, and only if, you call `identify(userID:)`
-   ([schema §14](docs/schema.md#14-privacy-manifest)).
+   ([schema §14](docs/schema.md#14-privacy-manifest)). If you call
+   `identify(userID:)`, mark Product Interaction, Other Diagnostic Data and
+   Device ID as **Linked** to the user in your own label and manifest, and add
+   User ID.
 
 3. **Choose a salt and never change it.** Any constant string, committed with the
    app. It is not a secret and grants nothing; its only job is to stop the same

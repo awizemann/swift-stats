@@ -2,16 +2,16 @@ import Foundation
 
 /// The three independently togglable consent groups of schema §11.
 ///
-/// The SDK's default is `[.usage, .diagnostics]` — **opt-out by default for an
-/// app**. The app is the thing with a privacy policy and a jurisdiction, and the
-/// end-user opt-out it must ship is `setEnabled(false)`.
+/// The SDK's default is `[.usage, .diagnostics, .identity]`: **per-install by
+/// default, per-user only when the app asks**. Each install gets a stable,
+/// salted, random install id that persists across sessions and launches, and
+/// no `userId` is ever sent unless the app calls `identify(userID:)`. The app —
+/// not the package — is the thing with a privacy policy and a jurisdiction, and
+/// the end-user opt-out it must ship is `setEnabled(false)`.
 ///
-/// `.identity` is **not** in the default: it makes an install stable across
-/// launches and lets `identify()` emit a `userId`, which changes what the
-/// consumer has to disclose (§14). It has to be asked for in code. Without it,
-/// every session gets its own install id, so install-based metrics (installs,
-/// active installs, first-seen installs, retention) count **sessions**. `identify(userID:)` is not needed
-/// for a stable install — granting `.identity` alone is enough.
+/// Pass `[.usage, .diagnostics]` to opt out of a stable install: every session
+/// then gets its own install id, so install-based metrics (installs, active
+/// installs, first-seen installs, retention) count **sessions**.
 ///
 /// Pass `.none` to collect nothing at all until a person says yes — with `.none`
 /// recorded there is no queue, no install id and no context.
@@ -25,25 +25,26 @@ public struct StatsConsent: OptionSet, Sendable, Hashable, Codable {
     /// The context object's diagnostic fields. Denied → the documented unknown
     /// values are sent instead (the context field itself is required).
     public static let diagnostics = StatsConsent(rawValue: 1 << 1)
-    /// A stable `installId` across launches, and the `userId` field. Denied →
-    /// a fresh ephemeral install id per session and no `userId` ever, which
-    /// means install-based metrics (installs, active installs, first-seen
-    /// installs, retention) count sessions.
+    /// A stable `installId` across sessions and launches, and permission for the
+    /// `userId` field. Granted by default.
     ///
-    /// Granting this is all a stable install needs: `identify(userID:)` is
-    /// **not** required — it only adds the optional `userId`.
+    /// Granted, the install id is per-install; a `userId` is added only once the
+    /// app calls `identify(userID:)`. Denied → a fresh install id per session
+    /// and no `userId` ever, even after `identify()`, which means install-based
+    /// metrics (installs, active installs, first-seen installs, retention)
+    /// count sessions.
     public static let identity = StatsConsent(rawValue: 1 << 2)
 
-    /// Everything. Note this includes `identity`, which most apps do not need.
+    /// Every group. Identical to ``default``; kept as a name for "everything".
     public static let all: StatsConsent = [.usage, .diagnostics, .identity]
     /// Collect nothing at all. **Not** the SDK default (see the type's docs);
     /// pass it explicitly when the app wants a person to opt *in* first.
     public static let none: StatsConsent = []
 
-    /// The SDK default: usage and diagnostics, without `identity` — so the
-    /// install id is per-session, and install-based metrics (installs, active
-    /// installs, first-seen installs, retention) count sessions. Use ``all`` (or add `.identity`) for a stable install.
-    public static let `default`: StatsConsent = [.usage, .diagnostics]
+    /// The SDK default: usage, diagnostics and identity — a stable per-install
+    /// id, and no `userId` unless the app calls `identify(userID:)`. Pass
+    /// `[.usage, .diagnostics]` instead for per-session install ids.
+    public static let `default`: StatsConsent = [.usage, .diagnostics, .identity]
 }
 
 /// The auto-events of schema §12, all opt-in and default off.

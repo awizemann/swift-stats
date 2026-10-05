@@ -43,6 +43,27 @@
 				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
 			</array>
 		</dict>
+		<dict>
+			<!-- The install id. With the default consent (which includes
+			     identity) it is a random UUID, persisted in the SDK's own
+			     UserDefaults suite and sent salted and hashed, so it is stable
+			     per install: a device-level ID in Apple's terms. Not linked to
+			     identity (no account, never IDFV/IDFA/hardware-derived) and not
+			     used for tracking. Declared here because the SDK collects it on
+			     its own, without the app opting in. User ID is NOT declared:
+			     the SDK sends a userId only when the app calls identify(userID:),
+			     so that app must declare it itself. -->
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeDeviceID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+			</array>
+		</dict>
 	</array>
 	<key>NSPrivacyAccessedAPITypes</key>
 	<array>
