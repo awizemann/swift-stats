@@ -4,7 +4,7 @@ Privacy-first usage analytics for native Apple apps. A small Swift package, zero
 dependencies, Swift 6 language mode, and a documented wire schema so the backend
 is yours to choose.
 
-> **Status: core client + schema (v0.2.0).**
+> **Status: core client + schema (v0.3.0).**
 > The wire contract in [`docs/schema.md`](docs/schema.md) is complete and stable
 > for `v1`, and the emitter (`StatsClient`, the file-backed queue, the
 > dispatcher, identity, sessions, consent) is implemented and tested. A shipping
@@ -72,7 +72,7 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
 ## Installation
 
 ```swift
-.package(url: "https://github.com/awizemann/swift-stats.git", from: "0.2.0")
+.package(url: "https://github.com/awizemann/swift-stats.git", .upToNextMinor(from: "0.3.0"))
 ```
 
 ```swift
@@ -465,6 +465,13 @@ CHANGELOG.md               Keep-a-changelog, semver
 ```
 
 ## Status and roadmap
+
+**Shipped (0.3.0).** Per-install by default (`.identity` in the default
+consent; per-user only via `identify(userID:)`), one live client per app id,
+queue and teardown hardening, `RelaunchProbe` for integrators, and backend
+`backend-cloudflare-0.4.0` (per-project rollups, cascading raw tables, the
+retention-raise marker, a budgeted nightly pass). See the CHANGELOG's 0.3.0
+upgrade notes before adopting.
 
 **Shipped (0.2.0).** Wire schema `v1`; the `Stats` core (file-backed queue,
 dispatcher, identity, sessions, consent); the Cloudflare backend (ingest, read

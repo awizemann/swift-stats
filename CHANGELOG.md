@@ -9,6 +9,40 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-05
+
+### Upgrade notes (read before adopting)
+
+Pin with `.upToNextMinor(from: "0.3.0")` — in 0.x a minor release may break.
+
+- **Per-install by default.** `StatsConsent.default` (and the `consent`
+  default of `StatsConfiguration`) now includes `.identity`. An app that never
+  called `setConsent(_:)` moves from per-session to a stable per-install id at
+  its next launch. Its install, active-install, first-seen and retention
+  figures drop from session counts to real counts, and every existing device
+  shows up once as a new first-seen install in the upgrade week. The SDK's
+  privacy manifest now declares **Device ID** (not linked, not tracking) —
+  update the App Store privacy label to match.
+- **`identify(userID:)` now takes effect under the default.** Apps that call
+  it without having recorded consent had `userId` suppressed on 0.2.0; from
+  0.3.0 a hashed `userId` is sent and persisted after the first `identify()`.
+  Declare **User ID** and mark collected types **Linked**, or pass / record
+  `[.usage, .diagnostics]` to stay per-session with no user.
+- **`setConsent(.default)` now grants identity.** A value already recorded via
+  `setConsent(.default)` on 0.2.0 stays `[.usage, .diagnostics]`.
+- **One live client per app id.** A second `StatsClient` for the same `appId`
+  forwards every call to the first; one whose `storageDirectory` belongs to a
+  different `appId` is refused. Build one client and inject it.
+- **Source note:** `currentConsent`, `isEnabled` and `hasStableInstallIdentity`
+  are `get async` (callers outside the actor already `await` them).
+- **No send while not collecting:** `flush()`, `reset()` and
+  `applicationDidEnterBackground()` no longer send a leftover queue when the
+  person has opted out or consent is `.none`; it is discarded.
+- **StatsTesting (breaking):** `ManualClock.waitForSleepers(count:)` now waits
+  and returns `Void`; the bounded form is `waitForSleepers(count:maxYields:)`.
+  New: `RelaunchProbe`, `InMemorySink.waitForBatches(_:)`,
+  `ManualClock.shiftWallClock(by:)`.
+
 ### Changed
 
 - **Per-install by default: `StatsConsent.default` is now
@@ -212,7 +246,9 @@ package; schema changes are called out explicitly below.
   to the schema §3 limit and logged at `error`, instead of being sent as-is and
   turning every batch into a permanent 400.
 
-### Fixed — Cloudflare backend (`backends/cloudflare`, unreleased; next `backend-cloudflare-*` heading)
+## [backend-cloudflare-0.4.0] — 2026-10-05
+
+### Fixed
 
 The batch format and the `/v1` request and response **shapes** are untouched,
 so emitters and readers need no code change. **Some read numbers change**, by
