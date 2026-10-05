@@ -107,6 +107,19 @@ public struct StatsConfiguration: Sendable {
     /// is not running — which is a data-integrity hole, not a feature.
     package var contextOverride: StatsContext?
 
+    /// Moves the SDK's `UserDefaults` suite out of `~/Library/Preferences` into
+    /// this directory (an absolute-path suite, `<directory>/com.wizemann.stats.<appId>`).
+    /// `nil` in production. Set by this package's own tests and by an isolated
+    /// `RelaunchProbe`, so a test run leaves nothing in the user's preferences:
+    /// `cfprefsd` re-materialises an empty `<suite>.plist` there seconds after
+    /// the domain is removed and the file deleted, and the only reliable way to
+    /// leave nothing behind is to never write there. Removing the directory
+    /// removes the suite, and a deferred write into a missing directory fails.
+    ///
+    /// `package`, not `public`: a consumer has no reason to move the SDK's
+    /// identity out of its documented, inspectable location.
+    package var identitySuiteDirectory: URL?
+
     /// The platform default inactivity gap (§10).
     public static var defaultSessionGap: Duration {
         #if os(macOS)
@@ -161,5 +174,6 @@ public struct StatsConfiguration: Sendable {
         self.uuidProvider = uuidProvider
         self.randomSource = randomSource
         self.contextOverride = nil
+        self.identitySuiteDirectory = nil
     }
 }

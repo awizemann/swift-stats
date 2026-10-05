@@ -42,7 +42,7 @@ struct ConsentTests {
         #expect(await harness.client.ephemeralInstallWarningCount == 0)
         // `diagnostics` is granted too, so the context is the real one.
         #expect(await harness.sink.batches.first?.context.deviceModel != "unknown")
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") != nil, "the install UUID is persisted")
         await harness.tearDown()
     }
@@ -158,7 +158,7 @@ struct ConsentTests {
         #expect(events.map(\.name) == ["before_identify", "after_identify"])
         #expect(events[0].userId == nil, "the 0.2.0 hash was never persisted")
         #expect(events[1].userId != nil, "the new default emits it")
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "userIdHash") != nil, "and persists it")
         await relaunched.tearDown()
     }
@@ -188,7 +188,7 @@ struct ConsentTests {
         #expect(first.first?.installId != nil)
         #expect(first.first?.installId != second.first?.installId)
         #expect(await relaunched.client.ephemeralInstallWarningCount == 1)
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") == nil)
         await relaunched.tearDown()
     }
@@ -216,7 +216,7 @@ struct ConsentTests {
         #expect(first.first?.installId != second.first?.installId)
         #expect(await relaunched.client.ephemeralInstallWarningCount == 1, "each client says it once")
         #expect(await relaunched.client.hasStableInstallIdentity == false)
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") == nil)
         await relaunched.tearDown()
     }
@@ -234,7 +234,7 @@ struct ConsentTests {
         #expect(await harness.client.queuedEventCount == 0)
         #expect(await harness.sink.batchCount == 0)
         // No install id was generated either.
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") == nil)
         await harness.tearDown()
     }
@@ -269,7 +269,7 @@ struct ConsentTests {
         #expect(events[0].installId != events[1].installId, "the install id must be per-session")
         #expect(events[0].installId.count == 64)
         // Nothing was persisted, so a relaunch cannot resume the identity.
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") == nil)
         await harness.tearDown()
     }
@@ -313,7 +313,7 @@ struct ConsentTests {
         await harness.client.waitForFlushes()
 
         #expect(await harness.sink.sentEvents.first?.userId == nil)
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "userIdHash") == nil, "the hash must not reach disk")
         await harness.tearDown()
     }
@@ -329,7 +329,7 @@ struct ConsentTests {
 
         #expect(await harness.client.queuedEventCount == 0, "a revocation discards, it does not flush")
         #expect(await harness.sink.batchCount == 0)
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") == nil)
         #expect(suite?.string(forKey: "userIdHash") == nil)
 
@@ -488,7 +488,7 @@ struct ConsentTests {
         #expect(events.map(\.seq) == [0, 1, 0, 1], "each install id has its own seq space")
         #expect(events[2].installId == events[3].installId, "the install is now stable across sessions")
         #expect(events[0].installId != events[2].installId, "the pre-grant id was ephemeral")
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") != nil)
         await harness.tearDown()
     }
@@ -517,7 +517,7 @@ struct ConsentTests {
         #expect(events.map(\.seq) == [0, 1, 2, 3, 0, 1])
         #expect(events[3].installId == events[0].installId)
         #expect(events[4].installId != events[0].installId)
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect((suite?.integer(forKey: "seq") ?? 0) == 0, "an ephemeral seq is never written to disk")
         await harness.client.shutdown()
         harness.clock.cancelAllSleepers()
@@ -545,7 +545,7 @@ struct ConsentTests {
         harness.clock.cancelAllSleepers()
 
         // Consent `.none` recorded without going through `setConsent`.
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         suite?.set(StatsConsent.none.rawValue, forKey: "consent")
         suite?.set(true, forKey: "consentRecorded")
 
@@ -564,7 +564,7 @@ struct ConsentTests {
         await other.client.track("a")
         await other.client.shutdown()
         other.clock.cancelAllSleepers()
-        UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: other.appId))?.set(false, forKey: "enabled")
+        UserDefaults(suiteName: other.configuration.identitySuiteName)?.set(false, forKey: "enabled")
         let reopened = other.relaunched()
         await reopened.client.flush()
         await reopened.client.waitForFlushes()
@@ -583,7 +583,7 @@ struct ConsentTests {
         await harness.client.track("a")
         await harness.client.shutdown()
         harness.clock.cancelAllSleepers()
-        UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))?.set(false, forKey: "enabled")
+        UserDefaults(suiteName: harness.configuration.identitySuiteName)?.set(false, forKey: "enabled")
 
         let relaunched = harness.relaunched()
         await relaunched.client.applicationDidEnterBackground()

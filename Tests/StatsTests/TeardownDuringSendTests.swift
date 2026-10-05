@@ -71,6 +71,7 @@ struct TeardownDuringSendTests {
                 uuidProvider: FixedUUIDProvider(Harness.defaultUUIDs),
                 randomSource: FixedRandomSource()
             )
+            configuration.identitySuiteDirectory = IsolatedDefaults.directory(appId: appId)
             var context = Harness.exampleContext
             context.bundleId = appId
             configuration.contextOverride = context
@@ -82,7 +83,7 @@ struct TeardownDuringSendTests {
             await client.shutdown()
             clock.cancelAllSleepers()
             try? FileManager.default.removeItem(at: directory)
-            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+            IsolatedDefaults.remove(appId: appId)
         }
     }
 

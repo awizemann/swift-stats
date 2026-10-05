@@ -62,6 +62,7 @@ struct ConcurrencyTests {
             ),
             randomSource: FixedRandomSource()
         )
+        configuration.identitySuiteDirectory = IsolatedDefaults.directory(appId: appId)
         var context = Harness.exampleContext
         context.bundleId = appId
         configuration.contextOverride = context
@@ -79,7 +80,7 @@ struct ConcurrencyTests {
         let appId = "com.example.overlap\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         defer {
             try? FileManager.default.removeItem(at: directory)
-            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+            IsolatedDefaults.remove(appId: appId)
         }
 
         let sink = OverlapDetectingSink()
@@ -120,7 +121,7 @@ struct ConcurrencyTests {
         let appId = "com.example.overlap2\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         defer {
             try? FileManager.default.removeItem(at: directory)
-            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+            IsolatedDefaults.remove(appId: appId)
         }
 
         let sink = OverlapDetectingSink()

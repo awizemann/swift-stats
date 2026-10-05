@@ -100,9 +100,9 @@ SELECT project_id, install_id, MIN(day)
 -- cannot distinguish from a real one — it would just be wrong, confidently.
 --
 -- One row is enough to fix that. Record the UTC day this migration ran; the
--- floor a reader must not trust below is then derivable per project from that
--- day and the project's own retention window (`firstSeenFloorDay` in
--- src/lib/queries.ts). Deliberately NOT a `first_seen_is_exact` column on
+-- floor a reader must not trust at or below is then that day − 89 — the 90-day
+-- raw window in force for every project when this ran, not any later per-project
+-- `retention_days` (`firstSeenFloorDay` in src/lib/queries.ts). Deliberately NOT a `first_seen_is_exact` column on
 -- `installs`: that would be a per-row flag carrying one repository-wide fact,
 -- and it would have to be written for every future row forever to stay true.
 --
@@ -125,8 +125,10 @@ CREATE TABLE backend_markers (
 --
 -- A FRESH deployment runs this migration against an empty `events` table, so the
 -- backfill inserts nothing and there is nothing to distrust. The marker is still
--- written — it names the day, and on a fresh database the floor it implies simply
--- sits below every install there will ever be. A deployment created BEFORE 0005
--- existed is the case the marker is for.
+-- written, so `firstSeenFloorDay` returns that day − 89 there too, not NULL. Under
+-- the default window ingest never writes a first_seen_day below it (a sighting
+-- backdated on this very day can land ON it); README §4 spells out the edges. A
+-- deployment created BEFORE 0005 existed is the case the marker is for.
+-- (Comment-only edits; the statements are unchanged.)
 INSERT OR IGNORE INTO backend_markers (key, value)
 VALUES ('installs_backfill_day', date('now'));

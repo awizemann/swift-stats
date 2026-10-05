@@ -17,9 +17,15 @@ private nonisolated let logger = Logger(subsystem: StatsLog.subsystem, category:
 /// scalar reads on the client actor, and making them `async` would add
 /// suspension points that widen the window between capture and disk for no gain.
 extension StatsConfiguration {
-    /// The SDK's own `UserDefaults` suite for this configuration's app id.
-    /// `package` so `StatsTesting` can clean up after an isolated probe.
-    package var identitySuiteName: String { StatsIdentityStore.suiteName(appId: appId) }
+    /// The SDK's own `UserDefaults` suite for this configuration's app id —
+    /// `com.wizemann.stats.<appId>`, or that name inside
+    /// ``identitySuiteDirectory`` when a test has set one.
+    /// `package` so `StatsTesting` and the tests can open the same suite.
+    package var identitySuiteName: String {
+        let name = StatsIdentityStore.suiteName(appId: appId)
+        guard let identitySuiteDirectory else { return name }
+        return identitySuiteDirectory.appendingPathComponent(name, isDirectory: false).path
+    }
 }
 
 struct StatsIdentityStore: @unchecked Sendable {
@@ -46,8 +52,7 @@ struct StatsIdentityStore: @unchecked Sendable {
     /// per app id) never share identity state.
     static func suiteName(appId: String) -> String { "com.wizemann.stats.\(appId)" }
 
-    init(appId: String, salt: String) {
-        let suiteName = Self.suiteName(appId: appId)
+    init(suiteName: String, salt: String) {
         self.suiteName = suiteName
         if let suite = UserDefaults(suiteName: suiteName) {
             self.defaults = suite

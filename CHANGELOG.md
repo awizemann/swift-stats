@@ -107,6 +107,14 @@ package; schema changes are called out explicitly below.
 
 ### Fixed
 
+- **`RelaunchProbe` (isolated) and this package's test suite no longer leave
+  files in `~/Library/Preferences`.** Removing a `com.wizemann.stats.<appId>`
+  domain left an empty `<suite>.plist` behind every time, and deleting the file
+  is not enough: `cfprefsd` writes it back seconds later or at process exit.
+  An isolated probe and every test now keep the SDK's suite in a temporary
+  directory (a `package` seam, `StatsConfiguration.identitySuiteDirectory`;
+  production naming is unchanged), removed afterwards and swept at process exit.
+  Files already leaked by earlier runs are not touched.
 - **Two `StatsClient`s for one app id no longer double-send or repeat
   `seq`: the second forwards to the first.** Two clients for one app id (or
   one consumer-supplied `storageDirectory`) shared the queue file and the
@@ -272,6 +280,12 @@ release.
   project's current window; raising retention dropped the floor below the
   0005 backfill's boundary spike and labelled those installs exact. It is now
   the backfill day's 90-day boundary for every project.
+- **Docs: `firstSeenFloorDay()` is not `null` on a fresh deployment.** The
+  README §4, ADOPTION §8.2 and the jsdoc said a fresh deployment returns `null`;
+  `0005` writes the marker unconditionally, so it returns migration day − 89
+  (harmless: under the default window ingest never writes a first sighting below
+  it). `null` means only that the marker row is absent. Behaviour unchanged; a
+  test now pins it.
 - **`installs.first_seen_day` is the earliest day seen**, not the first batch to
   arrive: an older offline batch delivered second now moves it earlier.
 - **Rate-limit buckets are per endpoint**, so the public write key presented to a

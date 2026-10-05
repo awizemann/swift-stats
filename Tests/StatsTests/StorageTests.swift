@@ -36,6 +36,7 @@ struct StorageTests {
             uuidProvider: FixedUUIDProvider(Harness.defaultUUIDs),
             randomSource: FixedRandomSource()
         )
+        configuration.identitySuiteDirectory = IsolatedDefaults.directory(appId: appId)
         var context = Harness.exampleContext
         context.bundleId = appId
         configuration.contextOverride = context
@@ -53,7 +54,7 @@ struct StorageTests {
         let appId = "com.example.lazy\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         defer {
             try? FileManager.default.removeItem(at: directory)
-            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+            IsolatedDefaults.remove(appId: appId)
         }
 
         let sink = InMemorySink()
@@ -100,7 +101,7 @@ struct StorageTests {
         let appId = "com.example.lazylife\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         defer {
             try? FileManager.default.removeItem(at: directory)
-            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+            IsolatedDefaults.remove(appId: appId)
         }
 
         let sink = InMemorySink()
@@ -130,7 +131,7 @@ struct StorageTests {
         let appId = "com.example.lazynone\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         defer {
             try? FileManager.default.removeItem(at: directory)
-            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+            IsolatedDefaults.remove(appId: appId)
         }
 
         let sink = InMemorySink()
@@ -166,7 +167,7 @@ struct StorageTests {
         let appDirectory = queue.deletingLastPathComponent().deletingLastPathComponent()
         defer {
             try? FileManager.default.removeItem(at: appDirectory)
-            UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+            IsolatedDefaults.remove(appId: appId)
         }
 
         let clock = ManualClock()

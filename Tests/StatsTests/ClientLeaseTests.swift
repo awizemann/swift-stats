@@ -144,7 +144,6 @@ struct ClientLeaseTests {
     func sharedStorageDirectory() async {
         let harness = Harness(flushAt: 10_000)
         let otherAppId = "com.example.shared\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
-        defer { UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: otherAppId)) }
         let otherSink = InMemorySink()
         var configuration = harness.configuration
         configuration.appId = otherAppId
@@ -203,7 +202,7 @@ struct ClientLeaseTests {
         await flush.value
         await consent.value
 
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.bool(forKey: "consentRecorded") == true)
         #expect(suite?.integer(forKey: "consent") == StatsConsent.none.rawValue)
         #expect(await settings.currentConsent == .none)

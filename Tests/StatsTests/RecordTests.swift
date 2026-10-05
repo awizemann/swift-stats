@@ -103,7 +103,7 @@ struct RecordTests {
         #expect(await harness.client.queuedEventCount == 0)
         harness.clock.cancelAllSleepers()
         try? FileManager.default.removeItem(at: harness.directory)
-        UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: harness.appId))
+        IsolatedDefaults.remove(appId: harness.appId)
     }
 
     /// `seq` is cached in the actor now, so the thing that must still hold is
@@ -115,7 +115,7 @@ struct RecordTests {
         for index in 0..<5 {
             await harness.client.track("event_\(index)")
         }
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.integer(forKey: "seq") == 5, "the next seq was persisted before the hand-off")
 
         await harness.client.flush()

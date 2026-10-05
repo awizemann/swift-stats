@@ -575,6 +575,33 @@ describe('firstSeenFloorDay', () => {
     expect(await backfillMarker()).toBe(today(new Date()));
   });
 
+  it('is NOT null on a fresh deployment: 0005 writes the marker over an empty `events` table too', async () => {
+    // `resetDatabase` applies every migration to an empty database — exactly a
+    // fresh deployment. 0005's marker insert is unconditional (`date('now')`), so
+    // the floor is today − 89 here, not `null`. The README and the jsdoc used to
+    // promise `null` for this case; this pins what the shipped SQL actually does.
+    const events = await DB.prepare(`SELECT COUNT(*) AS n FROM events`).first<{ n: number }>();
+    expect(events?.n).toBe(0);
+    expect(await backfillMarker()).toBe(TODAY);
+    expect(await firstSeenFloorDay(DB, PROJECT)).toBe(addDays(TODAY, -(RAW_RETENTION_DAYS - 1)));
+  });
+
+  it('on a fresh deployment, ingest under the default window never writes a first_seen_day below the floor', async () => {
+    // Why a fresh deployment's non-null floor is harmless: under the default
+    // 90-day window ingest clamps an ancient `ts` to today − 89, which on the
+    // marker day IS the floor and on every later day is above it. So at most a
+    // backdated first sighting on the marker day itself lands ON the floor (and is
+    // conservatively labelled "may be earlier"); nothing lands below it.
+    const floor = (await firstSeenFloorDay(DB, PROJECT)) as string;
+    const response = await post(makeBatch({ events: [makeEvent({ ts: '2001-01-01T00:00:00.000Z' })] }));
+    expect(response.status).toBe(202);
+    const row = await DB.prepare(
+      `SELECT MIN(first_seen_day) AS day FROM installs WHERE project_id = ?1`,
+    ).bind(PROJECT).first<{ day: string }>();
+    expect(row?.day).toBe(rawCutoffDay(new Date()));
+    expect((row?.day as string) >= floor).toBe(true);
+  });
+
   it('is null with no marker — a deployment with nothing to distrust', async () => {
     await DB.prepare(`DELETE FROM backend_markers WHERE key = 'installs_backfill_day'`).run();
     expect(await firstSeenFloorDay(DB, PROJECT)).toBeNull();

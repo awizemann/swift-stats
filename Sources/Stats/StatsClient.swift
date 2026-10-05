@@ -337,7 +337,7 @@ public actor StatsClient {
         didPrepare = true
 
         let identity = StatsIdentityStore(
-            appId: configuration.appId, salt: configuration.installIdSalt
+            suiteName: configuration.identitySuiteName, salt: configuration.installIdSalt
         )
         self.identityStore = identity
 
@@ -514,7 +514,7 @@ public actor StatsClient {
         if let identityStore { return identityStore }
         logger.error("the identity store was missing after prepareIfNeeded(); reopening it")
         let reopened = StatsIdentityStore(
-            appId: configuration.appId, salt: configuration.installIdSalt
+            suiteName: configuration.identitySuiteName, salt: configuration.installIdSalt
         )
         identityStore = reopened
         return reopened

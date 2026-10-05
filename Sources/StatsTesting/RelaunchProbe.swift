@@ -59,7 +59,8 @@ public enum RelaunchProbe {
     ///     with a client your app or another test has live for the same app id
     ///     (which would own the app id and receive the calls), and leaves
     ///     nothing behind: the directory and the SDK's `UserDefaults` suite
-    ///     are removed afterwards. `false` uses the configuration as given,
+    ///     (kept in its own temporary directory, not in the user's
+    ///     preferences) are removed afterwards. `false` uses the configuration as given,
     ///     including any state already persisted for its app id.
     public static func installIDsAcrossRelaunch(
         configuration: StatsConfiguration,
@@ -68,6 +69,7 @@ public enum RelaunchProbe {
     ) async -> Observation? {
         var configuration = configuration
         var directory: URL?
+        var defaultsDirectory: URL?
         if isolated {
             let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
             configuration.appId = "\(configuration.appId).probe\(suffix)"
@@ -75,12 +77,15 @@ public enum RelaunchProbe {
                 .appendingPathComponent("swift-stats-probe-\(suffix)", isDirectory: true)
             configuration.storageDirectory = scratch
             directory = scratch
+            // Off `~/Library/Preferences`: see `IsolatedDefaults` for why
+            // removing the domain there is not enough.
+            let defaults = IsolatedDefaults.directory(named: "probe-\(suffix)")
+            configuration.identitySuiteDirectory = defaults
+            defaultsDirectory = defaults
         }
         defer {
-            if let directory {
-                try? FileManager.default.removeItem(at: directory)
-                UserDefaults().removePersistentDomain(forName: configuration.identitySuiteName)
-            }
+            if let directory { try? FileManager.default.removeItem(at: directory) }
+            if let defaultsDirectory { IsolatedDefaults.remove(defaultsDirectory) }
         }
 
         guard let before = await launch(configuration, eventName: eventName),

@@ -183,14 +183,29 @@ loopback only, and `CloudflareEndpoint` enforces exactly that.
   firstSeenFloorDay(db, projectId): Promise<string | null>
   ```
 
-  It returns that project's `rawCutoffDay(markerDay, retention_days)` — the oldest
-  day whose `first_seen_day` can be trusted. **Installs with `first_seen_day` ≤
+  It returns `rawCutoffDay(markerDay, 90)` = `markerDay − 89` — the raw boundary
+  as it stood on the day the backfill ran. **Installs with `first_seen_day` ≤
   that floor may have been first seen earlier;** everything above it is exact.
-  `null` means there is no marker (a fresh deployment, nothing backfilled) and
-  should be rendered as "all exact", never "unknown". It is per project, derived
-  from the same `retention_days` the sweep uses, so a longer window does not get
-  90 days of exact rows mislabelled. Annotate cohort charts that reach back past
-  the floor rather than serving the boundary spike as if it were real.
+  The floor is the same for every project and deliberately ignores
+  `retention_days`: that column did not exist when `0005` ran (`0006` adds it),
+  so the backfill's `MIN(day)` could reach back exactly 90 days for everyone, and
+  raising a project's window later does not change what the backfill saw.
+  Annotate cohort charts that reach back past the floor rather than serving the
+  boundary spike as if it were real.
+
+  **A fresh deployment gets a floor too, not `null`.** `0005` writes the marker
+  unconditionally, so a database created from scratch carries
+  `installs_backfill_day` = the day you ran the migrations, and the floor is that
+  day − 89. That is harmless: the backfill had nothing to copy, and under the
+  default window ingest clamps an old `ts` to today − 89, so no first sighting
+  lands below the floor (one backdated to the migration day itself can land *on*
+  it and is labelled conservatively). Only a project whose window you raise above
+  90 can store backdated first sightings below it, and those are labelled "may be
+  earlier" when they are exact. If you know the database was empty when `0005`
+  ran and want every row reported exact, delete the marker:
+  `DELETE FROM backend_markers WHERE key = 'installs_backfill_day'`. `null` is
+  returned only when the marker row is absent, and should be rendered as "all
+  exact", never "unknown".
 - **`installs` has no expiry, and that is a decision.** It grows with installs,
   not traffic — three short columns, one row per install ever — and a first-seen
   day that expired at the retention cutoff would answer nothing the rollups do
@@ -614,7 +629,7 @@ What is exported, and what each thing is for:
 | `rawBoundaryDay(db, projectId, now)` | the observed raw/rollup boundary: `today - 89`, or the project's oldest surviving raw day when that is older — never below its `raw_complete_from` |
 | `setProjectRetention(db, projectId, days, now?)` | the one way to change a project's retention window: moves `raw_complete_from` with it on an increase (§4) |
 | `firstSeenRows(db, projectId, fromDay, toDay)` | installs first seen per day — retention cohorts and "new installs"; **counts only, never an install id** |
-| `firstSeenFloorDay(db, projectId)` | oldest day whose `first_seen_day` is trustworthy, or `null` for none — label cohorts at or below it (§4) |
+| `firstSeenFloorDay(db, projectId)` | `installs_backfill_day − 89`, the same for every project (a fresh deployment too); `null` only if the marker row is absent — label cohorts at or below it (§4) |
 | `totalInstalls(db, projectId, throughDay?)` | installs ever seen, cumulative (a sum over `firstSeenRows` is not the total) |
 | `resolveDayRange` / `clampAndValidateDays` | the pure date rules, database-free |
 | `parseLimit` / `parseIncludeDebug` / `parseEventName` / `requireBothDays` | the same query-string parsing, so a consumer rejects exactly what the public API rejects |

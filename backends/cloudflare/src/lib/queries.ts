@@ -892,8 +892,8 @@ export async function totalInstalls(
 }
 
 /**
- * The oldest day this project's `first_seen_day` values can be trusted — or
- * `null` when every one of them is exact.
+ * The day at or below which `first_seen_day` values may be too recent — or
+ * `null` when the `installs_backfill_day` marker row is absent.
  *
  * Migration 0005 backfilled `installs` from whatever raw `events` rows were still
  * present, as `MIN(day)` per install. For an install whose first event was still
@@ -919,11 +919,21 @@ export async function totalInstalls(
  * (0007): it records later retention changes, which cannot have affected a
  * backfill that had already run.
  *
- * `null` means "no floor" and is the answer for a FRESH deployment: no marker row
- * means 0005 has not run against a populated `events` table under a schema that
- * records it, so there is no backfilled cohort to distrust and every
- * `first_seen_day` was written by ingest at the moment it happened. A consumer
- * should read `null` as "all exact", never as "unknown".
+ * A FRESH deployment is NOT `null`. 0005 writes the marker unconditionally
+ * (`date('now')`), including over an empty `events` table, so a database built
+ * from scratch returns `markerDay − 89` like any other. That is harmless rather
+ * than wrong: the backfill copied nothing, and under the default window ingest
+ * clamps an old `ts` to `today − 89`, which is the floor on the marker day and
+ * above it afterwards — so nothing lands below it, and at most a sighting
+ * backdated on the marker day itself lands ON it and is labelled conservatively.
+ * Only a project whose window is raised above 90 can store a (clamped, exact)
+ * first sighting below the floor, and it errs the same safe way. An operator who
+ * knows 0005 ran on an empty database may delete the marker row; deliberately
+ * not done here by guessing from the data, which cannot tell a backfilled row
+ * from an ingested one.
+ *
+ * `null` therefore means only "no marker row" (deleted by hand, or a schema that
+ * predates it never re-run): read it as "all exact", never as "unknown".
  *
  * Cheap: one indexed point lookup. `projectId` is accepted for API stability and
  * so the floor can become per project again if a future migration ever makes the

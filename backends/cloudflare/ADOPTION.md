@@ -614,23 +614,28 @@ The reader-facing half is one exported helper:
 firstSeenFloorDay(db: D1Database, projectId: string): Promise<string | null>
 ```
 
-It returns, for that project, **the oldest day whose `first_seen_day` can be
-trusted** — `rawCutoffDay(markerDay, project.retention_days)`, the oldest day
+It returns **`rawCutoffDay(markerDay, 90)` = `markerDay − 89`**, the oldest day
 that still had raw rows when the migration ran and therefore the oldest day the
 backfill's `MIN(day)` could possibly have returned. Read it as:
 
 > installs with `first_seen_day` **≤** this floor may have been first seen
 > earlier; everything strictly above it is exact.
 
-Two properties worth stating:
+Three properties worth stating:
 
-- **`null` means "no floor", i.e. all exact.** A fresh deployment has no marker
-  (or ran `0005` against an empty `events`), so there is no backfilled cohort to
-  distrust. A consumer must render `null` as "all exact", never as "unknown".
-- **It is per project.** The floor comes from the same `retention_days` the sweep
-  uses (§9), so a project keeping 180 days has a floor 90 days further back than
-  a default one. Deriving it from the global default would mark 90 days of exact
-  rows as suspect.
+- **It is the same for every project.** `retention_days` did not exist when
+  `0005` ran (`0006` adds it), so the backfill's reach was 90 days for everyone;
+  a project's current (or later raised) window does not move the floor.
+- **A fresh deployment gets a floor too, not `null`.** `0005` writes the marker
+  unconditionally, including over an empty `events` table, so the floor is the
+  day you ran the migrations − 89. Harmless: under the default window ingest
+  clamps an old `ts` to today − 89, so no first sighting lands below it (one
+  backdated on the migration day itself lands *on* it and is labelled
+  conservatively); only a project raised above 90 days can store backdated, exact
+  first sightings below it, and they err the same safe way. An operator who knows
+  the database was empty when `0005` ran may delete the marker row.
+- **`null` means only "no marker row", i.e. all exact.** A consumer must render
+  `null` as "all exact", never as "unknown".
 
 Not a `first_seen_is_exact` column on `installs`: that would be a per-row flag
 carrying one repository-wide fact, and it would have to be written for every

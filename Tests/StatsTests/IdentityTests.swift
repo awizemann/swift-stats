@@ -96,6 +96,18 @@ struct IdentityTests {
         await harness.tearDown()
     }
 
+    /// Every other test moves the suite into a temporary directory so a run
+    /// leaves nothing in `~/Library/Preferences`; this pins what production
+    /// uses, without touching disk.
+    @Test("Without a test directory the suite is com.wizemann.stats.<appId>; with one it is an absolute path inside it")
+    func suiteNaming() {
+        var configuration = StatsConfiguration(appId: "com.example.App", installIdSalt: "s", sink: InMemorySink())
+        #expect(configuration.identitySuiteDirectory == nil)
+        #expect(configuration.identitySuiteName == "com.wizemann.stats.com.example.App")
+        configuration.identitySuiteDirectory = URL(fileURLWithPath: "/tmp/defaults", isDirectory: true)
+        #expect(configuration.identitySuiteName == "/tmp/defaults/com.wizemann.stats.com.example.App")
+    }
+
     @Test("The persisted defaults live in the SDK's own suite, never in .standard")
     func ownSuite() async {
         let harness = Harness()
@@ -103,7 +115,7 @@ struct IdentityTests {
         await harness.client.flush()
         await harness.client.waitForFlushes()
 
-        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        let suite = UserDefaults(suiteName: harness.configuration.identitySuiteName)
         #expect(suite?.string(forKey: "installUUID") != nil)
         #expect(UserDefaults.standard.string(forKey: "installUUID") == nil)
         await harness.tearDown()

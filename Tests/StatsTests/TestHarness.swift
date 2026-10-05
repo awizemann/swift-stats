@@ -87,6 +87,11 @@ final class Harness: Sendable {
             randomSource: random
         )
         if !sdkDefaultConsent { configuration.consent = consent }
+        // The suite lives in a per-app-id temporary directory, never in
+        // `~/Library/Preferences` (see `IsolatedDefaults`). Same app id, same
+        // directory: a relaunched harness reopens the same suite. Swept at
+        // process exit if a test never reaches `tearDown()`.
+        configuration.identitySuiteDirectory = IsolatedDefaults.directory(appId: appId)
         // `package`, not part of the public init: see StatsConfiguration.
         configuration.contextOverride = context
         self.configuration = configuration
@@ -126,12 +131,13 @@ final class Harness: Sendable {
     }
 
     /// Cancels scheduled work first, then releases anything still suspended on
-    /// the manual clock, then removes both the queue file and the defaults suite.
+    /// the manual clock, then removes both the queue file and the defaults suite
+    /// (its whole directory — see `IsolatedDefaults`).
     func tearDown() async {
         await client.shutdown()
         clock.cancelAllSleepers()
         try? FileManager.default.removeItem(at: directory)
-        UserDefaults().removePersistentDomain(forName: StatsIdentityStore.suiteName(appId: appId))
+        IsolatedDefaults.remove(appId: appId)
     }
 
     // No `drive(untilBatches:)` / `yieldUntil` any more: both spent a fixed
@@ -139,4 +145,12 @@ final class Harness: Sendable {
     // exhaust before a retry task had even registered its sleep. Await the
     // progress itself instead — `ManualClock.waitForSleepers(count:)` and
     // `InMemorySink.waitForBatches(_:)` are signalled by the event.
+}
+
+extension IsolatedDefaults {
+    /// The created, tracked suite directory for `appId`; idempotent.
+    static func directory(appId: String) -> URL { directory(named: appId) }
+
+    /// Removes the suite directory for `appId` (it need not exist).
+    static func remove(appId: String) { remove(path(named: appId)) }
 }
