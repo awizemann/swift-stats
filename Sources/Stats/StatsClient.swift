@@ -254,8 +254,8 @@ public actor StatsClient {
         )
         self.identityStore = identity
 
-        // The persisted choice wins; the configuration's values apply only the
-        // first time this app runs (§11).
+        // A persisted choice wins; the configuration's values apply until one
+        // exists. Only `setConsent` / `setEnabled` persist (§11).
         self.consent = identity.storedConsent ?? configuration.consent
         self.enabled = identity.storedEnabled ?? configuration.enabled
         self.userIdHash = self.consent.contains(.identity) ? identity.userIdHash : nil

@@ -188,6 +188,23 @@ struct ConsentTests {
         await relaunched.tearDown()
     }
 
+    /// Only `setConsent` persists a choice, so an app that never called it is
+    /// repaired by changing its configuration: the next launch uses the new
+    /// value. The setup guide's "change the factory to `.all`" advice for apps
+    /// without a consent UI depends on exactly this.
+    @Test("Without a setConsent call, a changed configuration applies on relaunch")
+    func configuredConsentAppliesUntilSetConsent() async {
+        let harness = Harness(consent: .default)
+        await harness.client.track("a")
+        await harness.client.shutdown()
+        harness.clock.cancelAllSleepers()
+
+        let relaunched = harness.relaunched(consent: .all)
+        #expect(await relaunched.client.currentConsent == .all)
+        #expect(await relaunched.client.hasStableInstallIdentity == true)
+        await relaunched.tearDown()
+    }
+
     // MARK: - Stable install identity
 
     /// The per-session-install warning is said at the first ephemeral mint,
