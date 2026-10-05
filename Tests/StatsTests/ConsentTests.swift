@@ -183,7 +183,110 @@ struct ConsentTests {
         // The relaunch asks for everything; the recorded choice must stand.
         let relaunched = harness.relaunched(consent: .all)
         #expect(await relaunched.client.currentConsent == [.usage])
+        // The stored choice, not the configuration's `.all`, decides it.
+        #expect(await relaunched.client.hasStableInstallIdentity == false)
         await relaunched.tearDown()
+    }
+
+    // MARK: - Stable install identity
+
+    /// The per-session-install warning is said at the first ephemeral mint,
+    /// once per client. Under the default configuration — no auto-events at
+    /// all — a plain `track()` is enough to trigger it.
+    @Test("Default consent warns once at the first ephemeral install id, not again next session")
+    func ephemeralInstallWarnsOncePerClient() async {
+        let harness = Harness(consent: .default, sessionGap: .seconds(300))
+        #expect(await harness.client.ephemeralInstallWarningCount == 0, "nothing is minted before a session")
+
+        await harness.client.track("a")
+        #expect(await harness.client.ephemeralInstallWarningCount == 1)
+
+        // A second session mints a second ephemeral id, but the client has
+        // already said it.
+        harness.clock.advance(by: .seconds(400))
+        await harness.client.track("b")
+        #expect(await harness.client.ephemeralInstallWarningCount == 1)
+        await harness.client.flush()
+        await harness.client.waitForFlushes()
+        let events = await harness.sink.sentEvents
+        #expect(events.count == 2)
+        #expect(events[0].installId != events[1].installId, "two sessions, two ephemeral ids")
+        await harness.tearDown()
+    }
+
+    @Test("With identity granted, no warning")
+    func stableInstallDoesNotWarn() async {
+        let harness = Harness(consent: .all, sessionGap: .seconds(300))
+        await harness.client.track("a")
+        harness.clock.advance(by: .seconds(400))
+        await harness.client.track("b")
+        #expect(await harness.client.ephemeralInstallWarningCount == 0)
+        #expect(await harness.client.hasStableInstallIdentity == true)
+        await harness.tearDown()
+    }
+
+    /// Why the warning is evaluated lazily: an app that ships the default
+    /// configuration but grants `.identity` before its first session never
+    /// mints an ephemeral id, and must not be told it did.
+    @Test("Granting identity before the first session means no warning")
+    func grantBeforeFirstSessionDoesNotWarn() async {
+        let harness = Harness(consent: .default)
+        let current = await harness.client.currentConsent
+        await harness.client.setConsent(current.union(.identity))
+        await harness.client.track("a")
+        #expect(await harness.client.ephemeralInstallWarningCount == 0)
+        await harness.tearDown()
+    }
+
+    /// The stored choice, not the configuration, decides: a relaunch that
+    /// configures `.all` over a stored `[.usage]` still mints ephemeral ids.
+    @Test("A stored consent without identity warns even when the configuration grants it")
+    func storedConsentWithoutIdentityWarns() async {
+        let harness = Harness(consent: .all)
+        await harness.client.setConsent([.usage])
+        await harness.client.shutdown()
+        harness.clock.cancelAllSleepers()
+
+        let relaunched = harness.relaunched(consent: .all)
+        await relaunched.client.track("a")
+        #expect(await relaunched.client.ephemeralInstallWarningCount == 1)
+        await relaunched.tearDown()
+    }
+
+    /// The migration an app shipped with the default consent has to make:
+    /// adding `.identity` to whatever is current. That is a pure grant, so it
+    /// must not be mistaken for a revocation — the queue survives, `seq` keeps
+    /// counting, and the next session runs under one persisted install UUID.
+    @Test("Adding .identity to the current consent keeps the queue and seq, and stabilizes the install")
+    func grantingIdentityIsMigrationSafe() async {
+        let harness = Harness(consent: .default, sessionGap: .seconds(300))
+        await harness.client.track("a")
+        await harness.client.track("b")
+        #expect(await harness.client.hasStableInstallIdentity == false)
+
+        let current = await harness.client.currentConsent
+        await harness.client.setConsent(current.union(.identity))
+
+        #expect(await harness.client.hasStableInstallIdentity == true)
+        #expect(await harness.client.currentConsent == .all)
+        #expect(await harness.client.queuedEventCount == 2, "a grant must not discard the queue")
+
+        // Two later sessions, both under the newly granted identity.
+        harness.clock.advance(by: .seconds(400))
+        await harness.client.track("c")
+        harness.clock.advance(by: .seconds(400))
+        await harness.client.track("d")
+        await harness.client.flush()
+        await harness.client.waitForFlushes()
+
+        let events = await harness.sink.sentEvents
+        #expect(events.map(\.name) == ["a", "b", "c", "d"])
+        #expect(events.map(\.seq) == [0, 1, 2, 3], "a grant must not reset seq")
+        #expect(events[2].installId == events[3].installId, "the install is now stable across sessions")
+        #expect(events[0].installId != events[2].installId, "the pre-grant id was ephemeral")
+        let suite = UserDefaults(suiteName: StatsIdentityStore.suiteName(appId: harness.appId))
+        #expect(suite?.string(forKey: "installUUID") != nil)
+        await harness.tearDown()
     }
 
     @Test("Disabled: nothing is captured and the queue is cleared")

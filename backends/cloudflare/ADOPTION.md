@@ -520,6 +520,12 @@ every distinct install in it, in the *same* `db.batch()` as the events. The read
 side is two functions in `src/lib/queries.ts`: `firstSeenRows` (per-day counts)
 and `totalInstalls` (cumulative).
 
+These count `install_id`s, so they are only install counts for emitters that
+grant `identity` consent. Under the SDK's default consent (`identity` withheld,
+§11) every session has its own `install_id`, so install-based metrics
+(installs, active installs, first-seen installs, retention) count sessions.
+A stable install needs `.identity` granted, not `identify(userID:)`.
+
 **Why (what is otherwise unrecoverable).** Raw events are deleted at the
 retention cutoff, and the rollups that outlive them store per-day **distinct
 counts**. A distinct count cannot answer "was this install new that day?". So

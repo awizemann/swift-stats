@@ -140,6 +140,11 @@ public actor StatsClient {
     /// requires `seq` to be strictly increasing per install; a gap is allowed,
     /// a repeat is not.
     private var nextSeqValue = 0
+    /// How many times this client has warned that its install id is
+    /// per-session. At most 1: the warning is said once per client, the first
+    /// time a session mints an ephemeral id. Internal so tests can assert on
+    /// exactly that, which a log line alone would not let them do.
+    private(set) var ephemeralInstallWarningCount = 0
     /// Bumped synchronously by every teardown that discards the queue
     /// (`setConsent` revocation, `setEnabled(false)`). A drain that is already
     /// suspended in `dispatcher.enqueue(...)` compares the value it captured
@@ -499,6 +504,26 @@ public actor StatsClient {
         return consent
     }
 
+    /// Whether sessions started from now on carry a stable `installId`.
+    ///
+    /// `true` means the current consent includes `.identity`, so each new
+    /// session uses the hash of the stored install UUID, which persists across
+    /// sessions and launches. `false` means each new session mints its own
+    /// ephemeral install id, so install-based metrics (installs, active
+    /// installs, first-seen installs, retention) count sessions.
+    ///
+    /// It reports the policy, not the id already in use. It reflects the
+    /// current — possibly persisted — consent, so it changes after
+    /// ``setConsent(_:)``, but a grant made mid-session does not re-stamp that
+    /// session: its events keep the per-session id until the next session
+    /// starts. And the stored UUID is not permanent: revoking **any** consent
+    /// group deletes it, so the next identified session mints a new one.
+    /// `identify(userID:)` plays no part in any of this.
+    public var hasStableInstallIdentity: Bool {
+        prepareIfNeeded()
+        return consent.contains(.identity)
+    }
+
     /// Records a consent choice.
     ///
     /// Any group going from granted to denied is a **revocation**: the local
@@ -833,6 +858,7 @@ public actor StatsClient {
             sessionInstallId = identity.installId(for: uuid)
         } else {
             sessionInstallId = identity.installId(for: configuration.uuidProvider.uuid())
+            warnEphemeralInstallOnce()
         }
 
         let sampled = configuration.contextOverride ?? StatsEnvironment.sampleContext(
@@ -852,6 +878,25 @@ public actor StatsClient {
         // Auto-events reach disk before the event that opened the session, in
         // the order §12 fixes.
         await drainPending()
+    }
+
+    /// Says once per client that the install id it just minted is per-session.
+    ///
+    /// The default consent withholds `identity`, so an app that never grants it
+    /// gets a fresh install id every session — and install-based metrics that
+    /// silently count sessions. Evaluated here, at the first mint, rather than
+    /// at configuration time: that is the only point at which it is certainly
+    /// true. An app that grants `.identity` before its first session, or that
+    /// starts disabled and never opens one, is never warned.
+    private func warnEphemeralInstallOnce() {
+        guard ephemeralInstallWarningCount == 0 else { return }
+        ephemeralInstallWarningCount += 1
+        logger.warning("""
+            identity consent is not granted, so installId is per-session: \
+            install-based metrics (installs, active installs, first-seen installs, retention) \
+            will count sessions. Grant .identity (e.g. consent: .all) for a stable install; \
+            identify() is not needed
+            """)
     }
 
     /// Enqueues an auto-event without re-entering session bookkeeping — the

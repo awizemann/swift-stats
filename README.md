@@ -112,8 +112,11 @@ func makeStats(writeKey: String) throws -> StatsClient {
 let stats = try makeStats(writeKey: writeKey)
 
 // 2. Consent already defaults to [.usage, .diagnostics], so this line is only
-//    needed to CHANGE it — to grant .identity (a stable install id + userId), or
-//    to pass .none if your policy wants collect-nothing-until-asked.
+//    needed to CHANGE it — to grant .identity (a stable install id, and a userId
+//    only if you also call identify()), or to pass .none if your policy wants
+//    collect-nothing-until-asked. Without .identity the install id is
+//    per-session, so install-based metrics (installs, active installs,
+//    first-seen installs, retention) count sessions.
 await stats.setConsent([.usage, .diagnostics])   // .identity withheld → per-session id
 
 // 3. Record. Names are snake_case; props are flat and never carry user text.

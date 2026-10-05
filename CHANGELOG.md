@@ -9,6 +9,25 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+### Added
+
+- **`StatsClient.hasStableInstallIdentity`** — `true` when the current
+  (possibly persisted) consent includes `.identity`, so sessions started from
+  now on carry a stable `installId`. Changes after `setConsent(_:)`; a
+  mid-session grant takes effect at the next session.
+- **A `warning` log, once per client** (category `Client`), the first time a
+  session mints an ephemeral install id because `identity` is not granted —
+  which is the default. Install-based metrics (installs, active installs,
+  first-seen installs, retention) then count sessions. No values are logged.
+
+### Documentation
+
+- `StatsConsent.identity` / `.default`, the README quick start and the
+  Cloudflare `ADOPTION.md` `installs` section now say plainly that without
+  `.identity` install-based metrics (installs, active installs, first-seen
+  installs, retention) count sessions, and that
+  `identify(userID:)` is not needed for a stable install.
+
 ## [backend-cloudflare-0.3.0] — 2026-08-19
 
 **Cloudflare backend `0.3.0` — key liveness, first-seen installs, per-project
