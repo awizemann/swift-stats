@@ -491,8 +491,10 @@ Check your implementation against the test vector: account id `account-1`, salt
   project's `raw_complete_from` (§4): there the rollup is the real history and
   raw rows are only late arrivals. A day that still has **other** rows keeps its
   rollup, stale until the next nightly pass re-rolls it (the last few days) or
-  until the day ages out and is re-rolled from its raw rows (older days); reads
-  serve such a day from its raw rows meanwhile.
+  until the day ages out and is re-rolled from its raw rows (older days). A
+  day inside the raw-read window is served from its raw rows meanwhile; one
+  below the clock cutoff is served from that stale rollup until the sweep
+  re-rolls it.
 
 **Late events: the tombstone.** Erasing the stored rows is not the end of it: a
 device can still hold events captured under the hash — a queue on disk while the
