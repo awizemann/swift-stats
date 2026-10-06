@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // stats-worker admin CLI — create projects, mint and revoke keys, erase an
-// install. Node 20+, no dependencies.
+// install or one user. Node 20+, no dependencies.
 //
 // It generates SQL and (unless you pass --dry-run) hands it to
 // `wrangler d1 execute`. Nothing here talks to D1 directly, so there is no
@@ -16,10 +16,12 @@
 //   node scripts/admin.mjs create-project overwatch "Overwatch" --local
 //   node scripts/admin.mjs mint-key overwatch write --label "macOS 1.4" --local
 //   node scripts/admin.mjs mint-key overwatch read  --label "Overwatch app" --local
+//   node scripts/admin.mjs mint-key overwatch admin --label "account server" --local
 //   node scripts/admin.mjs list-keys overwatch --local
 //   node scripts/admin.mjs set-retention overwatch 180 --local
 //   node scripts/admin.mjs revoke-key <key-hash> --local
 //   node scripts/admin.mjs delete-install <installId> --local
+//   node scripts/admin.mjs delete-user overwatch <userIdHash> --unlink|--delete --local
 //
 // Add --remote instead of --local to act on the deployed database. --dry-run
 // prints the SQL and exits, which is the safe way to review a destructive one.
@@ -31,6 +33,43 @@ const DB_NAME = 'stats';
 const PROJECT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const INSTALL_ID_RE = /^[0-9a-f]{64}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
+// Mirrors USER_ID_HASH_RE in src/lib/erase.ts: the SDK's `userId` is
+// lowercaseHex(SHA256(userID + installIdSalt)), never the raw account id.
+const USER_ID_HASH_RE = /^[0-9a-f]{64}$/;
+// Mirrors ERASE_CHUNK_ROWS in src/lib/erase.ts — rows per statement, so each one
+// finishes far inside D1's per-statement time limit.
+const ERASE_CHUNK_ROWS = 5000;
+
+// `delete-user`'s statements — VERBATIM the template literals of the same names
+// in src/lib/erase.ts (this script cannot import TypeScript). The test suite
+// compares the texts (test/erase.test.ts), so an edit to one alone fails it.
+// Placeholders: ?1 project id, ?2 user hash, ?3 chunk size, ?4 now; `{table}`
+// a rollup table.
+const ERASE_ROLLUP_TABLES = ['daily_rollups', 'daily_event_rollups', 'daily_prop_rollups'];
+const ERASE_TOMBSTONE_SQL = `INSERT INTO erased_users (project_id, user_id, mode, erased_at)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT (project_id, user_id) DO UPDATE
+  SET mode = CASE WHEN erased_users.mode = 'delete' THEN 'delete' ELSE excluded.mode END,
+      erased_at = excluded.erased_at`;
+const CHUNK_IDS = `SELECT id FROM events WHERE project_id = ?1 AND user_id = ?2 ORDER BY id LIMIT ?3`;
+const ERASE_UNLINK_SQL = `UPDATE events SET user_id = NULL WHERE id IN (${CHUNK_IDS})`;
+const ERASE_DELETE_SQL = `DELETE FROM events WHERE id IN (${CHUNK_IDS})`;
+const ERASE_CLEAR_ROLLUPS_SQL = `DELETE FROM {table}
+ WHERE project_id = ?1
+   AND day IN (SELECT day FROM events WHERE id IN (${CHUNK_IDS}))
+   AND day >= COALESCE((SELECT raw_complete_from FROM projects WHERE id = ?1), '')
+   AND NOT EXISTS (SELECT 1 FROM events e
+                    WHERE e.project_id = ?1 AND e.day = {table}.day
+                      AND e.id NOT IN (${CHUNK_IDS}))`;
+
+/** Substitute `?N` placeholders with already-quoted SQL values, highest N first. */
+function bindSql(sql, values) {
+  let out = sql;
+  for (let i = values.length; i >= 1; i -= 1) out = out.replaceAll(`?${i}`, values[i - 1]);
+  return out.replace(/\s+/g, ' ');
+}
+// Per kind; mirrors KEY_PREFIXES in src/keys.ts (the cross-repo key format).
+const KEY_PREFIXES = { write: 'sk_stats', read: 'rk_stats', admin: 'ak_stats' };
 // Mirrors MIN_RETENTION_DAYS / MAX_RETENTION_DAYS in src/dates.ts. Duplicated
 // rather than imported: this script is dependency-free Node and deliberately
 // does not load the Worker's TypeScript.
@@ -121,7 +160,7 @@ async function mint(kind) {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   const b64 = Buffer.from(bytes).toString('base64url');
-  const key = `${kind === 'write' ? 'sk_stats' : 'rk_stats'}_${b64}`;
+  const key = `${KEY_PREFIXES[kind]}_${b64}`;
   return { key, hash: await sha256Hex(key) };
 }
 
@@ -157,6 +196,25 @@ function query(sql) {
     return first?.results ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Run one data-changing statement quietly (no output unless it fails).
+ *
+ * For `delete-user`'s loop, which would otherwise print wrangler's banner once
+ * per chunk. It does not report a changed-row count, on purpose: `wrangler d1
+ * execute --local --json` omits `meta.changes` (only `--remote` reports it), so
+ * the loop decides "done" by asking the table instead — which is also the
+ * question that matters ("is anything still linked?"), not a proxy for it.
+ */
+function executeQuiet(sql) {
+  const args = ['d1', 'execute', DB_NAME, local ? '--local' : '--remote', ...configArgs, '--command', sql];
+  if (!local) args.push('--yes');
+  const result = spawnSync('wrangler', args, { encoding: 'utf8' });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr ?? '');
+    die(`wrangler exited with ${result.status ?? 'a signal'} (re-run the same command to resume)`);
   }
 }
 
@@ -209,7 +267,7 @@ switch (command) {
   case 'mint-key': {
     const [projectId, kind] = rest;
     if (!projectId || !PROJECT_ID_RE.test(projectId)) die('project id must match [A-Za-z0-9._-]{1,64}');
-    if (kind !== 'write' && kind !== 'read') die("kind must be 'write' or 'read'");
+    if (!Object.hasOwn(KEY_PREFIXES, kind ?? '')) die("kind must be 'write', 'read' or 'admin'");
     // BEFORE minting: a key printed for a nonexistent project looks entirely
     // valid and 401s forever, and §8 makes that 401 indistinguishable from a
     // revoked key.
@@ -230,6 +288,10 @@ switch (command) {
     if (kind === 'write') {
       console.log('  Ships inside the app binary; grants append-only access to');
       console.log('  this one project (schema §2.4). Safe to embed, by design.');
+    } else if (kind === 'admin') {
+      console.log('  Grants ONLY POST /v1/users/erase for this project (schema §8.4):');
+      console.log('  it cannot ingest or read. MUST NOT ship in an app: keep it on');
+      console.log("  the server that handles account deletion, in its secret store.");
     } else {
       console.log('  MUST NOT be embedded in a shipped client app (schema §8).');
       console.log('  Keychain / a server-side secret store only.');
@@ -309,15 +371,117 @@ switch (command) {
     break;
   }
 
+  case 'delete-user': {
+    const [projectId, userIdHash] = rest;
+    if (!projectId || !PROJECT_ID_RE.test(projectId)) die('project id must match [A-Za-z0-9._-]{1,64}');
+    if (!userIdHash || !USER_ID_HASH_RE.test(userIdHash)) {
+      die(
+        'userIdHash must be 64 lowercase hex: the SHA-256 of userID + installIdSalt the SDK sends,\n' +
+          '  never the account id itself (README "Erasing one user")',
+      );
+    }
+    // The mode is REQUIRED, as on the endpoint: the two differ in whether data
+    // survives, so neither is a default. And a misspelled flag (`--unlnk`) must
+    // not fall through to whichever mode happens to be the fallback.
+    const allowed = new Set(['--unlink', '--delete', '--local', '--remote', '--dry-run']);
+    for (const f of flags) if (!allowed.has(f)) die(`unknown flag for delete-user: ${f}`);
+    if (flags.has('--unlink') === flags.has('--delete')) die('pass exactly one of --unlink or --delete');
+    const mode = flags.has('--unlink') ? 'unlink' : 'delete';
+
+    // The same statements as POST /v1/users/erase (src/lib/erase.ts), as SQL
+    // for `wrangler d1 execute`, which has no loop and no binding — so the loop
+    // is here and each chunk is its own command. Scoped to ONE project: the same
+    // hash in another project is a different person's link and is untouched.
+    // `installs` is deliberately NOT touched (see src/lib/erase.ts); to erase a
+    // whole install too, use delete-install.
+    const P = q(projectId);
+    const H = q(userIdHash);
+    const N = String(ERASE_CHUNK_ROWS);
+    const tombstoneSql =
+      bindSql(ERASE_TOMBSTONE_SQL, [P, H, q(mode), "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"]) + ';';
+    // A delete chunk is the rollup clears THEN the delete, in one command, the
+    // order the endpoint's batch uses: the clears compute the days the chunk
+    // empties from the chunk's own rows, in SQL, so nothing is read between
+    // statements. Whether wrangler runs a multi-statement `--command` as one
+    // transaction is wrangler's business; if it does not and a run dies
+    // between the clears and the delete, the clears were for rows that are
+    // still there: a day inside the raw-read window reads from those rows
+    // meanwhile (one below the clock cutoff reads empty until the nightly
+    // sweep re-rolls it), the rerun recomputes the same days and finishes, and
+    // a day never finished is re-rolled from its raw rows by the nightly job.
+    const chunkSql =
+      mode === 'unlink'
+        ? bindSql(ERASE_UNLINK_SQL, [P, H, N]) + ';'
+        : [
+            ...ERASE_ROLLUP_TABLES.map(
+              (table) => bindSql(ERASE_CLEAR_ROLLUPS_SQL.replaceAll('{table}', table), [P, H, N]) + ';',
+            ),
+            bindSql(ERASE_DELETE_SQL, [P, H, N]) + ';',
+          ].join('\n');
+    const countSql =
+      `SELECT COUNT(*) AS n FROM events WHERE project_id = ${P} AND user_id = ${H};`;
+
+    console.log('\n--- SQL (the tombstone, then one chunk, repeated until the count reaches 0) ---');
+    console.log(tombstoneSql);
+    console.log(chunkSql);
+    console.log(countSql);
+    if (dryRun) {
+      console.log('\n(--dry-run: nothing executed)');
+      break;
+    }
+    if (!local && !remote) die('pass --local or --remote (or --dry-run to just print the SQL)');
+    requireProjectExists(projectId);
+
+    // The tombstone FIRST, as the endpoint does, so ingest stops adding rows
+    // for this hash before the chunks start (README "Erasing one user").
+    executeQuiet(tombstoneSql);
+
+    // Count, erase a chunk, count again, until nothing is left. Each pass is
+    // idempotent ("whatever is still linked"), so an interrupted run is resumed
+    // by running the same command again. The count rides the `events_user`
+    // partial index (0009): it reads this user's rows, not the project's.
+    const remaining = () => {
+      const rows = query(countSql);
+      const n = rows?.[0]?.n;
+      if (typeof n !== 'number') die('could not count the remaining events; stopping (re-run to resume)');
+      return n;
+    };
+    const total = remaining();
+    console.log(`\n${total} event(s) linked to this userId in project "${projectId}".`);
+    let left = total;
+    while (left > 0) {
+      executeQuiet(chunkSql);
+      const after = remaining();
+      // A chunk that erased nothing while rows remain would loop forever.
+      if (after >= left) die(`no progress (${after} still linked); stopping`);
+      left = after;
+      console.log(`  ${mode === 'unlink' ? 'unlinked' : 'deleted'} ${total - left} of ${total}`);
+    }
+    console.log(`\nDone: ${total} event(s) ${mode === 'unlink' ? 'unlinked' : 'deleted'} in project "${projectId}".`);
+    if (mode === 'unlink') {
+      console.log('Rollups are unchanged and stay exact: none of them ever held a userId.');
+      console.log('Unlinking is final for these rows: a later --delete for this userId');
+      console.log('cannot find them (nothing ties them to it any more).');
+    } else {
+      console.log('Rollups of days left with no events were cleared (never below the');
+      console.log("project's raw_complete_from); days with other events are recomputed by");
+      console.log('the next nightly re-roll or at age-out. See README "Erasing one user".');
+    }
+    console.log('A tombstone keeps ingest from re-linking this userId for the project\'s');
+    console.log('retention window plus 30 days.');
+    break;
+  }
+
   default:
     console.log(`stats-worker admin
 
   create-project <id> <name>
-  mint-key <projectId> write|read [--label "text"]
+  mint-key <projectId> write|read|admin [--label "text"]
   set-retention <projectId> <days>          # raw-event window, 90-400
   list-keys <projectId>
   revoke-key <key-hash>
   delete-install <installId>
+  delete-user <projectId> <userIdHash> --unlink|--delete   # --unlink keeps the events
 
 Flags: --local | --remote | --dry-run`);
     process.exit(command === undefined ? 0 : 1);

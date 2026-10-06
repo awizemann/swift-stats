@@ -28,6 +28,68 @@ package; schema changes are called out explicitly below.
 No wire-schema change (`schema` stays `v1`); `docs/schema.md` §2.5 now names
 `forgetUser()` and spells out the hash.
 
+## [backend-cloudflare-0.5.0] — 2026-10-05
+
+### Added
+
+- **`POST /v1/users/erase` — erasing one user** (schema §8.4). An app that calls
+  `identify()` can now honour "delete my account": its server sends
+  `{projectId, userId, mode}` with an admin key, where `userId` is the 64-hex
+  hash the SDK sent (`SHA256(accountID + installIdSalt)`) and `mode` — required —
+  is `"unlink"` (keep the events, null their `user_id`; rollups stay exact) or
+  `"delete"` (remove the events; a day the delete leaves with no raw rows has
+  its rollups cleared in the same transaction, never below the project's
+  `raw_complete_from`, and a day with other rows keeps a stale rollup until the
+  next nightly re-roll or its age-out re-roll — raw rows serve it meanwhile).
+  `unlink` is final for the rows it touches: a later `delete` cannot find them.
+  One project only — the same hash elsewhere is untouched — and `installs` is
+  never touched. Bounded per call (4 × 5,000 rows: the D1 database is shared and
+  serialises queries); answers `{done, affected}` and the caller repeats until
+  `done`. Idempotent. README §10 "Erasing one user" has the hash recipe in
+  Swift, Node and shell.
+- **Erase tombstones** (`erased_users`). Each erase records the project, hash,
+  mode and time, and ingest checks a batch's `userId`s against it (one lookup,
+  only for batches that carry one, and re-checked inside the insert so an erase
+  that completes mid-batch cannot leave rows linked): late events for an
+  unlinked hash are stored without it, late events for a deleted hash are
+  dropped and still acknowledged with 202. `delete` beats a later `unlink`. The hash is kept for the project's
+  raw-retention window plus 30 days after the last erase call, ignored by ingest
+  after that and purged by the nightly job; a queue held offline longer than
+  that can still re-link its own events (ingest accepts events of any age, so
+  the bound is a choice, documented as such).
+- **Admin keys** (`ak_stats_…`, kind `admin`): grant the erase endpoint for
+  their project and nothing else — 401 on ingest and reads, and write/read keys
+  401 on erase, indistinguishable from an unknown key. For a server, never an
+  app. `admin.mjs mint-key <projectId> admin`; own 120/min pre-auth bucket.
+- **`eraseUserChunk(db, projectId, userIdHash, mode, options?)`** exported from
+  `stats-worker/lib`, so the dashboard runs the same erase directly against D1
+  (after its own authorization).
+- **`admin.mjs delete-user <projectId> <userIdHash> --unlink|--delete`** —
+  exactly one mode is required and unknown flags are refused; writes the same
+  tombstone and runs the same statements as the endpoint (a test compares the
+  texts); chunked and resumable, with `--dry-run`.
+
+### Migration
+
+`0009_admin_keys_and_user_index.sql`, **required** by the new code: rebuilds
+`keys` to allow `kind = 'admin'` (every row, column, the foreign-key cascade and
+`keys_by_project` carried over unchanged; `keys` is small, so it is cheap), adds
+`events_user`, a partial index on `events (project_id, user_id) WHERE user_id
+IS NOT NULL`, and creates `erased_users`. The index build reads `events` once;
+on a large database rehearse it first, as for `0008`. The D1 database is shared
+with the hosted dashboard: apply `0009` before deploying either Worker. See
+ADOPTION.md §12.
+
+The nightly job's fixed tail is one query longer (`TAIL_QUERIES` 7, for the
+tombstone purge); the minimum budget stays 16.
+
+**Wire schema `v1`, additive (no `schema` change):** new §8.4 (the erase
+contract, optional for a backend, including its check order and the late-event
+rule) and §13 now requires a way to delete or unlink all of a `userId`'s events
+within a project, and bounds any retention of an erased `userId`. That §13
+requirement is new: a backend that conformed to `v1` before this revision does
+not until it offers such a deletion.
+
 ## [0.3.0] — 2026-10-05
 
 ### Upgrade notes (read before adopting)
@@ -877,8 +939,8 @@ A pre-release audit pass, all of it behavior-preserving on the wire — `v1` in
   app id (an app plus an extension, say) would interleave `seq` and overwrite
   each other's queue file — there is no file locking in v1.
 
-[Unreleased]: https://github.com/awizemann/swift-stats/compare/0.3.1...HEAD
-[0.3.1]: https://github.com/awizemann/swift-stats/compare/0.3.0...0.3.1
-[0.3.0]: https://github.com/awizemann/swift-stats/compare/0.2.0...0.3.0
-[0.2.0]: https://github.com/awizemann/swift-stats/compare/0.1.0...0.2.0
-[0.1.0]: https://github.com/awizemann/swift-stats/releases/tag/0.1.0
+[Unreleased]: https://github.com/awizemann/swift-stats/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/awizemann/swift-stats/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/awizemann/swift-stats/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/awizemann/swift-stats/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/awizemann/swift-stats/releases/tag/v0.1.0

@@ -26,6 +26,7 @@ const INSTALL_B = 'b'.repeat(64);
 export const INSTALLS = { a: INSTALL_A, b: INSTALL_B };
 
 const TABLES = [
+  'erased_users',
   'events',
   'installs',
   'backend_markers',
@@ -304,6 +305,8 @@ export async function seedEvents(
     props?: Record<string, unknown> | null;
     isDebug?: boolean;
     projectId?: string;
+    /** `events.user_id` — the hashed `userId` (§2.5); NULL when omitted. */
+    userId?: string;
   }>,
 ): Promise<void> {
   const bid = batchId();
@@ -322,7 +325,7 @@ export async function seedEvents(
   const stmt = DB.prepare(
     `INSERT INTO events
        (project_id, batch_id, day, ts, name, session_id, install_id, app_id, seq, user_id, props, is_debug)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'com.wizemann.Overwatch', ?8, NULL, ?9, ?10)`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'com.wizemann.Overwatch', ?8, ?11, ?9, ?10)`,
   );
 
   await DB.batch(
@@ -338,6 +341,7 @@ export async function seedEvents(
         seedSeq + i,
         r.props === undefined || r.props === null ? null : JSON.stringify(r.props),
         r.isDebug === true ? 1 : 0,
+        r.userId ?? null,
       ),
     ),
   );

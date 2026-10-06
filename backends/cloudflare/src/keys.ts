@@ -17,7 +17,13 @@ import { unauthorized } from './errors.js';
 import { clampRetentionDays } from './dates.js';
 import { logger } from './log.js';
 
-export type KeyKind = 'write' | 'read';
+/**
+ * What a key may do. Each kind grants exactly one endpoint family and nothing
+ * else (§8): `write` ingests, `read` reads, `admin` erases one user's events
+ * (§8.4, migration 0009). `kind` is part of the lookup in `resolveKey`, so a key
+ * of the wrong kind is the same 401 as an unknown one.
+ */
+export type KeyKind = 'write' | 'read' | 'admin';
 
 export interface KeyScope {
   readonly projectId: string;
@@ -52,6 +58,22 @@ export const KEY_TOUCH_INTERVAL_MS = 60_000;
 /** Prefixes, so a leaked string is recognizable in a log or a bug report. */
 export const WRITE_KEY_PREFIX = 'sk_stats';
 export const READ_KEY_PREFIX = 'rk_stats';
+/**
+ * The admin key (§8.4). Like a read key it MUST NOT ship in an app: it belongs
+ * on the app's own server, beside the code that deletes an account.
+ */
+export const ADMIN_KEY_PREFIX = 'ak_stats';
+
+/**
+ * Prefix per kind. A total map rather than a ternary, so adding a kind is a
+ * compile error here until it has a prefix — the ternary this replaced would
+ * have silently minted a new kind as `rk_stats_…`.
+ */
+export const KEY_PREFIXES: Readonly<Record<KeyKind, string>> = {
+  write: WRITE_KEY_PREFIX,
+  read: READ_KEY_PREFIX,
+  admin: ADMIN_KEY_PREFIX,
+};
 
 /** Lowercase hex SHA-256 of a key's UTF-8 bytes. */
 export async function hashKey(key: string): Promise<string> {
@@ -185,7 +207,14 @@ export function requireScope(scope: KeyScope, requestedProjectId: string): void 
   if (requestedProjectId !== scope.projectId) throw unauthorized();
 }
 
-/** Mint a fresh key. Returned plaintext is the only copy; store `hash` only. */
+/**
+ * Mint a fresh key. Returned plaintext is the only copy; store `hash` only.
+ *
+ * The format is a CROSS-REPO CONTRACT: swiftstats.co/src/keys.ts mints the same
+ * shape byte for byte — `<prefix>_` + base64url (unpadded) of 32 random bytes,
+ * with `keys.key_hash` = lowercase hex SHA-256 of that whole string. Only the
+ * prefix varies by kind.
+ */
 export async function mintKey(kind: KeyKind): Promise<{ key: string; hash: string }> {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -193,6 +222,6 @@ export async function mintKey(kind: KeyKind): Promise<{ key: string; hash: strin
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
-  const key = `${kind === 'write' ? WRITE_KEY_PREFIX : READ_KEY_PREFIX}_${b64}`;
+  const key = `${KEY_PREFIXES[kind]}_${b64}`;
   return { key, hash: await hashKey(key) };
 }

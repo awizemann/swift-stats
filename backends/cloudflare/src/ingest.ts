@@ -6,6 +6,7 @@ import { resolveKey, touchKey } from './keys.js';
 import { checkPreAuthRate, checkProjectRate } from './ratelimit.js';
 import { MAX_BODY_BYTES, parseJsonBody, validateBatch } from './validate.js';
 import { deferLog, logger } from './log.js';
+import { erasedUserModes, erasureCutoff, type EraseMode } from './lib/erase.js';
 import type { Env } from './env.js';
 
 /**
@@ -19,7 +20,7 @@ import type { Env } from './env.js';
  */
 const MAX_WIRE_BYTES = 2 * 1024 * 1024;
 
-function checkContentType(header: string | null): void {
+export function checkContentType(header: string | null): void {
   if (header === null) {
     throw badRequest('bad_content_type', 'Content-Type must be application/json.');
   }
@@ -31,7 +32,7 @@ function checkContentType(header: string | null): void {
   }
 }
 
-function checkContentEncoding(header: string | null): void {
+export function checkContentEncoding(header: string | null): void {
   if (header === null) return;
   const encoding = header.trim().toLowerCase();
   if (encoding === '' || encoding === 'identity') return;
@@ -175,6 +176,29 @@ function isSizeShapedFailure(cause: unknown): boolean {
   return /string or blob too big|SQLITE_TOOBIG|too many SQL variables/i.test(message);
 }
 
+/**
+ * The live erase tombstones for this batch's `userId`s (see `erasedUserModes`).
+ * No statement at all when no event carries one.
+ */
+async function lookUpTombstones(
+  db: D1Database,
+  projectId: string,
+  events: ReadonlyArray<{ readonly userId: string | null }>,
+  retentionDays: number,
+  now: Date,
+): Promise<Map<string, EraseMode>> {
+  const userIds = [...new Set(events.flatMap((e) => (e.userId === null ? [] : [e.userId])))];
+  if (userIds.length === 0) return new Map();
+  try {
+    return await erasedUserModes(db, projectId, userIds, retentionDays, now);
+  } catch (cause) {
+    logger.error('erase_lookup_failed', { projectId }, cause);
+    throw new HttpError(503, 'internal_error', 'Storage unavailable. Retry with backoff.', {
+      'retry-after': '5',
+    });
+  }
+}
+
 export async function handleIngest(
   request: Request,
   env: Env,
@@ -241,6 +265,16 @@ export async function handleIngest(
       }),
     );
   }
+
+  // Erase tombstones (§8.4, 0009): one lookup, and only for a batch that carries
+  // a `userId` — most never do. A hash erased in this project within the bound
+  // is either stored unlinked (`unlink`) or not stored at all (`delete`), so an
+  // SDK flushing a queue captured before the erase cannot re-link the account.
+  // A D1 failure here is a 503 like any other storage fault: the batch is
+  // retained and retried, never stored without the check.
+  const tombstones = await lookUpTombstones(env.DB, projectId, batch.events, scope.retentionDays, now);
+  let erasedDropped = 0;
+  let erasedUnlinked = 0;
 
   const receivedAt = now.toISOString();
   const c = batch.context;
@@ -311,6 +345,41 @@ export async function handleIngest(
      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
      ON CONFLICT (project_id, install_id, seq) DO NOTHING`,
   );
+  // The same insert for an event that CARRIES a `userId`, with the erase
+  // tombstone (§8.4, 0009) checked inside the statement. The lookup above runs
+  // before `db.batch()`, so on its own it has a gap: an erase that writes its
+  // tombstone, runs its chunks and answers `done: true` between that lookup and
+  // this batch's commit would leave these rows linked after the caller was told
+  // the account was gone. In SQL, inside the batch's transaction, the check sees
+  // every tombstone committed before the batch; one committed after it is
+  // followed by the erase's own chunks, which then find these rows. ?13 is the
+  // tombstone bound, the same instant `erasedUserModes` used.
+  //
+  // `INSERT … SELECT … WHERE` rather than `VALUES`: the WHERE drops a row under a
+  // live `delete` tombstone, and SQLite needs a WHERE on the SELECT to parse the
+  // trailing ON CONFLICT anyway. Events without a `userId` — nearly all of them —
+  // keep the plain statement above and pay nothing.
+  //
+  // Two tallies are approximate only in that race, and both are accepted: a row
+  // this guard drops reports 0 changes and so counts as `deduped` in the log,
+  // and the batch's `installs` upsert still records the install's sighting.
+  // `installs` holds no `userId`, and the device really did send the event.
+  const insertIdentifiedEvent = env.DB.prepare(
+    `INSERT INTO events (
+       project_id, batch_id, day, ts, name, session_id, install_id, app_id, seq, user_id, props, is_debug
+     )
+     SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,
+            CASE WHEN EXISTS (SELECT 1 FROM erased_users t
+                               WHERE t.project_id = ?1 AND t.user_id = ?10
+                                 AND t.mode = 'unlink' AND t.erased_at >= ?13)
+                 THEN NULL ELSE ?10 END,
+            ?11,?12
+      WHERE NOT EXISTS (SELECT 1 FROM erased_users t
+                         WHERE t.project_id = ?1 AND t.user_id = ?10
+                           AND t.mode = 'delete' AND t.erased_at >= ?13)
+     ON CONFLICT (project_id, install_id, seq) DO NOTHING`,
+  );
+  const tombstoneSince = erasureCutoff(scope.retentionDays, now);
 
   // First-seen day per distinct install in this batch, folded as we go (0005).
   // The MINIMUM bucket day, not the first event's: a batch is not ordered, and an
@@ -319,6 +388,16 @@ export async function handleIngest(
   const firstSeen = new Map<string, string>();
 
   for (const e of batch.events) {
+    const erased: EraseMode | undefined = e.userId === null ? undefined : tombstones.get(e.userId);
+    if (erased === 'delete') {
+      // Dropped, but still acknowledged below (`accepted` counts the batch):
+      // §7 would turn a 4xx into an error-logged permanent drop of the whole
+      // batch, and the other events in it are fine. Not folded into
+      // `firstSeen` either — an event that is not stored is not a sighting.
+      erasedDropped += 1;
+      continue;
+    }
+    if (erased === 'unlink') erasedUnlinked += 1;
     // §10: a future-dated or implausibly old `ts` is tolerated and clamped into
     // the retention window for AGGREGATION — the PROJECT's window (0006), which
     // is why `scope.retentionDays` is threaded through here — and never below
@@ -328,21 +407,23 @@ export async function handleIngest(
     const seen = firstSeen.get(e.installId);
     if (seen === undefined || day < seen) firstSeen.set(e.installId, day);
 
+    const userId = erased === 'unlink' ? null : e.userId;
+    const binds = [
+      projectId,
+      batch.batchId,
+      day,
+      e.ts,
+      e.name,
+      e.sessionId,
+      e.installId,
+      e.appId,
+      e.seq,
+      userId,
+      e.props === null ? null : JSON.stringify(e.props),
+      c.isDebug ? 1 : 0,
+    ];
     statements.push(
-      insertEvent.bind(
-        projectId,
-        batch.batchId,
-        day,
-        e.ts,
-        e.name,
-        e.sessionId,
-        e.installId,
-        e.appId,
-        e.seq,
-        e.userId,
-        e.props === null ? null : JSON.stringify(e.props),
-        c.isDebug ? 1 : 0,
-      ),
+      userId === null ? insertEvent.bind(...binds) : insertIdentifiedEvent.bind(...binds, tombstoneSince),
     );
   }
 
@@ -353,7 +434,7 @@ export async function handleIngest(
   // zero changed rows exactly like a deduped event does — so the dedupe tally has to
   // stop at the end of the event range or every repeat visitor would be counted
   // as a replayed event.
-  const EVENT_STATEMENTS_TO = EVENT_STATEMENTS_FROM + batch.events.length;
+  const EVENT_STATEMENTS_TO = EVENT_STATEMENTS_FROM + batch.events.length - erasedDropped;
 
   let deduped = 0;
 
@@ -495,6 +576,17 @@ export async function handleIngest(
       sdkVersion: batch.context.sdkVersion,
     }),
   );
+  if (erasedDropped > 0 || erasedUnlinked > 0) {
+    // Counts only — never the hash (§13).
+    deferLog(ctx, () =>
+      logger.info('events_erased_on_ingest', {
+        projectId,
+        events: batch.events.length,
+        dropped: erasedDropped,
+        unlinked: erasedUnlinked,
+      }),
+    );
+  }
   if (deduped > 0) {
     // A replay under a fresh `batchId` (see the insert above). Counts only —
     // no event name, no `installId`, no `seq`, no body (§7, §13). Deferred,

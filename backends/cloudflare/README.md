@@ -2,8 +2,8 @@
 
 A small Worker that serves the whole of [`docs/schema.md`](../../docs/schema.md)
 `v1`: ingest on `POST /v1/events`, reads on `GET /v1/summary` and
-`GET /v1/events/top`, and a nightly Cron Trigger that rolls up closed days and
-ages out raw events.
+`GET /v1/events/top`, one-user erasure on `POST /v1/users/erase` (§8.4), and a
+nightly Cron Trigger that rolls up closed days and ages out raw events.
 
 Zero dependencies at runtime, one binding (D1), no Worker secrets.
 
@@ -11,8 +11,9 @@ Zero dependencies at runtime, one binding (D1), no Worker secrets.
 POST /v1/events        X-Stats-Key       (write key)  -> 202
 GET  /v1/summary       X-Stats-Read-Key  (read key)
 GET  /v1/events/top    X-Stats-Read-Key  (read key)
+POST /v1/users/erase   X-Stats-Admin-Key (admin key)  -> 200 {done, affected}
 GET  /health           (none)
-cron 10 2 * * *        roll up closed days, then delete raw events past retention
+cron 10 2 * * *        roll up closed days, delete raw events past retention, purge expired erase tombstones
 ```
 
 `HEAD` is accepted wherever `GET` is (workerd does not synthesize it, so it is
@@ -24,20 +25,21 @@ routed explicitly); every other method on a path is **405** with `Allow`.
 
 **D1** (SQLite), one database named `stats`, schema in
 [`migrations/0001_init.sql`](migrations/0001_init.sql) plus the additive
-migrations `0002`–`0006`.
+migrations `0002`–`0009`.
 
 | Table | Holds | Key / index |
 |---|---|---|
 | `projects` | tenants | `id` (the wire `projectId`) |
-| `keys` | **SHA-256 hashes** of write and read keys, and `last_used_at` (0004) | `key_hash`; `(project_id, kind)` |
+| `keys` | **SHA-256 hashes** of write, read and admin (0009) keys, and `last_used_at` (0004) | `key_hash`; `(project_id, kind)` |
 | `batches` | the `batchId` dedupe ledger (§6) | `(project_id, batch_id)` PK — the dedupe *is* the PK |
 | `batch_context` | the §3 context, once per batch | `batch_id` |
-| `events` | one row per event | `(project_id, day)`, `(project_id, day, name)`, `(install_id)`, `(day)` |
+| `events` | one row per event | `(project_id, day)`, `(project_id, day, name)`, `(install_id)`, `(day)`; `(project_id, user_id)` for rows with a `user_id` (0009) |
 | `installs` | first sighting per install (0005) — **outlives the raw purge** | `(project_id, install_id)`; `(project_id, first_seen_day)` |
 | `daily_rollups` | per-day `opens` / `sessions` / `activeInstalls` / `events` | `(project_id, day, include_debug)` |
 | `daily_event_rollups` | per-day per-event-name `count` / `installs` | `… , name` |
 | `daily_prop_rollups` | per-day per-prop-value `count` / `installs` | `… , name, prop, value_type, value_key, is_null` |
 | `rollup_state` | what the nightly job rolled, when | `day` |
+| `erased_users` | erase tombstones (0009): project, `userId` hash, mode, last erase time — **bounded**, see §10 "Erasing one user" | `(project_id, user_id)`; `(erased_at)` |
 | `backend_markers` | one-row-per-fact deployment history (`installs_backfill_day`, 0005) — see §4 | `key` |
 
 `projects.retention_days` (0006) carries each project's raw-event window; see §4.
@@ -282,7 +284,7 @@ the endpoint. There is no recovery path by design — lose a key, revoke it and
 mint another.
 
 ```sh
-node scripts/admin.mjs mint-key <projectId> write|read [--label "…"] --remote
+node scripts/admin.mjs mint-key <projectId> write|read|admin [--label "…"] --remote
 node scripts/admin.mjs list-keys <projectId> --remote     # shows hashes, never keys
 node scripts/admin.mjs revoke-key <key-hash> --remote
 ```
@@ -310,6 +312,15 @@ What *would* need a constant-time compare is storing keys in plaintext and using
 
 A write key grants **no** reads: `kind` is part of the lookup, so a write key on a
 read endpoint gets the same 401 as an unknown key.
+
+**Admin keys** (`ak_stats_…`, migration 0009) are the third kind, and the
+narrowest: one grants `POST /v1/users/erase` for its project (§10, "Erasing one
+user") and **nothing else** — it 401s on ingest and on both read endpoints, and a
+write or read key 401s on erase, all byte-identical to an unknown key. Mint one
+only for a project whose app calls `identify()`, and keep it **on a server** —
+the one that handles account deletion, in its secret store. It must never ship
+inside an app: unlike the write key, which is public by design, an admin key in a
+binary lets anyone holding the binary erase any account's link.
 
 ## 8. `Content-Encoding: gzip`
 
@@ -407,6 +418,125 @@ activity, where before the erasure the same days read the post-erasure raw
 numbers. Re-roll those days after a `delete-install` on such a project: with no
 raw rows left, a re-roll replaces each day's rollup with an empty one.
 
+### Erasing one user
+
+The §13 obligation for an app that calls `identify()`: honour "delete my
+account" for the events linked to it. Two ways, running the same statements
+(`src/lib/erase.ts`):
+
+```sh
+# From the app's own server, with an admin key (§7):
+curl -sS https://<worker>/v1/users/erase \
+  -H 'content-type: application/json' -H "x-stats-admin-key: $STATS_ADMIN_KEY" \
+  -d '{"projectId":"overwatch","userId":"<64-hex hash>","mode":"unlink"}'
+# -> {"done":true,"affected":42}; repeat the identical request while done is false.
+
+# Or as the operator:
+node scripts/admin.mjs delete-user <projectId> <64-hex hash> --unlink|--delete --remote
+```
+
+**The `userId` is a hash, not the account id.** The SDK never sends the id the
+app passed to `identify()`; it sends
+`lowercaseHex(SHA256(UTF8(accountID + installIdSalt)))` — no separator — and
+that is what `events.user_id` holds. The app's server computes the same value:
+
+```swift
+import CryptoKit   // or: StatsConfiguration.hashedUserId(accountID, salt: salt)
+let digest = SHA256.hash(data: Data((accountID + installIdSalt).utf8))
+let userId = digest.map { String(format: "%02x", $0) }.joined()
+```
+
+```js
+import { createHash } from 'node:crypto';
+const userId = createHash('sha256').update(accountId + installIdSalt, 'utf8').digest('hex');
+```
+
+```sh
+printf '%s%s' "$ID" "$SALT" | shasum -a 256 | cut -d' ' -f1
+```
+
+Check your implementation against the test vector: account id `account-1`, salt
+`test-salt` →
+`ff0315ef5b57317d76a46521554b19ae36c120ed198f87f718ad7913d79bfa3e`.
+
+- **The salt has to be available to that server.** It is the `installIdSalt` in
+  the app's `StatsConfiguration`; it ships inside the app and is not a secret by
+  design (§9 — it separates one app's ids from another's, it does not hide them),
+  so copying it into the server's config costs nothing.
+- **One hash per distinct salt.** If the app has ever shipped with more than one
+  salt (two apps in one project, or a salt change between versions), the same
+  account produced a different `userId` under each: erase once per salt.
+- The endpoint accepts only that shape — 64 lowercase hex — and answers **400**
+  `invalid_user_id` for anything else, so a server passing the raw account id is
+  told so rather than answered `affected: 0`.
+
+**`unlink` or `delete`.** `mode` is required; there is no default.
+
+- `unlink` sets `user_id` to `NULL` and keeps the events. **Rollups stay exact**:
+  none has ever contained a `user_id`, so nothing they count changes. Only
+  raw-window *user* figures (a dashboard's `COUNT(DISTINCT user_id)`) stop
+  counting this account — which is the point. It suits an app whose promise is
+  "we no longer know these events were yours": the link is gone, install and
+  event numbers are untouched. **It is final for those rows**: nothing ties them
+  to the hash any more, so a later `delete` for the same `userId` cannot find
+  them (it deletes only rows linked since — none, under the tombstone). If the
+  rows themselves may have to go, choose `delete` from the start.
+- `delete` removes the events, and the rollups follow as far as they can. A
+  day the delete leaves with **no** raw rows has its rollups (all three tables,
+  both `include_debug` variants) deleted in the same batch — nothing else would
+  ever correct them, because the nightly sweep only re-rolls days that still
+  have raw rows, so the stale rollup would become that day's answer the moment
+  it left the raw window. The days are computed in SQL from the chunk's own rows,
+  inside the same transaction as the delete. A day is never cleared below the
+  project's `raw_complete_from` (§4): there the rollup is the real history and
+  raw rows are only late arrivals. A day that still has **other** rows keeps its
+  rollup, stale until the next nightly pass re-rolls it (the last few days) or
+  until the day ages out and is re-rolled from its raw rows (older days); reads
+  serve such a day from its raw rows meanwhile.
+
+**Late events: the tombstone.** Erasing the stored rows is not the end of it: a
+device can still hold events captured under the hash — a queue on disk while the
+app was offline, or events recorded just before the app called `forgetUser()` —
+and a delete frees their `(installId, seq)` identity, so a re-send would be stored
+again and re-link the account. So every erase records a tombstone
+(`erased_users`: project, hash, mode, time of the last erase call), and ingest
+checks a batch's `userId`s against it — one lookup per batch, and none for a
+batch with no `userId` — and re-checks inside the insert itself, so an erase
+that completes while a batch is in flight cannot leave that batch's rows
+linked. Under an `unlink` tombstone the event is stored with no
+`userId`; under a `delete` tombstone it is dropped (still answered 202, so the
+SDK neither retries it nor logs an error). `delete` beats a later `unlink`.
+
+The tombstone holds the hash — the thing being erased — so it is **bounded**: it
+counts for the project's raw-retention window plus **30 days** after the last
+erase call (120 days at the default 90), ingest ignores it after that, and the
+nightly job deletes it. Ingest accepts events of any age (a too-old `ts` is
+clamped into the window, §10), so this bound is a choice, not something the
+wire contract implies: a device that holds an unsent queue for longer than that
+can still re-link (unlink) or re-store (delete) its own events. Erase again if
+that matters for an app whose users go months between launches.
+
+**Bounded and resumable.** Each call erases at most 4 chunks of 5,000 rows and
+answers `done: false` if rows may remain. Small on purpose: D1 bounds a
+statement's run time, and the database is shared with ingest, reads and the
+dashboard — D1 serialises queries, so one long erase would stall all of them.
+Repeat until `done: true`. Every call works on "whatever is still linked", so a
+retry or a rerun is harmless; after `done` it answers
+`{"done": true, "affected": 0}`. `delete-user` loops for you, requires exactly
+one of `--unlink` / `--delete`, and can be re-run to resume. The lookup is an
+index range on `events_user` (0009), a partial index on `(project_id, user_id)`
+for rows that have a user.
+
+**What it does not touch.** Other projects — the same hash in another project is
+left alone (§2.5 forbids joining on it). And **`installs`, in either mode**: an
+`installs` row is an install id and a first-seen day with no `user_id`, and the
+install is not the account's alone — it may hold events from before
+`identify()`, or another account's after a sign-out. Deleting it would rewrite
+that install's first sighting, and every cohort built on it, for activity never
+linked to this account. To erase the install as well, use `delete-install`.
+`batches` and `batch_context` carry neither a `user_id` nor an install id and
+age out with retention.
+
 ### Deleting a project
 
 ```sql
@@ -433,8 +563,9 @@ per-isolate `Map` and throws a 429 with `Retry-After` past the limit:
 |---|---|---|
 | SHA-256 of the presented **write** key | 600/min | **pre-auth**, on `/v1/events` |
 | SHA-256 of the presented **read** key | 120/min | **pre-auth**, on `/v1/summary`, `/v1/events/top` |
+| SHA-256 of the presented **admin** key | 120/min | **pre-auth**, on `/v1/users/erase` |
 | `projectId` | 600/min | post-auth, on `/v1/events` |
-| `anonymous` (no key, or one of impossible length) | 600/min | pre-auth, all four paths |
+| `anonymous` (no key, or one of impossible length) | 600/min | pre-auth, every authenticated path |
 
 Keyed buckets are **per endpoint family**: the same key presented to ingest and
 to a read endpoint is counted in two separate buckets. That matters because the
@@ -630,6 +761,7 @@ What is exported, and what each thing is for:
 | `setProjectRetention(db, projectId, days, now?)` | the one way to change a project's retention window: moves `raw_complete_from` with it on an increase (§4) |
 | `firstSeenRows(db, projectId, fromDay, toDay)` | installs first seen per day — retention cohorts and "new installs"; **counts only, never an install id** |
 | `firstSeenFloorDay(db, projectId)` | `installs_backfill_day − 89`, the same for every project (a fresh deployment too); `null` only if the marker row is absent — label cohorts at or below it (§4) |
+| `eraseUserChunk(db, projectId, userIdHash, mode, {chunkRows?, maxChunks?, now?})` | records the tombstone, then one bounded slice of a §8.4 erase → `{done, affected, chunks}`; call again while `done` is false. Validates the hash and the mode itself; **authorization is yours** (see below) |
 | `totalInstalls(db, projectId, throughDay?)` | installs ever seen, cumulative (a sum over `firstSeenRows` is not the total) |
 | `resolveDayRange` / `clampAndValidateDays` | the pure date rules, database-free |
 | `parseLimit` / `parseIncludeDebug` / `parseEventName` / `requireBothDays` | the same query-string parsing, so a consumer rejects exactly what the public API rejects |
@@ -767,5 +899,8 @@ Verified at the commit that introduced this file, by `npm test`
 - [x] The one table exempt from the sweep (`installs`) is documented, returns no
       ids to any reader, and is cleared by `delete-install`.
 - [x] A documented way to delete all events for one `installId`.
+- [x] A documented way to delete or unlink all events for one `userId` within a
+      project (`POST /v1/users/erase`, `delete-user`), behind an admin key that
+      grants nothing else.
 - [x] Rate limiting a well-behaved emitter never trips.
 - [x] A conformance suite runnable against a local instance: `npm test`.

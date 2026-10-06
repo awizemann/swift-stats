@@ -1,17 +1,24 @@
 // stats-worker — the Cloudflare/D1 backend for swift-stats.
 //
-// Contract: ../../docs/schema.md (wire schema v1). Three endpoints and one cron:
+// Contract: ../../docs/schema.md (wire schema v1). Four endpoints and one cron:
 //
-//   POST /v1/events        ingest,  X-Stats-Key       (write key)  -> 202
-//   GET  /v1/summary       read,    X-Stats-Read-Key  (read key)
-//   GET  /v1/events/top    read,    X-Stats-Read-Key  (read key)
+//   POST /v1/events        ingest,  X-Stats-Key        (write key)  -> 202
+//   GET  /v1/summary       read,    X-Stats-Read-Key   (read key)
+//   GET  /v1/events/top    read,    X-Stats-Read-Key   (read key)
+//   POST /v1/users/erase   admin,   X-Stats-Admin-Key  (admin key)  -> 200 {done, affected}
+//   GET  /health           none
 //   cron                   roll up yesterday, then age out raw events past 90 days
+//
+// Each key kind opens exactly one of those families (§8, §8.4): a write key
+// cannot read or erase, a read key cannot write or erase, an admin key can only
+// erase one user's events in its project.
 //
 // Deliberately absent: cookies, redirects, CORS, any storage of the client IP or
 // anything derived from it, and any identifier of the Worker's own invention
 // (§9, §13). If you are adding a header or a column, check §13 first.
 
 import { HttpError, internalError, methodNotAllowed, notFound } from './errors.js';
+import { handleEraseUser } from './erase.js';
 import { handleIngest } from './ingest.js';
 import { handleSummary, handleTopEvents } from './read.js';
 import { runScheduled } from './rollup.js';
@@ -48,6 +55,12 @@ async function route(
     case '/v1/events/top':
       if (!isRead) throw methodNotAllowed('GET');
       return await handleTopEvents(request, env, ctx, now);
+
+    case '/v1/users/erase':
+      // §8.4: POST only. It changes data, so it is never reachable by GET/HEAD —
+      // a prefetch or a crawler must not be able to erase anything.
+      if (method !== 'POST') throw methodNotAllowed('POST');
+      return await handleEraseUser(request, env, ctx, now);
 
     case '/health':
       // No auth and no D1 read: this is for a uptime check, so it must not be

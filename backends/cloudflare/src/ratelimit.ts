@@ -32,7 +32,7 @@
 //   * already what `keys.key_hash` stores, so it reveals nothing new,
 //   * per-client in the way that matters — one project's key, one bucket.
 //
-// Keyed buckets are ALSO namespaced by endpoint (`ingest:` / `read:`), so the
+// Keyed buckets are ALSO namespaced by endpoint (`ingest:` / `read:` / `admin:`), so the
 // same key presented to both endpoint families is counted twice, separately —
 // see `checkPreAuthRate`. What namespacing cannot fix, and nothing in-Worker can:
 // the write key is public, so anyone holding the app binary can spend that key's
@@ -81,6 +81,17 @@ export const PRE_AUTH_LIMIT_PER_WINDOW = 600;
  * no queue behind it that a false positive can back up.
  */
 export const READ_LIMIT_PER_WINDOW = 120;
+
+/**
+ * Pre-auth ceiling per presented ADMIN key per minute, on `/v1/users/erase`.
+ *
+ * The read number, for the read number's reason: an admin key is one server
+ * (§8.4 forbids shipping it in an app), not a fleet. An erase is resumable —
+ * each call does a bounded slice and answers `done: false` until the user is
+ * gone — so a caller looping on it makes a handful of calls per user, far below
+ * this. A 429 here only delays a deletion the caller retries anyway.
+ */
+export const ADMIN_LIMIT_PER_WINDOW = 120;
 
 /**
  * Post-auth ceiling per project per minute on ingest. Distinct from the above so
@@ -145,7 +156,7 @@ export async function checkPreAuthRate(
    * path 429'd the app's own fleet on ingest. Namespaced, abuse of one endpoint
    * spends only that endpoint's bucket.
    */
-  endpoint: 'ingest' | 'read' = 'ingest',
+  endpoint: 'ingest' | 'read' | 'admin' = 'ingest',
 ): Promise<void> {
   // A key shape that cannot be valid does not deserve a SHA-256 either; it goes
   // in the anonymous bucket with the missing-key requests. Mirrors the length
@@ -162,6 +173,7 @@ export async function checkPreAuthRate(
   }
   const hash = await hashKey(presentedKey);
   if (endpoint === 'read') countAgainst(`read:key:${hash}`, now, READ_LIMIT_PER_WINDOW);
+  else if (endpoint === 'admin') countAgainst(`admin:key:${hash}`, now, ADMIN_LIMIT_PER_WINDOW);
   else countAgainst(`ingest:key:${hash}`, now, PRE_AUTH_LIMIT_PER_WINDOW);
 }
 

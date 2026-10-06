@@ -31,6 +31,13 @@ export interface Fields {
   readonly status?: number;
   readonly path?: string;
   readonly source?: 'raw' | 'rollup' | 'mixed';
+  /** `POST /v1/users/erase` (§8.4): which erase ran. Never the `userId`. */
+  readonly mode?: 'unlink' | 'delete';
+  /** `POST /v1/users/erase`: whether the user has no linked events left. */
+  readonly done?: boolean;
+  /** Ingest: events dropped / stored unlinked by an erase tombstone (0009). */
+  readonly dropped?: number;
+  readonly unlinked?: number;
 }
 
 /**

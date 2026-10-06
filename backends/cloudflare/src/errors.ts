@@ -28,6 +28,8 @@ export type ErrorCode =
   | 'invalid_range'
   | 'range_too_large'
   | 'invalid_limit'
+  | 'invalid_user_id'
+  | 'invalid_mode'
   // 401
   | 'unauthorized'
   // 404 / 405

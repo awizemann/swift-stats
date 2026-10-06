@@ -277,6 +277,8 @@ describe('events, batches and batch_context cascade with their project (0008)', 
       'events_install',
       'events_scope',
       'events_scope_name',
+      // 0009's partial index, applied by `applyMigrationsFrom` after 0008.
+      'events_user',
     ]);
     expect(schema.find((s) => s.name === 'events_identity')?.sql).toMatch(
       /UNIQUE INDEX[\s\S]*\(project_id, install_id, seq\)/,

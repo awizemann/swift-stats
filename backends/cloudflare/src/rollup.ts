@@ -15,6 +15,7 @@ import {
   today,
 } from './dates.js';
 import { logger } from './log.js';
+import { purgeExpiredErasures } from './lib/erase.js';
 import type { Env } from './env.js';
 
 /**
@@ -289,7 +290,7 @@ export function rollupStatements(
  *
  * Cost model, in these units (what ADOPTION.md C's capacity numbers come from):
  *
- *     fixed per night   = 1 lease + 1 project select + TAIL_QUERIES (6)  = 8
+ *     fixed per night   = 1 lease + 1 project select + TAIL_QUERIES (7)  = 9
  *     per project       = 1 if it has trailing work (one batch, all REROLL_DAYS days)
  *                       + 1 + d if it has d days expiring tonight (a select, then
  *                         one roll-and-delete batch per day), d capped per night
@@ -345,20 +346,21 @@ export const PASS_WALL_BUDGET_MS = 10 * 60 * 1_000;
 /**
  * Queries the pass must keep in hand for its fixed tail, whatever happened above:
  * the `rollup_state` write, the `raw_complete_from` clear, the orphan sweep, the
- * context purge, the ledger purge, and the lease release. (Rotation is NOT in the
+ * context purge, the ledger purge, the erase-tombstone purge (0009), and the
+ * lease release. (Rotation is NOT in the
  * tail: each project's `rolled_at` is written inside its own last batch.)
  */
-export const TAIL_QUERIES = 6;
+export const TAIL_QUERIES = 7;
 
 /**
  * The smallest budget the pass will run with, whatever `ROLLUP_QUERY_BUDGET`
  * says. Below it a hand-set tiny budget would leave no room for a single
  * project's work after the fixed cost, so nothing would ever be rotated and the
  * same project would be first — and unfinished — every night. 16 is the fixed
- * cost (lease, project select, TAIL_QUERIES = 8) plus one project's worst first
- * night at this budget: its trailing batch, a below-marker delete, the
- * expiring-day select, and `sweepDaysCap(16)` = 4 roll-and-delete batches, with
- * one to spare.
+ * cost of 9 (lease, project select, TAIL_QUERIES = 7) plus one project's worst
+ * first night at this budget: its trailing batch, a below-marker delete, the
+ * expiring-day select, and `sweepDaysCap(16)` = 4 roll-and-delete batches —
+ * 9 + 7 = exactly 16, nothing to spare since the tombstone purge joined the tail.
  */
 export const MIN_QUERY_BUDGET = 16;
 
@@ -683,6 +685,18 @@ async function runRollupAndSweep(env: Env, now: Date, budget: QueryBudget): Prom
       .run();
   } catch (cause) {
     logger.error('retention_failed', { day: cutoff }, cause);
+  }
+
+  budget.spend(1);
+  try {
+    // Erase tombstones (0009) past their bound: the project's window plus a
+    // month after the last erase call. One statement, capped at
+    // ERASURE_PURGE_ROWS; ingest already ignores an expired tombstone, so a
+    // backlog here is only rows kept a little longer, never a behaviour change.
+    const purged = await purgeExpiredErasures(env.DB, now);
+    if (purged > 0) logger.info('erasures_purged', { rows: purged });
+  } catch (cause) {
+    logger.error('erasure_purge_failed', {}, cause);
   }
 
   logger.info('retention_swept', { day: cutoff, events: deletedEvents });

@@ -1043,6 +1043,56 @@ re-roll from.
 
 ---
 
+# 0.5.0 — erasing one user (migration `0009`)
+
+Additive: one endpoint, one key kind, one migration. Wire schema stays `v1`
+(§8.4 and a §13 sentence are new); nothing an existing read returns changes.
+
+## 12. `POST /v1/users/erase`, admin keys, and the erase tombstone
+
+**What.** An app that calls `identify()` can have its server erase one user's
+events in one project — `unlink` (null `user_id`) or `delete` (remove the rows),
+in bounded slices of 4 × 5,000 rows per call — with a new `admin` key kind
+(`ak_stats_…`) that grants that and nothing else. Each erase writes a tombstone
+(`erased_users`) that ingest consults so late events cannot re-link the hash,
+kept for the project's window plus 30 days. The logic is
+`src/lib/erase.ts`, exported from `stats-worker/lib` as `eraseUserChunk`; README
+§10 "Erasing one user" is the operator view.
+
+**Migration `0009`.** It rebuilds `keys` (the `kind` CHECK gains `'admin'`; rows,
+columns, cascade and `keys_by_project` are copied unchanged), creates
+`events_user` — `CREATE INDEX … ON events (project_id, user_id) WHERE user_id IS
+NOT NULL` — and creates `erased_users`.
+
+- **Apply `0009` before deploying EITHER Worker.** The D1 database is shared
+  with the hosted dashboard (swiftstats.co). This Worker's new code needs
+  `erased_users` on every ingest that carries a `userId` (the lookup fails, and
+  ingest answers 503 — retained, not lost — until the table exists), and the
+  dashboard's copy of the lib needs it for erase. Apply it with this repo's
+  `npm run migrate:remote` (the dashboard's `app_*` migrations do not include
+  it), then deploy this Worker, then the dashboard.
+- **Rehearse the index build on a large `events` table.** `CREATE INDEX` reads
+  every row of `events` once inside the migration's transaction (writing index
+  entries only for rows that have a `user_id`). Check `SELECT COUNT(*) FROM
+  events` first, as §8.1 suggests for `0005`, and run the migration against a
+  copy of a production-sized database before the real one.
+- **Rollback after `0009` is safe.** The rebuilt CHECK is a superset of the old
+  one, so a previous Worker reads and writes `keys` exactly as before (it never
+  mints or resolves `admin`); `events_user` and `erased_users` are simply unused
+  by it. What a rollback loses is the tombstone check on ingest — late events
+  for an erased hash would be stored linked again until the new code is back.
+
+**The dashboard must learn the `admin` kind.** Its copy of the key format
+(`swiftstats.co/src/keys.ts`) has `KeyKind = 'write' | 'read'` and picks the
+prefix with `kind === 'write' ? … : …`, which would mint an admin key as
+`rk_stats_…`. Before it offers admin keys it needs the `ak_stats` prefix, a
+badge for the kind wherever keys are listed, the kind in its per-kind key counts
+(`settings.ts` counts only `write` and `read`, so admin keys are silently
+uncounted today), and the setup wizard must **reject** an admin key wherever it
+asks for a write or read key. Its project delete needs no change: `erased_users`
+cascades from `projects`, though naming it explicitly would match how that code
+treats every other table.
+
 ## Recommended, not implemented
 
 Each of these is a real improvement we deliberately left out of the code, with

@@ -227,7 +227,8 @@ call.
   `ff0315ef5b57317d76a46521554b19ae36c120ed198f87f718ad7913d79bfa3e`.
 - A backend MUST treat it as an opaque string: it MAY index it for a per-account
   rollup, and MUST NOT expose it in the `v1` read contract (§8 has no `userId`
-  dimension) or use it to join across projects.
+  dimension) or use it to join across projects. It MUST be able to delete or
+  unlink every event carrying a given `userId` within a project (§13, §8.4).
 - Sending a `userId` makes events for that account linkable, which is a real
   privacy cost. Apps that do not need per-account analysis SHOULD never call
   `identify()`.
@@ -569,6 +570,85 @@ A reader SHOULD retry 429/5xx with the §7 backoff, and MUST NOT retry 4xx.
 Error bodies are `{"error": "<machine_code>", "message": "<human text>"}`;
 `error` values are backend-defined but MUST be stable snake_case strings.
 
+### 8.4 Admin: erasing one user — `POST /v1/users/erase`
+
+This is **not** part of the read contract above. It changes data, and it is
+the one write a server makes rather than an emitter. It exists so an app that
+calls `identify()` (§2.5) can honour "delete my account". §13 requires a
+backend to offer *some* way to do that; this endpoint is OPTIONAL, and a
+backend that serves it MUST serve it as described here. Added to `v1` as an
+additive change (§15): the `schema` string does not change.
+
+**Key.** `X-Stats-Admin-Key`, a third key kind, project-scoped like the other
+two (§2.4). It MUST NOT be embeddable in a shipped client app — it belongs on
+the app's own server, beside its account-deletion code. It grants this endpoint
+and nothing else: an admin key on ingest or on a read endpoint MUST get
+**401**, and a write or read key on this endpoint MUST get **401**, with nothing
+in either response distinguishing those from an unknown key (§8).
+
+**Request.** `Content-Type: application/json`, body:
+
+```json
+{ "projectId": "overwatch", "userId": "<the wire userId>", "mode": "unlink" }
+```
+
+| Field | Req. | Notes |
+|---|---|---|
+| `projectId` | yes | validated against the key's scope exactly as §8 does: out of scope, malformed or nonexistent are one **401** |
+| `userId` | yes | the value as it went on the wire (§2.5) — for the Swift SDK, 64 lowercase hex, `lowercaseHex(SHA256(UTF8(accountID + installIdSalt)))`. Never the account id. One call per distinct salt the app has shipped with. A backend MAY restrict the shape it accepts (and SHOULD, to reject a caller passing the raw account id) and MUST document it |
+| `mode` | yes | `"unlink"` — keep the events, remove their `userId`; `"delete"` — remove the events. No default: a request without one is **400**. `unlink` is final for the rows it touches: a later `delete` for the same `userId` cannot find them, since nothing links them to it any more |
+
+Checks run in this order, extending §8's, so a key cannot learn anything about
+a project it does not cover from a 400:
+
+1. `Content-Type` not `application/json`, or a `Content-Encoding` the backend
+   does not accept — **400**, before authentication (they say nothing about any
+   project);
+2. rate limit — **429**, before authentication, so a key-guessing loop costs no
+   storage read;
+3. the admin key — **401**;
+4. the body: over the size limit **413**, not JSON **400** (`bad_json`), not a
+   JSON object **400** (`bad_request`);
+5. `projectId` against the key's scope — **401**;
+6. `userId`, then `mode` — **400**.
+
+**Scope.** Only events of that project whose `userId` equals the given value.
+The same value in another project MUST NOT be touched (§2.5: no joins across
+projects). The erase is about the account link, not the install: what a backend
+keeps per `installId` (§13) is not linked to a `userId` and is out of scope —
+erasing an install is the separate §13 deletion.
+
+**Response.** `200` with `{"done": <bool>, "affected": <int>}`. A backend MAY do
+the work in bounded slices: `done: false` means rows may remain, and the caller
+repeats the identical request until `done` is `true`. `affected` is the number
+of events unlinked or deleted by **this** call. The call is idempotent — a repeat
+after `done: true` answers `{"done": true, "affected": 0}` — so a caller that
+lost a response simply sends it again.
+
+**Aggregates.** Nothing a read returns has a `userId` dimension (§8), so
+`unlink` leaves every aggregate exact. After `delete`, aggregates already
+computed from the deleted events MAY still count them; a backend MUST document
+when, if ever, they are recomputed.
+
+**Late events.** An emitter may still hold events captured under the erased
+`userId` (an offline queue, §1), and may send them after the erase. A backend
+SHOULD stop them re-linking the account: after `unlink`, store such events
+without the `userId`; after `delete`, drop them — and still acknowledge the
+batch (§7), since the rest of it is valid. The check belongs in the same
+transaction as the insert: checked only beforehand, an erase that completes in
+between leaves the batch's rows linked after the caller was told `done`. Doing
+that means keeping the erased
+`userId` itself, so a backend that does it MUST bound how long it keeps it,
+MUST use it for nothing else, and MUST document the bound and what happens to
+events that arrive after it. (The reference backend keeps it for the project's
+raw-event window plus 30 days after the last erase call, and treats `delete`
+as winning over a later `unlink`.)
+
+**Errors.** As §8.3: **400** malformed body, `userId` or `mode` · **401** as
+above · **405** for any method but `POST` · **413** for an oversized body ·
+**429** with `Retry-After` · **5xx** backend fault. Retry 429/5xx with backoff;
+do not retry 4xx.
+
 ## 9. Identity
 
 - The install identifier is generated as a **random UUID v4** at first run, then
@@ -732,8 +812,15 @@ Retention: a backend MUST document its raw-event retention and SHOULD keep raw
 events no longer than **90 days**, aggregating beyond that. A backend MAY vary
 that window per project, and MUST then document the range it permits and the
 default. A backend MUST provide a way to delete all events for a given
-`installId` on request, which is the only per-person deletion this schema can
-support.
+`installId` on request. A backend MUST also provide a way to delete **or
+unlink** all events carrying a given `userId` (§2.5) within one project — what
+an app that calls `identify()` needs to honour "delete my account";
+`POST /v1/users/erase` (§8.4) is the reference contract for it. Those two are
+the only per-person deletions this schema can support: nothing else on the wire
+identifies a person. A backend that keeps an erased `userId` to stop late
+events re-linking it (§8.4) MUST keep it only for that, and only for a bounded,
+documented time. This deletion requirement is new in this revision of `v1`: a
+backend that conformed before it does not conform until it provides one.
 
 A backend MAY keep, beyond its raw-event window, a record of an `installId`'s
 **first-seen day** and nothing else — the one fact that cannot be reconstructed
