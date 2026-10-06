@@ -4,7 +4,7 @@ Privacy-first usage analytics for native Apple apps. A small Swift package, zero
 dependencies, Swift 6 language mode, and a documented wire schema so the backend
 is yours to choose.
 
-> **Status: core client + schema (v0.3.0).**
+> **Status: core client + schema (v0.3.1).**
 > The wire contract in [`docs/schema.md`](docs/schema.md) is complete and stable
 > for `v1`, and the emitter (`StatsClient`, the file-backed queue, the
 > dispatcher, identity, sessions, consent) is implemented and tested. A shipping
@@ -72,7 +72,7 @@ actor-based, written for Swift 6 language mode, and pluggable at the backend.
 ## Installation
 
 ```swift
-.package(url: "https://github.com/awizemann/swift-stats.git", .upToNextMinor(from: "0.3.0"))
+.package(url: "https://github.com/awizemann/swift-stats.git", .upToNextMinor(from: "0.3.1"))
 ```
 
 ```swift
@@ -159,13 +159,19 @@ They differ in one thing, durability:
   that guarantee, most often right before a deliberate teardown or an operation
   that may end the process.
 
-`flush()`, `waitForFlushes()`, `shutdown()`, `reset()`, `identify(userID:)` and
-both lifecycle methods drain whatever `record()` has accepted before they do
+`flush()`, `waitForFlushes()`, `shutdown()`, `reset()`, `identify(userID:)`,
+`forgetUser()` and both lifecycle methods drain whatever `record()` has accepted before they do
 their own work, so nothing recorded is left behind or mis-attributed; a test
 that wants only the drain can `await stats.drainRecorded()`.
 
 `identify(userID:)` is opt-in, hashed with your salt before it leaves the
-device, and most apps should never call it.
+device, and most apps should never call it. On sign-out call `forgetUser()`:
+later events carry no `userId`, while the install id, the session and anything
+already queued are kept. To erase an account on the backend, your server
+computes `lowercaseHex(SHA256(UTF8(accountID + installIdSalt)))` — the value
+`identify()` sent — and names the account by it; in Swift that is
+`StatsConfiguration.hashedUserId(_:salt:)`. The formula is the contract, so a
+server in any language can compute it from the account id and your salt.
 
 ### Writing a sink
 
@@ -410,6 +416,7 @@ the suite opened lazily inside the actor on the first `record()`, `track()` or
    | `setEnabled(false)` | discarded | forgotten | **kept** |
    | `setConsent(_:)` revoking a group | discarded | forgotten | **deleted** |
    | `reset()` | flushed first | forgotten | regenerated (or deleted) |
+   | `forgetUser()` | kept | forgotten | kept |
 
    The opt-out is a *switch*: a person who turns it off and back on expects the
    same install, not a new one, and while it is off nothing is collected, so the

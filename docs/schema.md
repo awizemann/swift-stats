@@ -195,7 +195,9 @@ the one project it was minted for.
 ### 2.5 `userId`
 
 Optional. Present only when the app called `identify(userID:)`, and then on every
-subsequent event of that install until `reset()` or a new `identify` call.
+subsequent event of that install until `reset()`, `forgetUser()`,
+`setEnabled(false)`, a revocation of `identity` consent (§11), or a new `identify`
+call.
 
 - ≤ 128 scalars. Opaque to the schema; no format is imposed.
 - The value MUST already be hashed or otherwise opaque **before it reaches the
@@ -210,7 +212,19 @@ subsequent event of that install until `reset()` or a new `identify` call.
   the field MUST be omitted entirely — an `identify()` call is remembered in
   memory but never emitted — and `identify()` MUST NOT re-enable linkage that
   consent withheld.
-- `reset()` (§9) clears it.
+- `reset()` (§9) clears it. `forgetUser()` clears it too — the sign-out call —
+  and changes nothing else: the install id, `seq`, consent, the session and the
+  queue are kept, and events already captured keep the `userId` they were
+  captured with.
+- The Swift SDK sends `lowercaseHex(SHA256(UTF8(accountID + installIdSalt)))`
+  — the app's install salt (§9), no separator. That is the SDK's derivation,
+  not a format the schema imposes: a backend still treats the field as opaque.
+  An app's server that asks a backend to erase an account computes the same
+  value from the account id and the app's salt (in Swift,
+  `StatsConfiguration.hashedUserId(_:salt:)`); apps with different salts
+  produce different values for one account id. Test vector: account id
+  `account-1`, salt `test-salt` →
+  `ff0315ef5b57317d76a46521554b19ae36c120ed198f87f718ad7913d79bfa3e`.
 - A backend MUST treat it as an opaque string: it MAY index it for a per-account
   rollup, and MUST NOT expose it in the `v1` read contract (§8 has no `userId`
   dimension) or use it to join across projects.

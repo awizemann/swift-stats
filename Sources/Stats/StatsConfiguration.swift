@@ -177,3 +177,41 @@ public struct StatsConfiguration: Sendable {
         self.identitySuiteDirectory = nil
     }
 }
+
+extension StatsConfiguration {
+    /// The `userId` that ``StatsClient/identify(userID:)`` sends for `userID`
+    /// under this configuration — what an app's server passes to a backend to
+    /// find, or erase, that account's events.
+    ///
+    /// The contract is the formula, not this helper:
+    /// `lowercaseHex(SHA256(UTF8(userID + installIdSalt)))`, no separator (§2.5,
+    /// §9). A server need not hold a configuration — or run Swift — to compute
+    /// it; in Swift, ``hashedUserId(_:salt:)`` takes the salt directly. This is
+    /// the same function `identify()` applies, with this configuration's salt,
+    /// so it matches what a client built from this configuration sends — with
+    /// two caveats:
+    ///
+    /// - A hash persisted under an earlier salt keeps being sent after a salt
+    ///   change, until `identify()` runs again; this returns the new-salt value.
+    /// - A client that forwards to another client for the same app id (see
+    ///   ``StatsClient``) has `identify()` hashed by the owner, with the
+    ///   owner's salt.
+    ///
+    /// The salt is per configuration: the same account id hashes differently
+    /// in two apps (or two backends) configured with different salts.
+    ///
+    /// `identify()` ignores an empty id, so no event ever carries the hash of
+    /// `""`; this still returns one (a value that matches nothing) rather than
+    /// an optional, so a server mapping account ids to hashes needs no special
+    /// case. Pure: it reads no persisted state, and unlike `identify()` it does
+    /// not warn about values that look like addresses.
+    public func hashedUserId(_ userID: String) -> String {
+        Self.hashedUserId(userID, salt: installIdSalt)
+    }
+
+    /// ``hashedUserId(_:)`` for a salt held outside a configuration — a server
+    /// or script that knows the app's `installIdSalt` but builds no client.
+    public static func hashedUserId(_ userID: String, salt: String) -> String {
+        StatsIdentityStore.hash(userID, salt: salt)
+    }
+}

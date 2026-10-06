@@ -43,7 +43,7 @@ private nonisolated let logger = Logger(subsystem: StatsLog.subsystem, category:
 /// shape. But a second client for the same app id (a settings screen that
 /// builds its own, a per-window client) is safe too: the queue file and the
 /// persisted `seq` belong to the app id, so only one client may own them, and
-/// any other client for that app id **forwards every call to the owner**. `track`, `record`, `identify`, `setConsent`, `setEnabled`,
+/// any other client for that app id **forwards every call to the owner**. `track`, `record`, `identify`, `forgetUser`, `setConsent`, `setEnabled`,
 /// `reset`, `flush`, the lifecycle calls and the read-only state all behave
 /// exactly as if they had been made on the owner, so an opt-out made through
 /// any handle is the opt-out. The forwarding client's own configuration (its
@@ -789,6 +789,12 @@ public actor StatsClient {
     /// carry it; it is not persisted, so after a relaunch it is gone until
     /// `identify()` is called again.
     ///
+    /// On sign-out, call ``forgetUser()``: it stops attaching the hash without
+    /// touching the install, the queue or the session. (``setEnabled(_:)`` off
+    /// and on again would also drop the hash, but it discards the queue and ends
+    /// the session too; ``reset()`` forgets the install as well.) A backend
+    /// erasing the account looks it up by ``StatsConfiguration/hashedUserId(_:)``.
+    ///
     /// - Important: calling this puts the SDK's **User ID** data type in play, so
     ///   the consuming app must declare `NSPrivacyCollectedDataTypeUserID` in its
     ///   privacy manifest and nutrition label (schema §14) — the package's own
@@ -810,6 +816,52 @@ public actor StatsClient {
         let hash = identity.hashedUserId(userID)
         userIdHash = hash
         if consent.contains(.identity) { identity.userIdHash = hash }
+    }
+
+    /// Stops attaching the hashed `userId` from ``identify(userID:)`` — the
+    /// sign-out call (§2.5). Events from now on carry no `userId` until
+    /// `identify()` is called again, in this launch or a later one: the hash is
+    /// cleared from memory **and** from the SDK's defaults suite.
+    ///
+    /// It forgets the *account*, not the *install*, and changes nothing else:
+    ///
+    /// - The install UUID, `seq`, consent and the opt-out are untouched, so the
+    ///   install's metrics carry on as one install across the sign-out.
+    /// - The current session continues — no `session_end` / `session_start`.
+    /// - The queue is kept. Events already captured, and events accepted by
+    ///   ``record(_:props:)`` before this call (drained first, as `identify()`
+    ///   does), keep the `userId` they were recorded under and are sent as
+    ///   normal. To keep them from being sent, use ``setEnabled(_:)`` or a
+    ///   consent revocation instead, which discard the queue.
+    ///
+    /// It applies to calls ordered after it returns. A `record()` made
+    /// concurrently from another task may land on either side of the drain,
+    /// and so may still carry the id.
+    ///
+    /// Safe to call when nothing was identified, and it still clears the hash
+    /// when the client is opted out or `.identity` is denied — a remembered
+    /// in-memory hash must not reappear on a later grant. Like every call, a
+    /// second client for the same app id forwards it to the owner; on a client
+    /// that was itself ``shutdown()`` it does nothing.
+    ///
+    /// This is a client-side unlink only; it does not delete anything a backend
+    /// already holds. To erase the account there, the app's server sends
+    /// ``StatsConfiguration/hashedUserId(_:)`` for that account.
+    public func forgetUser() async {
+        // Events recorded before this call belong to the identified stretch, so
+        // they are captured — under the hash — before it is cleared.
+        await drainRecordedIfNeeded()
+        // `privacy`: a refused client logs this at `fault` — the person signed
+        // out and the unlink was not applied.
+        guard case .mine = await route("forgetUser()", privacy: true, { await $0.forgetUser() }) else { return }
+        // No `enabled` / consent guard: clearing is always allowed, and
+        // `identify()` under denied consent keeps an in-memory hash that a later
+        // grant would otherwise start emitting.
+        // The read spares a defaults write (and the file rewrite behind it)
+        // on the common nothing-to-forget path. Read and write are synchronous
+        // on the actor, so no other call can store a hash in between.
+        if identity.userIdHash != nil { identity.userIdHash = nil }
+        userIdHash = nil
     }
 
     // MARK: - Consent and opt-out

@@ -6,7 +6,7 @@ import Testing
 struct StatsSmokeTests {
     @Test("SDK and schema versions are the documented values")
     func versions() {
-        #expect(Stats.sdkVersion == "0.3.0")
+        #expect(Stats.sdkVersion == "0.3.1")
         // docs/schema.md is the contract; the constant must match its heading.
         #expect(Stats.schemaVersion == "v1")
     }

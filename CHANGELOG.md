@@ -9,6 +9,25 @@ package; schema changes are called out explicitly below.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-10-05
+
+### Added
+
+- **`StatsClient.forgetUser()`** — the sign-out call. Clears the hashed
+  `userId` set by `identify(userID:)`, in memory and on disk, so later events
+  (and later launches) carry none. Unlike `setEnabled(false)` + `setEnabled(true)`
+  it keeps the install id, `seq`, consent, the current session and the queue;
+  events already captured or `record()`ed keep the `userId` they were recorded
+  under. Forwarded to the owner like every other call; still clears when opted
+  out or `.identity` is denied.
+- **`StatsConfiguration.hashedUserId(_:)`** (and the static
+  `hashedUserId(_:salt:)`) — the exact `userId` `identify()` sends for an
+  account id, `lowercaseHex(SHA256(UTF8(userID + installIdSalt)))`, for an
+  app's server to name the account in an erase request.
+
+No wire-schema change (`schema` stays `v1`); `docs/schema.md` §2.5 now names
+`forgetUser()` and spells out the hash.
+
 ## [0.3.0] — 2026-10-05
 
 ### Upgrade notes (read before adopting)
@@ -858,6 +877,8 @@ A pre-release audit pass, all of it behavior-preserving on the wire — `v1` in
   app id (an app plus an extension, say) would interleave `seq` and overwrite
   each other's queue file — there is no file locking in v1.
 
-[Unreleased]: https://github.com/awizemann/swift-stats/compare/0.2.0...HEAD
+[Unreleased]: https://github.com/awizemann/swift-stats/compare/0.3.1...HEAD
+[0.3.1]: https://github.com/awizemann/swift-stats/compare/0.3.0...0.3.1
+[0.3.0]: https://github.com/awizemann/swift-stats/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/awizemann/swift-stats/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/awizemann/swift-stats/releases/tag/0.1.0

@@ -13,7 +13,7 @@ struct StatsCloudflareSmokeTests {
     func schemaVersionsAgree() {
         #expect(Stats.schemaVersion == "v1")
         #expect(StatsCloudflare.schemaVersion == "v1")
-        #expect(Stats.sdkVersion == "0.3.0")
+        #expect(Stats.sdkVersion == "0.3.1")
         #expect(StatsCloudflare.adapterVersion == Stats.sdkVersion)
     }
 
